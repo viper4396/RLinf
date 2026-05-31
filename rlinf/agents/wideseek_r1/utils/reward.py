@@ -66,7 +66,7 @@ def credit_assignment(
         hind_weights: Optional hindsight importance weights (rho_i,t).
 
     Returns:
-        ``(output_buffer, train_buffer, final_answer_format, turn_rewards)``.
+        ``(output_buffer, train_buffer, final_answer_format, turn_rewards, traj_reward_agg, outcome_reward)``.
     """
     reward_mode = agentloop_config.get("reward_mode", "turn")
     length_penalty = 0.0
@@ -144,6 +144,7 @@ def credit_assignment(
                 else:
                     turn_rewards.append(0.0)
         else:
+            outcome_reward = traj_reward_agg
             turn_rewards = [traj_reward_agg] * len(output_buffer)
 
     else:
@@ -200,7 +201,7 @@ def credit_assignment(
 
     train_buffer: list[AgentLoopOutput] = list(output_buffer)
     final_answer_format = 1 if answer_format else 0
-    return output_buffer, train_buffer, final_answer_format, turn_rewards
+    return output_buffer, train_buffer, final_answer_format, turn_rewards, traj_reward_agg, outcome_reward
 
 
 async def compute_hind_weights(

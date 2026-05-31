@@ -265,6 +265,31 @@ def _compute_final_answer_format_metrics(rollout_batch: dict) -> dict:
     return metrics
 
 
+def _compute_reward_metrics(rollout_batch: dict) -> dict:
+    """Compute trajectory-level reward metrics."""
+    traj_reward_agg = rollout_batch.get("traj_reward_agg_metric")
+    outcome_reward = rollout_batch.get("outcome_reward_metric")
+
+    metrics: dict[str, float] = {}
+    if traj_reward_agg is not None:
+        values = [float(v) for v in traj_reward_agg]
+        _add_weighted_mean_metric(
+            metrics,
+            "wideseek_r1/traj/mean/traj_reward_agg",
+            sum(values),
+            len(values),
+        )
+    if outcome_reward is not None:
+        values = [float(v) for v in outcome_reward]
+        _add_weighted_mean_metric(
+            metrics,
+            "wideseek_r1/traj/mean/outcome_reward",
+            sum(values),
+            len(values),
+        )
+    return metrics
+
+
 def _compute_rollout_metrics(
     rollout_batch: dict,
     idx_to_traj: list[int],
@@ -284,4 +309,5 @@ def _compute_rollout_metrics(
     metrics.update(_compute_num_effective_subagents_metrics(rollout_batch=rollout_batch))
     metrics.update(_compute_access_search_ratio_metrics(rollout_batch=rollout_batch))
     metrics.update(_compute_final_answer_format_metrics(rollout_batch=rollout_batch))
+    metrics.update(_compute_reward_metrics(rollout_batch=rollout_batch))
     return metrics
