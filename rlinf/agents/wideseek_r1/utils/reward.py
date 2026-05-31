@@ -31,104 +31,310 @@ def credit_assignment(
     llm_reward,
     succ_end,
     answer_format,
+    num_turn_subagents: list[int] | None = None,
+    num_effective_subagents: list[int] | None = None,
+    access_search_ratio: list[float] | None = None,
+    llm_turn_rewards: list[float] | None = None,
+    hind_weights: list[float] | None = None,
 ):
-    """Assign trajectory reward and select trainable turns for policy updates.
+    """Assign turn-level or trajectory-level rewards.
+
+    Two modes, controlled by ``reward_mode`` config:
+
+    **"turn"** (default)
+      Per-planner-turn rewards using either LLM-judge scores or formula-based
+      parallelism + completion.  The last planner turn gets the outcome reward.
+
+    **"trajectory"**
+      Single trajectory-level reward computed from aggregates, then broadcast
+      to all turns.  ``traj_reward = llm_reward + parallelism_bonus +
+      completion_bonus - length_penalty``.
+
+    When ``hind_weights`` are provided, turn rewards are scaled by
+    ``rho_i,t = clip(hind_i,t / mean(hind), c_min, c_max)``.
 
     Args:
-        agentloop_config: Agent-loop config containing reward shaping weights.
-        output_buffer: All turns generated in one trajectory.
-        llm_reward: End-of-trajectory reward from answer evaluation.
-        succ_end: Whether the agent stopped naturally without tool calls.
-        answer_format: Whether final-answer extraction/format validation succeeded.
+        agentloop_config: Agent-loop config.
+        output_buffer: All turns of one trajectory.
+        llm_reward: Answer-level reward from ``get_final_reward_score``.
+        succ_end: Whether the agent produced a valid answer tag.
+        answer_format: Whether final-answer extraction succeeded.
+        num_turn_subagents: Per-planner-turn sub-agent counts.
+        num_effective_subagents: Per-planner-turn effective sub-agent counts.
+        access_search_ratio: Per-planner-turn access / search ratios.
+        llm_turn_rewards: Optional LLM-judge per-turn scores.
+        hind_weights: Optional hindsight importance weights (rho_i,t).
 
     Returns:
-        Tuple of `(output_buffer, train_buffer, final_answer_format, reward_score)`.
+        ``(output_buffer, train_buffer, final_answer_format, turn_rewards)``.
     """
-    final_answer_format = 0
-    search_credit = 0.0
+    reward_mode = agentloop_config.get("reward_mode", "turn")
     length_penalty = 0.0
 
-    format_reward = agentloop_config.get("format_reward", 0.0)
-    call_search_reward = agentloop_config.get("call_search_reward", 0.0)
     length_limit = agentloop_config.get("length_limit", 5000)
     max_length_limit = agentloop_config.get("max_length_limit", 7000)
     length_p = agentloop_config.get("length_penalty", 0.0)
 
-    for turn_output in output_buffer:
-        # Reward search behavior when at least one access call exists in trajectory.
-        tool_call_info = turn_output.tool_call_info
-        if tool_call_info is None:
-            continue
-        if tool_call_info.get("access", 0) > 0:
-            search_credit = call_search_reward
-            break
+    max_subagents = agentloop_config.get("max_workers_per_planner", 10)
+    parallelism_weight = agentloop_config.get("parallelism_weight", 0.0)
+    completion_weight = agentloop_config.get("completion_weight", 0.0)
+    max_turn_scale = agentloop_config.get("max_turn_scale", 1.0)
+    max_planner_turns = agentloop_config.get("max_planner_turns", 10)
+    epsilon = agentloop_config.get("parallelism_epsilon", 0.01)
+    c_min = agentloop_config.get("hind_clip_min", 0.1)
+    c_max = agentloop_config.get("hind_clip_max", 5.0)
 
+    # --- length penalty ------------------------------------------------------
     max_response_len = max(
-        len(turn_output.response_ids) for turn_output in output_buffer
+        (len(t.response_ids) for t in output_buffer if t.response_ids), default=0
     )
     if max_response_len > length_limit:
-        t = (max_response_len - length_limit) / (max_length_limit - length_limit)
-        t = max(0.0, min(1.0, t))
-        length_penalty = t * length_p
+        t_frac = (max_response_len - length_limit) / (max_length_limit - length_limit)
+        t_frac = max(0.0, min(1.0, t_frac))
+        length_penalty = t_frac * length_p
 
-    one_turn_failed = False
+    P = len(num_turn_subagents) if num_turn_subagents else 0
 
-    for turn in output_buffer:
-        if turn.extra_fields["turn_repeat_failed"]:
-            one_turn_failed = True
+    # trajectory-level aggregate bonuses (used by both modes)
+    p_bonus, c_bonus = _compute_traj_bonuses(
+        num_turn_subagents, num_effective_subagents,
+        output_buffer, max_subagents, epsilon,
+    )
+    traj_reward_agg = (
+        (llm_reward + parallelism_weight * p_bonus + completion_weight * c_bonus - length_penalty)
+        if (succ_end and answer_format)
+        else 0.0
+    )
 
-    train_buffer: list[AgentLoopOutput] = []
-    if answer_format:
-        flag = False
-        for turn in output_buffer:
-            if (
-                turn.extra_fields["context_failed"]
-                or turn.extra_fields["max_turn_limit_failed"]
-            ) and turn.extra_fields["role"] != "worker":
-                # main agent or sa failed but extract good format
-                flag = True
+    if reward_mode == "trajectory":
+        use_hind = hind_weights is not None and len(hind_weights) >= P - 1
+        use_llm_rm = (
+            llm_turn_rewards is not None and len(llm_turn_rewards) >= P - 1
+        )
 
-        if not flag:
+        if use_hind or use_llm_rm:
+            outcome_reward = traj_reward_agg
+            gamma = agentloop_config.get("gamma", 0.9)
+
+            planner_turn_rewards: list[float] = []
+            for i in range(P):
+                if i == P - 1:
+                    planner_turn_rewards.append(outcome_reward)
+                elif use_hind:
+                    rho = max(c_min, min(c_max, hind_weights[i]))
+                    tn = P - i - 1
+                    reward = rho * (gamma ** tn) * traj_reward_agg
+                    planner_turn_rewards.append(reward)
+                elif use_llm_rm:
+                    reward = float(llm_turn_rewards[i])
+                    planner_turn_rewards.append(reward)
+
+            # Scale all turn rewards when total planner turns exceeds soft limit.
+            if P > max_planner_turns:
+                planner_turn_rewards = [r * max_turn_scale for r in planner_turn_rewards]
+
+            turn_rewards = []
+            planner_idx = -1
             for turn in output_buffer:
-                if not (
-                    turn.extra_fields["context_failed"]
-                    or turn.extra_fields["max_turn_limit_failed"]
-                ):
-                    train_buffer.append(turn)
-
-            reward_score = llm_reward + format_reward + search_credit - length_penalty
-            final_answer_format = 1
+                role = turn.extra_fields.get("role", "")
+                if role in ("planner", "single"):
+                    planner_idx += 1
+                if 0 <= planner_idx < P:
+                    turn_rewards.append(planner_turn_rewards[planner_idx])
+                else:
+                    turn_rewards.append(0.0)
         else:
-            for turn in output_buffer:
-                if (
-                    turn.extra_fields["context_failed"]
-                    or turn.extra_fields["max_turn_limit_failed"]
-                ) and turn.extra_fields["role"] != "worker":
-                    train_buffer.append(turn)
-
-            reward_score = 0.0
+            turn_rewards = [traj_reward_agg] * len(output_buffer)
 
     else:
-        reward_score = 0.0
-        if succ_end:
-            train_buffer.append(output_buffer[-1])
-
-        if one_turn_failed:
-            for turn in output_buffer:
-                if turn.extra_fields["turn_repeat_failed"]:
-                    if turn not in train_buffer:
-                        train_buffer.append(turn)
+        # ---- turn-level reward (existing logic) -----------------------------
+        use_llm_rm = (
+            llm_turn_rewards is not None and len(llm_turn_rewards) >= P - 1
+        )
+        if use_llm_rm:
+            outcome_reward = traj_reward_agg
         else:
-            for turn in output_buffer:
-                if (
-                    turn.extra_fields["max_turn_limit_failed"]
-                    or turn.extra_fields["context_failed"]
-                ):
-                    assert not turn.extra_fields["turn_repeat_failed"]
-                    if turn not in train_buffer:
-                        train_buffer.append(turn)
+            outcome_reward = (
+                (llm_reward - length_penalty) if (succ_end and answer_format) else 0.0
+            )
 
-    return output_buffer, train_buffer, final_answer_format, reward_score
+        planner_turn_rewards: list[float] = []
+        for i in range(P):
+            if i == P - 1:
+                planner_turn_rewards.append(outcome_reward)
+                continue
+
+            if use_llm_rm:
+                reward = float(llm_turn_rewards[i])
+            else:
+                n_total = num_turn_subagents[i] if num_turn_subagents else 0
+                n_eff = num_effective_subagents[i] if num_effective_subagents else 0
+                asr = access_search_ratio[i] if access_search_ratio else 0.0
+                if n_total > 0:
+                    p_i = min(n_total / max_subagents, 1.0 + epsilon)
+                    eff_ratio_i = n_eff / n_total
+                    capped = min(asr, 1.0 + epsilon)
+                    d = eff_ratio_i + capped
+                    c_i = (2.0 * eff_ratio_i * capped / d) if d > 0 else 0.0
+                else:
+                    p_i = 0.0
+                    c_i = 0.0
+                reward = parallelism_weight * p_i + completion_weight * c_i
+            planner_turn_rewards.append(reward)
+
+        # Scale all turn rewards when total planner turns exceeds soft limit.
+        if P > max_planner_turns:
+            planner_turn_rewards = [r * max_turn_scale for r in planner_turn_rewards]
+
+        # Map to output_buffer turns.
+        turn_rewards = []
+        planner_idx = -1
+        for turn in output_buffer:
+            role = turn.extra_fields.get("role", "")
+            if role in ("planner", "single"):
+                planner_idx += 1
+            if 0 <= planner_idx < P:
+                turn_rewards.append(planner_turn_rewards[planner_idx])
+            else:
+                turn_rewards.append(0.0)
+
+    train_buffer: list[AgentLoopOutput] = list(output_buffer)
+    final_answer_format = 1 if answer_format else 0
+    return output_buffer, train_buffer, final_answer_format, turn_rewards
+
+
+async def compute_hind_weights(
+    output_buffer: list[AgentLoopOutput],
+    extract_answer: str,
+    temperature: float = 1.0,
+    c_min: float = 0.1,
+    c_max: float = 5.0,
+    compute_logprobs: Callable[[list[int]], Awaitable[list[float]]] | None = None,
+) -> list[float] | None:
+    """Compute hindsight importance weights for each non-outcome planner turn.
+
+    For each turn t, builds a hindsight prompt
+    ``[state_i,t, "Given that the final outcome was {extract_answer}, how
+    necessary was this step?", action_i,t]``, runs it through *compute_logprobs*
+    to get token-level logprobs for the action tokens, then computes:
+
+        hind_i,t = exp(sum_logprobs / (temperature × len(action_tokens)))
+        rho_i,t  = clip(hind_i,t / mean(hind), c_min, c_max)
+
+    Returns a list of *rho* values, one per planner turn (excluding outcome).
+    Returns ``None`` when *compute_logprobs* is not available.
+
+    Args:
+        output_buffer: All turns of the trajectory.
+        extract_answer: Parsed final answer text.
+        temperature: Softmax temperature for logprob weighting.
+        c_min, c_max: Clipping bounds for rho.
+        compute_logprobs: Async callback (prompt_ids) → per-token logprobs.
+    """
+    if compute_logprobs is None:
+        return None
+
+    # Group turns by planner turn index.
+    planner_turns: list[list[AgentLoopOutput]] = []
+    current_group: list[AgentLoopOutput] = []
+    for t in output_buffer:
+        role = t.extra_fields.get("role", "")
+        if role in ("planner", "single") and current_group:
+            planner_turns.append(current_group)
+            current_group = []
+        current_group.append(t)
+    if current_group:
+        planner_turns.append(current_group)
+
+    # The last group is the answer turn — skip it for hind computation.
+    if len(planner_turns) <= 1:
+        return None
+
+    non_outcome_groups = planner_turns[:-1]
+    hind_values: list[float] = []
+
+    for group in non_outcome_groups:
+        # Only use the main-agent (planner/single) turn: its prompt already
+        # embeds the worker returns from earlier turns, and the action tokens
+        # capture the planner's tool-call decisions (including worker creation).
+        main_turn = group[0]
+        state_text = main_turn.prompt_text or ""
+        action_tokens = list(main_turn.response_ids)
+
+        # Build hindsight prompt.
+        final_statement = (
+            f"Given that the final outcome was {extract_answer}, "
+            "what actions do you take in the next step?"
+        )
+        hindsight_prompt = f"{state_text}\n{final_statement}"
+
+        # Tokenize and compute logprobs.
+        # (compute_logprobs handles tokenization internally)
+        try:
+            logprobs = await compute_logprobs(
+                hindsight_prompt, action_tokens, temperature
+            )
+            s_hind = sum(logprobs)
+            n_tokens = len(action_tokens)
+            if n_tokens > 0:
+                hind = float(
+                    __import__("math").exp(s_hind / (temperature * n_tokens))
+                )
+            else:
+                hind = 1.0
+        except Exception:
+            hind = 1.0
+
+        hind_values.append(hind)
+
+    if not hind_values:
+        return None
+
+    # Normalize: rho_i,t = clip(hind_i,t / mean(hind), c_min, c_max)
+    mean_hind = sum(hind_values) / len(hind_values)
+    if mean_hind <= 0:
+        return None
+
+    rho_values = [
+        max(c_min, min(c_max, h / mean_hind)) for h in hind_values
+    ]
+    return rho_values
+
+
+def _compute_traj_bonuses(
+    num_turn_subagents, num_effective_subagents,
+    output_buffer, max_subagents, epsilon,
+) -> tuple[float, float]:
+    """Compute aggregate parallelism and completion bonuses for a trajectory."""
+    total_subagents = sum(num_turn_subagents) if num_turn_subagents else 0
+    total_effective = sum(num_effective_subagents) if num_effective_subagents else 0
+    num_non_outcome = max(len(num_turn_subagents) - 1 if num_turn_subagents else 0, 1)
+
+    parallelism_bonus_val = min(
+        total_subagents / (max_subagents * num_non_outcome), 1.0 + epsilon
+    )
+
+    total_access = sum(
+        t.tool_call_info.get("access", 0)
+        for t in output_buffer if t.tool_call_info
+    )
+    total_search = sum(
+        t.tool_call_info.get("search", 0)
+        for t in output_buffer if t.tool_call_info
+    )
+    if total_subagents > 0:
+        eff_ratio = total_effective / total_subagents
+    else:
+        eff_ratio = 0.0
+    if total_search > 0:
+        acc_ratio = min(total_access / total_search, 1.0 + epsilon)
+    else:
+        acc_ratio = 0.0
+    denom = eff_ratio + acc_ratio
+    completion_bonus_val = (
+        (2.0 * eff_ratio * acc_ratio / denom) if denom > 0 else 0.0
+    )
+    return parallelism_bonus_val, completion_bonus_val
 
 
 async def get_final_reward_score(
@@ -178,6 +384,87 @@ async def get_final_reward_score(
         reward_score = 0.0
 
     return reward_score, format
+
+
+async def evaluate_turn_rewards(
+    question: str,
+    ground_truth: str,
+    outcome_reward: float,
+    output_buffer: list[AgentLoopOutput],
+    judge_llm_generator: Callable[[list], Awaitable[str]],
+    num_planner_turns: int,
+) -> list[float]:
+    """Use an LLM judge to assign per-planner-turn rewards in [-1.0, 1.0].
+
+    The judge sees the full trajectory (planner turns + worker summaries) and
+    scores each planner turn based on how much it contributed to the outcome.
+
+    Args:
+        question: Original user question.
+        ground_truth: Ground-truth answer text.
+        outcome_reward: Outcome turn reward (= traj_reward_agg when
+            llm_as_turn_rm=True, i.e. llm_reward + bonuses - length_penalty,
+            zeroed if no valid answer).
+        output_buffer: All turns of the trajectory.
+        judge_llm_generator: Shared LLM judge function.
+        num_planner_turns: Number of planner turns in this trajectory.
+
+    Returns:
+        List of floats, length ``num_planner_turns``, each in [-1.0, 1.0].
+    """
+    from rlinf.agents.wideseek_r1.utils.prompt import LLM_JUDGE_TURN_PROMPT
+
+    # Build a readable trajectory text.
+    parts = []
+    turn_idx = 0
+    for t in output_buffer:
+        role = t.extra_fields.get("role", "")
+        if role == "planner":
+            turn_idx += 1
+            parts.append(f"\n[Turn {turn_idx} - Planner]")
+            if t.tool_call_info:
+                n = t.tool_call_info.get("subtask", 0)
+                parts.append(f"  Created {n} sub-agent(s)")
+        elif role == "worker":
+            parts.append(f"  Sub-agent response: {t.response_text[:500]}...")
+
+    trajectory_text = "\n".join(parts)
+
+    messages = [
+        {"role": "system", "content": "You are an evaluation assistant. For each planner turn, output a score in [-1.0, 1.0] based on how much it helped or hurt progress toward the correct answer."},
+        {"role": "user", "content": LLM_JUDGE_TURN_PROMPT.format(
+            question=question,
+            ground_truth=str(ground_truth),
+            outcome_reward=outcome_reward,
+            trajectory_text=trajectory_text,
+        )},
+    ]
+
+    response = await judge_llm_generator(messages)
+    response = response.strip()
+
+    # Parse the JSON array from the response.
+    try:
+        # Try direct JSON parse first.
+        scores = json.loads(response)
+    except json.JSONDecodeError:
+        # Fallback: extract the first JSON array from the text.
+        match = re.search(r"\[.*?\]", response, re.DOTALL)
+        if match:
+            try:
+                scores = json.loads(match.group(0))
+            except json.JSONDecodeError:
+                scores = [0.0] * num_planner_turns
+        else:
+            scores = [0.0] * num_planner_turns
+
+    # Clamp and pad/truncate to the expected length.
+    scores = [max(-1.0, min(1.0, float(s))) for s in scores]
+    if len(scores) < num_planner_turns:
+        scores.extend([0.0] * (num_planner_turns - len(scores)))
+    scores = scores[:num_planner_turns]
+
+    return scores
 
 
 async def verify_answer_with_llm_judge(
@@ -581,14 +868,15 @@ def extract_final_answer(text: str, mode: bool = "boxed", strict=True):
         For `markdown`: parsed `pd.DataFrame` or None.
     """
     text = text.split("</think>")[-1].strip()
-    if mode == "tag":
-        answer_pattern = r"<answer>(.*?)</answer>"
-        match = re.finditer(answer_pattern, text, re.DOTALL)
-        matches = list(match)
 
-        if len(matches) < 1:
-            return None
-        return matches[-1].group(1).strip()
+    # When <answer> tags are present, extract their content first.
+    answer_pattern = r"<answer>(.*?)</answer>"
+    answer_matches = re.findall(answer_pattern, text, re.DOTALL)
+    if answer_matches:
+        text = answer_matches[-1].strip()
+
+    if mode == "tag":
+        return text if text else None
     elif mode == "boxed":
         if not text:
             return None

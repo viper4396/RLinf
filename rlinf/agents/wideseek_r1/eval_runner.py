@@ -207,6 +207,14 @@ class WideSeekR1AgentEvalRunner(AgentEvalRunner):
         mas_sum_num_subagents = 0
         mas_num_valid_trajs = 0
 
+        mas_sum_num_subagents_v2 = 0
+        mas_sum_num_creation_events = 0
+
+        mas_sum_num_effective_subagents = 0
+
+        mas_sum_access_search_ratio = 0.0
+        mas_num_access_search_ratio_entries = 0
+
         if is_markdown:
             acc = {}
         else:
@@ -240,6 +248,20 @@ class WideSeekR1AgentEvalRunner(AgentEvalRunner):
                     subagent_turns_list = total_turn_list[:-1]
                     mas_subagent_turns_list.append(sum(subagent_turns_list))
                     mas_num_subagents_list.append(len(subagent_turns_list))
+
+                num_turn_subagents = sample.get("num_turn_subagents", None)
+                if num_turn_subagents is not None:
+                    mas_sum_num_subagents_v2 += sum(num_turn_subagents)
+                    mas_sum_num_creation_events += len(num_turn_subagents)
+
+                num_effective_subagents = sample.get("num_effective_subagents", None)
+                if num_effective_subagents is not None:
+                    mas_sum_num_effective_subagents += sum(num_effective_subagents)
+
+                access_search_ratio = sample.get("access_search_ratio", None)
+                if access_search_ratio is not None:
+                    mas_sum_access_search_ratio += sum(access_search_ratio)
+                    mas_num_access_search_ratio_entries += len(access_search_ratio)
 
                 for turn in turns:
                     prompt_lengths.append(turn.get("prompt_ids_length", 0))
@@ -408,6 +430,22 @@ class WideSeekR1AgentEvalRunner(AgentEvalRunner):
                 mas_sum_num_subagents / mas_num_valid_trajs
             )
 
+        if mas_num_valid_trajs > 0:
+            aggregated_metrics["avg_num_subagents_per_traj_v2"] = (
+                mas_sum_num_subagents_v2 / mas_num_valid_trajs
+            )
+            aggregated_metrics["avg_subagent_creation_events_per_traj"] = (
+                mas_sum_num_creation_events / mas_num_valid_trajs
+            )
+            aggregated_metrics["avg_num_effective_subagents_per_traj"] = (
+                mas_sum_num_effective_subagents / mas_num_valid_trajs
+            )
+            aggregated_metrics["avg_access_search_ratio_per_turn"] = (
+                mas_sum_access_search_ratio / mas_num_access_search_ratio_entries
+                if mas_num_access_search_ratio_entries > 0
+                else 0.0
+            )
+
         return processed_results, aggregated_metrics
 
     def update(
@@ -465,6 +503,15 @@ class WideSeekR1AgentEvalRunner(AgentEvalRunner):
         total_turn_list_metric = (
             extra_fields_traj.get("total_turn_list") or [None] * group_size
         )
+        num_turn_subagents_metric = (
+            extra_fields_traj.get("num_turn_subagents") or [None] * group_size
+        )
+        num_effective_subagents_metric = (
+            extra_fields_traj.get("num_effective_subagents") or [None] * group_size
+        )
+        access_search_ratio_metric = (
+            extra_fields_traj.get("access_search_ratio") or [None] * group_size
+        )
         final_answer_format_metric = (
             extra_fields_traj.get("final_answer_format") or [0] * group_size
         )
@@ -487,6 +534,13 @@ class WideSeekR1AgentEvalRunner(AgentEvalRunner):
         samples_data: list[dict] = []
         for traj_idx in range(group_size):
             total_turn_list = _safe_idx(total_turn_list_metric, traj_idx, None)
+            num_turn_subagents = _safe_idx(num_turn_subagents_metric, traj_idx, None)
+            num_effective_subagents = _safe_idx(
+                num_effective_subagents_metric, traj_idx, None
+            )
+            access_search_ratio = _safe_idx(
+                access_search_ratio_metric, traj_idx, None
+            )
             final_answer_format = (
                 _safe_idx(final_answer_format_metric, traj_idx, 0) or 0
             )
@@ -548,6 +602,9 @@ class WideSeekR1AgentEvalRunner(AgentEvalRunner):
                         extra_fields_traj.get("final_answer_text"), traj_idx, None
                     ),
                     "total_turn_list": total_turn_list,
+                    "num_turn_subagents": num_turn_subagents,
+                    "num_effective_subagents": num_effective_subagents,
+                    "access_search_ratio": access_search_ratio,
                     "final_answer_format": float(final_answer_format),
                     "llm_reward": float(llm_reward),
                 }

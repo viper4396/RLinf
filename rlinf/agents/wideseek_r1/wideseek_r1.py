@@ -14,6 +14,7 @@
 
 import asyncio
 import copy
+import re
 from typing import Optional
 
 from omegaconf import DictConfig
@@ -33,7 +34,10 @@ from rlinf.agents.wideseek_r1.utils.prompt_utils import (
     get_search_tool_message,
 )
 from rlinf.agents.wideseek_r1.utils.reward import (
+    _compute_traj_bonuses,
+    compute_hind_weights,
     credit_assignment,
+    evaluate_turn_rewards,
     extract_final_answer,
     get_final_reward_score,
 )
@@ -144,6 +148,69 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
             "role": role,
         }
 
+    @staticmethod
+    def _check_final_answer(response_text: str) -> tuple[bool, bool]:
+        """Check if response contains ``<answer>...</answer>`` tags.
+
+        Returns:
+            ``(has_answer, format_valid)`` where ``has_answer`` is True when
+            the tags are present, and ``format_valid`` is True when the
+            content between the tags is non-empty.
+        """
+        pattern = r"<answer>(.*?)</answer>"
+        matches = re.findall(pattern, response_text, re.DOTALL)
+        if not matches:
+            return False, False
+        content = matches[-1].strip()
+        return True, bool(content)
+
+    async def compute_token_logprobs(
+        self,
+        prompt_text: str,
+        target_token_ids: list[int],
+        temperature: float = 1.0,
+    ) -> list[float]:
+        """Compute per-token logprobs of *target_token_ids* given *prompt_text*.
+
+        Concatenates prompt + target tokens, asks the rollout engine to
+        generate 1 extra token, and returns the logprobs for the target
+        portion of the sequence.
+
+        Args:
+            prompt_text: The conditioning text (state + hindsight question).
+            target_token_ids: Token IDs of the action to score.
+            temperature: Sampling temperature for logprob computation.
+
+        Returns:
+            Per-token log probabilities (same length as *target_token_ids*).
+        """
+        prompt_ids = self.tokenizer.encode(prompt_text, add_special_tokens=False)
+        full_ids = prompt_ids + list(target_token_ids)
+        full_ids = full_ids[: self.max_total_len - 1]
+
+        generate_result = await self.generate(
+            full_ids,
+            sampling_params={
+                "max_new_tokens": 1,
+                "temperature": temperature,
+            },
+        )
+
+        raw_logprobs = generate_result.get("logprobs", [])
+        if raw_logprobs is None:
+            raw_logprobs = []
+
+        # logprobs covers the last len(target)+1 tokens (target + generated token).
+        n_target = len(target_token_ids) + 1
+        target_logprobs = (
+            raw_logprobs[-n_target:-1] if len(raw_logprobs) >= n_target
+            else raw_logprobs
+        )
+        # Pad / truncate to exact length.
+        if len(target_logprobs) < len(target_token_ids):
+            target_logprobs = [0.0] * (len(target_token_ids) - len(target_logprobs)) + target_logprobs
+        return target_logprobs[:len(target_token_ids)]
+
     async def local_judge_llm_generator(self, messages: list) -> str:
         prompt_ids = self.tokenizer.apply_chat_template(
             messages, tokenize=True, add_generation_prompt=True
@@ -239,6 +306,9 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
             worker_outputs_buffer,
             answer_text,
             total_turn_list,
+            _,
+            _,
+            _,
             task_failed,
             _,
         ) = await self.run_one_query_role(
@@ -258,6 +328,26 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
             return self.cfg.agentloop.get("max_sa_turns", 50)
         if role == "worker":
             return self.cfg.agentloop.get("max_worker_turns", 20)
+        raise ValueError(f"illegal role {role}")
+
+    def _set_max_allow_turns(self, role: str) -> int:
+        """Hard turn limit (>= soft limit).  Turns beyond the soft limit are
+        marked ``max_turn_limit_failed`` but the agent is allowed to continue."""
+        if role == "planner":
+            return self.cfg.agentloop.get(
+                "max_allow_planner_turns",
+                self.cfg.agentloop.get("max_planner_turns", 10),
+            )
+        if role == "single":
+            return self.cfg.agentloop.get(
+                "max_allow_sa_turns",
+                self.cfg.agentloop.get("max_sa_turns", 50),
+            )
+        if role == "worker":
+            return self.cfg.agentloop.get(
+                "max_allow_worker_turns",
+                self.cfg.agentloop.get("max_worker_turns", 20),
+            )
         raise ValueError(f"illegal role {role}")
 
     def _build_message_history_and_tools(
@@ -312,41 +402,39 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
         output_buffer: list[AgentLoopOutput],
         role: str,
         turn_idx: int,
-        max_turns: int,
         succ_end: bool,
         context_failed: bool,
         tool_response_failed: bool,
+        answer_format_failed: bool = False,
     ) -> bool:
         """Apply failure flags to turns for one role and return task failure.
+
+        ``max_turn_limit_failed`` is already set per-turn inside the main loop
+        (True when ``turn_idx >= max_turns``).  This method only marks
+        context / tool-response / answer-format failures and computes the
+        overall task-failure flag.
 
         Args:
             output_buffer: Collected per-turn outputs for this role execution.
             role: Current role whose turns should be marked.
             turn_idx: Last executed loop index (zero-based).
-            max_turns: Maximum allowed turns for this role.
-            succ_end: Whether the role loop ended successfully.
+            succ_end: Whether the role loop ended via a valid answer tag.
             context_failed: Whether prompt/response length hit context limit.
             tool_response_failed: Whether tool feedback exceeded available space.
+            answer_format_failed: Whether the final turn lacks valid answer tags.
 
         Returns:
             Boolean task failure indicator for this role execution.
         """
-        max_turn_limit_failed = (
-            not succ_end
-            and not context_failed
-            and not tool_response_failed
-            and turn_idx + 1 >= max_turns
-        )
-
-        if max_turn_limit_failed:
-            for turn in output_buffer:
-                if turn.extra_fields["role"] == role:
-                    turn.extra_fields["max_turn_limit_failed"] = True
-
         if context_failed or tool_response_failed:
             for turn in output_buffer:
                 if turn.extra_fields["role"] == role:
                     turn.extra_fields["context_failed"] = True
+
+        if answer_format_failed:
+            for turn in output_buffer:
+                if turn.extra_fields["role"] == role:
+                    turn.extra_fields["answer_format_failed"] = True
 
         if (
             context_failed
@@ -355,7 +443,7 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
         ):
             output_buffer[-1].extra_fields["turn_repeat_failed"] = True
 
-        task_failed = max_turn_limit_failed or context_failed or tool_response_failed
+        task_failed = not succ_end
         assert task_failed != succ_end
         return task_failed
 
@@ -367,7 +455,7 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
         main_task: str | None = None,
         is_markdown: bool = False,
         language: str = "en",
-    ) -> tuple[list[AgentLoopOutput], str]:
+    ) -> tuple[list[AgentLoopOutput], str, list[int], list[int], list[float], list[int], bool, bool]:
         """Run one query under a specific role until stop, failure, or turn budget.
 
         Args:
@@ -379,12 +467,19 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
             language: Prompt language.
 
         Returns:
-            Tuple of `(output_buffer, answer_text, total_turn_list, task_failed, succ_end)`.
+            Tuple of `(output_buffer, answer_text, total_turn_list, num_turn_subagents, num_effective_subagents, access_search_ratio, task_failed, succ_end)`.
         """
 
         origin_question = question
         output_buffer = []
         total_turn_list = []
+        num_turn_subagents = []
+        num_effective_subagents = []
+        access_search_ratio = []
+
+        # Planner turn counter: increments each time the planner/single-agent
+        # executes a new turn.  Workers inherit their parentʼs counter.
+        planner_turn_counter = -1
 
         message_history, tools = self._build_message_history_and_tools(
             origin_question=origin_question,
@@ -394,8 +489,9 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
             main_task=main_task,
         )
         max_turns = self._set_max_turns(role=role)
+        max_allow_turns = self._set_max_allow_turns(role=role)
 
-        turn_hint = get_first_turn_hint(max_turns=max_turns, language=language)
+        turn_hint = get_first_turn_hint(max_turns=max_allow_turns, language=language)
         assert message_history[-1]["role"] == "user"
         message_history[-1]["content"] = message_history[-1]["content"] + turn_hint
 
@@ -407,12 +503,15 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
         # Initialize tracking variables
         context_failed = False
         tool_response_failed = False
+        answer_format_failed = False
+        has_answer_tag = False
 
         succ_end = False
         sub_traj_num = 0
 
         turn_idx = -1
-        for turn_idx in range(max_turns):
+        for turn_idx in range(max_allow_turns):
+            planner_turn_counter += 1
             max_resp_len = self.max_total_len - len(prompt_ids)
             if max_resp_len <= 0:
                 context_failed = True
@@ -441,6 +540,12 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
                 response_text, role=role
             )
 
+            # Check whether this turn carries a final <answer> tag.
+            if role in ("planner", "single"):
+                has_answer, _ = self._check_final_answer(response_text)
+                if has_answer:
+                    has_answer_tag = True
+
             output_buffer.append(
                 AgentLoopOutput(
                     prompt_ids=copy.deepcopy(prompt_ids),
@@ -454,9 +559,11 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
                     extra_fields={
                         "role": role,
                         "idx_to_sub_traj": sub_traj_id,
+                        "planner_turn_idx": planner_turn_counter,
                         "context_failed": False,
-                        "max_turn_limit_failed": False,
+                        "max_turn_limit_failed": turn_idx >= max_turns,
                         "turn_repeat_failed": False,
+                        "answer_format_failed": False,
                     },
                     tool_call_info=tool_call_info
                     if tool_call_info
@@ -470,9 +577,22 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
                 context_failed = True
                 break
 
-            # Extract tool calls
-            if tool_requests == []:
+            # Determine if this is the final turn.
+            # Answer tag always wins — the agent signalled completion.
+            if has_answer_tag:
                 succ_end = True
+                if role == "planner":
+                    num_turn_subagents.append(0)
+                    num_effective_subagents.append(0)
+                    access_search_ratio.append(0.0)
+                break
+
+            if tool_requests == []:
+                # No tool calls and no answer tag → format error.
+                if role in ("planner", "single"):
+                    answer_format_failed = True
+                else:
+                    succ_end = True
                 break
 
             # Handle tool calls based on role
@@ -494,7 +614,32 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
                         )
                     )
                 sub_traj_num += len(tasks)
+                num_turn_subagents.append(len(tasks))
                 worker_results = await asyncio.gather(*tasks)
+
+                # Count effective sub-agents and compute access/search ratio.
+                num_effective = 0
+                turn_total_search = 0
+                turn_total_access = 0
+                for worker_outputs_buffer, _, _, w_task_failed in worker_results:
+                    has_search = False
+                    for t in worker_outputs_buffer:
+                        if t.tool_call_info:
+                            s = t.tool_call_info.get("search", 0)
+                            a = t.tool_call_info.get("access", 0)
+                            turn_total_search += s
+                            turn_total_access += a
+                            if s > 0:
+                                has_search = True
+                    if has_search and not w_task_failed:
+                        num_effective += 1
+                num_effective_subagents.append(num_effective)
+                ratio = (
+                    turn_total_access / turn_total_search
+                    if turn_total_search > 0
+                    else 0.0
+                )
+                access_search_ratio.append(ratio)
 
                 tool_messages_text = []
                 for idx, (
@@ -528,7 +673,7 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
 
                 turn_hint = get_next_turn_hint(
                     next_turn_idx=turn_idx + 2,
-                    max_turns=max_turns,
+                    max_turns=max_allow_turns,
                     language=language,
                 )
                 tool_messages.append(
@@ -596,7 +741,7 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
 
                 turn_hint = get_next_turn_hint(
                     next_turn_idx=turn_idx + 2,
-                    max_turns=max_turns,
+                    max_turns=max_allow_turns,
                     language=language,
                 )
                 tool_messages.append(
@@ -621,10 +766,10 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
             output_buffer=output_buffer,
             role=role,
             turn_idx=turn_idx,
-            max_turns=max_turns,
             succ_end=succ_end,
             context_failed=context_failed,
             tool_response_failed=tool_response_failed,
+            answer_format_failed=answer_format_failed,
         )
 
         # Generate summary
@@ -641,7 +786,7 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
             total_turn_list.append(turn_idx + 1)  # with no summary
         else:
             total_turn_list.append(turn_idx + 1)
-        return output_buffer, answer_text, total_turn_list, task_failed, succ_end
+        return output_buffer, answer_text, total_turn_list, num_turn_subagents, num_effective_subagents, access_search_ratio, task_failed, succ_end
 
     async def run_one_query(self, prompt_ids: list[int], *, answer) -> AgentLoopOutput:
         """Run one sample end-to-end and attach reward/training metadata.
@@ -667,6 +812,9 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
             output_buffer,
             answer_text,
             total_turn_list,
+            num_turn_subagents,
+            num_effective_subagents,
+            access_search_ratio,
             task_failed,
             succ_end,
         ) = await self.run_one_query_role(
@@ -693,20 +841,122 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
             self.llm_generator,
         )
 
-        output_buffer, train_buffer, final_answer_format, reward_score = (
+        reward_mode = self.cfg.agentloop.get("reward_mode", "turn")
+        advantage_mode = self.cfg.algorithm.get("advantage_mode", "trajectory")
+
+        # Optional: LLM-as-turn-RM — judge scores each planner turn.
+        # Skipped when reward_mode=traj AND advantage_mode=traj, since neither
+        # reward nor advantage benefits from per-turn differentiation.
+        llm_turn_rewards = None
+        skip_llm_judge = (
+            reward_mode == "trajectory" and advantage_mode == "trajectory"
+        )
+
+        # Pre-compute outcome_reward for the LLM turn judge so it sees the
+        # full traj_reward_agg (bonuses + length_penalty) rather than bare
+        # llm_reward.  Mirrors the formula in credit_assignment.
+        llm_as_turn_rm_cfg = self.cfg.agentloop.get("llm_as_turn_rm", False)
+        if (
+            llm_as_turn_rm_cfg
+            and self.workflow == "mas"
+            and self.llm_generator is not None
+            and not skip_llm_judge
+        ):
+            # length_penalty
+            length_limit = self.cfg.agentloop.get("length_limit", 5000)
+            max_length_limit = self.cfg.agentloop.get("max_length_limit", 7000)
+            length_p = self.cfg.agentloop.get("length_penalty", 0.0)
+            max_response_len = max(
+                (len(t.response_ids) for t in output_buffer if t.response_ids),
+                default=0,
+            )
+            length_penalty_val = 0.0
+            if max_response_len > length_limit:
+                t_frac = (max_response_len - length_limit) / (max_length_limit - length_limit)
+                t_frac = max(0.0, min(1.0, t_frac))
+                length_penalty_val = t_frac * length_p
+
+            p_bonus, c_bonus = _compute_traj_bonuses(
+                num_turn_subagents,
+                num_effective_subagents,
+                output_buffer,
+                self.cfg.agentloop.get("max_workers_per_planner", 10),
+                self.cfg.agentloop.get("parallelism_epsilon", 0.01),
+            )
+            parallelism_weight = self.cfg.agentloop.get("parallelism_weight", 0.0)
+            completion_weight = self.cfg.agentloop.get("completion_weight", 0.0)
+
+            answer_format_ok = final_answer_extract is not None and format is True
+            outcome_reward = (
+                llm_reward
+                + parallelism_weight * p_bonus
+                + completion_weight * c_bonus
+                - length_penalty_val
+            ) if (succ_end and answer_format_ok) else 0.0
+
+            ground_truth = answer.get("answer", "")
+            if isinstance(ground_truth, list):
+                ground_truth = ground_truth[0] if ground_truth else ""
+            llm_turn_rewards = await evaluate_turn_rewards(
+                question=origin_question,
+                ground_truth=str(ground_truth),
+                outcome_reward=outcome_reward,
+                output_buffer=output_buffer,
+                judge_llm_generator=self.llm_generator,
+                num_planner_turns=len(num_turn_subagents)
+                if num_turn_subagents
+                else 0,
+            )
+
+        # Hindsight importance weights (reward_mode=trajectory, advantage_mode=turn,
+        # llm_as_turn_rm=False).  Scores each planner turn by how necessary it was
+        # for the final outcome, then weights turn rewards by ρ×γ^(T-t).
+        hind_weights = None
+        llm_as_turn_rm = self.cfg.agentloop.get("llm_as_turn_rm", False)
+        if (
+            reward_mode == "trajectory"
+            and advantage_mode == "turn"
+            and not llm_as_turn_rm
+            and self.workflow == "mas"
+        ):
+            hind_weights = await compute_hind_weights(
+                output_buffer=output_buffer,
+                extract_answer=str(final_answer_extract),
+                temperature=self.cfg.agentloop.get("hind_temperature", 1.0),
+                c_min=self.cfg.agentloop.get("hind_clip_min", 0.1),
+                c_max=self.cfg.agentloop.get("hind_clip_max", 5.0),
+                compute_logprobs=self.compute_token_logprobs,
+            )
+
+        output_buffer, train_buffer, final_answer_format, turn_rewards = (
             credit_assignment(
                 agentloop_config=self.cfg.agentloop,
                 output_buffer=output_buffer,
                 llm_reward=llm_reward,
                 succ_end=succ_end,
                 answer_format=final_answer_extract is not None and format is True,
+                num_turn_subagents=num_turn_subagents
+                if self.workflow == "mas"
+                else None,
+                num_effective_subagents=num_effective_subagents
+                if self.workflow == "mas"
+                else None,
+                access_search_ratio=access_search_ratio
+                if self.workflow == "mas"
+                else None,
+                llm_turn_rewards=llm_turn_rewards,
+                hind_weights=hind_weights,
             )
         )
 
-        for single_turn_output in output_buffer:
-            single_turn_output.reward_score = reward_score
+        assert len(turn_rewards) == len(output_buffer), (
+            f"turn_rewards lens mismatch: {len(turn_rewards)} != {len(output_buffer)}"
+        )
+        for i, single_turn_output in enumerate(output_buffer):
+            single_turn_output.reward_score = turn_rewards[i]
         for single_turn_output in train_buffer:
-            single_turn_output.reward_score = reward_score
+            idx = output_buffer.index(single_turn_output)
+            single_turn_output.reward_score = turn_rewards[idx]
 
         for single_turn_output in output_buffer:
             single_turn_output.extra_fields["not_training"] = (
@@ -761,6 +1011,9 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
                 "origin_question": origin_question,
                 "llm_reward": llm_reward,
                 "total_turn_list": total_turn_list if self.workflow == "mas" else None,
+                "num_turn_subagents": num_turn_subagents if self.workflow == "mas" else None,
+                "num_effective_subagents": num_effective_subagents if self.workflow == "mas" else None,
+                "access_search_ratio": access_search_ratio if self.workflow == "mas" else None,
                 "instance_id": answer["instance_id"],
                 "num_valid_planner_turns": num_valid_planner_turns,
                 "num_valid_worker_turns": num_valid_worker_turns,
@@ -810,6 +1063,7 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
         }
 
         idx_to_sub_traj = []
+        planner_turn_idx_list = []
         for task_result in task_results:
             sub_traj_map = {}
             for single_turn_output in task_result.single_turn_outputs:
@@ -819,7 +1073,13 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
                 if role_idx not in sub_traj_map:
                     sub_traj_map[role_idx] = len(sub_traj_map)
                 idx_to_sub_traj.append(sub_traj_map[role_idx])
-        extra_fields_train = {"idx_to_sub_traj": idx_to_sub_traj}
+                planner_turn_idx_list.append(
+                    single_turn_output.extra_fields.get("planner_turn_idx", -1)
+                )
+        extra_fields_train = {
+            "idx_to_sub_traj": idx_to_sub_traj,
+            "planner_turn_idx": planner_turn_idx_list,
+        }
 
         return (
             extra_fields_turn,
@@ -855,6 +1115,15 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
             ),
             "total_turn_list_metric": rollout_result.extra_fields_traj[
                 "total_turn_list"
+            ],
+            "num_turn_subagents_metric": rollout_result.extra_fields_traj[
+                "num_turn_subagents"
+            ],
+            "num_effective_subagents_metric": rollout_result.extra_fields_traj[
+                "num_effective_subagents"
+            ],
+            "access_search_ratio_metric": rollout_result.extra_fields_traj[
+                "access_search_ratio"
             ],
             "final_answer_format": rollout_result.extra_fields_traj[
                 "final_answer_format"

@@ -70,7 +70,9 @@ algorithm:
   clip_log_ratio_max: 20 # if null or not set, will not clip
 
   adv_type: grpo_dynamic
-  advantage_mode: trajectory  # "trajectory" for trajectory-level GRPO, "turn" for turn-level GRPO
+  advantage_mode: turn  # "trajectory" for trajectory-level GRPO, "turn" for turn-level GRPO
+  gamma: 0.9                  # discount factor for discounted cumulative sum
+  omega: 0.5                  # outcome blending weight (1-omega = turn-reward weight)
   normalize_advantages: False
   early_stop_imp_ratio: 5.0
   use_valid_token_scale: False
@@ -110,19 +112,38 @@ agentloop:
   toolcall_parser: "wideseek_r1-qwen"
   workflow: mas
   max_planner_turns: 10
+  max_allow_planner_turns: 15     # hard limit (> max_planner_turns); turns beyond soft limit are tagged max_turn_limit_failed
   max_worker_turns: 20
+  max_allow_worker_turns: 25
   max_sa_turns: 50
+  max_allow_sa_turns: 55
   print_outputs: False # whether to print the outputs (token ids, texts, tool calls, etc.) of agent loop worker.
   max_workers_per_planner: 10
   max_toolcall_per_worker: 5
   is_dynamic_rollout_batch: True
 
-  format_reward: 0.1
-  call_search_reward: 0.05
+  # reward mode: "turn" for per-turn rewards, "trajectory" for single traj-level reward
+  reward_mode: turn
+
+  # turn-level reward shaping (reward_mode=turn)
+  llm_as_turn_rm: False             # when True, use LLM judge for per-turn rewards; when False, use formula-based
+  parallelism_weight: 1.0          # weight for per-turn parallelism bonus (unused when llm_as_turn_rm=True)
+  completion_weight: 1.0           # weight for per-turn completion (harmonic mean) bonus (unused when llm_as_turn_rm=True)
+  parallelism_epsilon: 0.05        # ratio cap = min(ratio, 1+epsilon)
+  max_turn_scale: 0.6              # reward scale factor when turn is max_turn_limit_failed
+
+  # trajectory-level reward discount factor (reward_mode=trajectory with hind_weights or llm_as_turn_rm)
+  gamma: 0.9                       # discount factor for rho * gamma^(T-t) * traj_reward_agg
+
+  # hindsight importance weights (used when reward_mode=trajectory, advantage_mode=turn, llm_as_turn_rm=False)
+  hind_temperature: 1.0            # temperature for hind logprob weighting
+  hind_clip_min: 0.1               # lower bound for rho = clip(hind/mean(hind), c_min, c_max)
+  hind_clip_max: 5.0               # upper bound for rho
+
+  # length penalty
   length_limit: 3000
   max_length_limit: 5000
   length_penalty: 0.1
-  over_context_penalty: 0.2
 
   # whether to enable Qwen3-30B-A3B LLM judge for access summary and answer reward, False is only for ci now
   use_llm_judge: True
