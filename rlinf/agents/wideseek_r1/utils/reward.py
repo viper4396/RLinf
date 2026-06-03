@@ -113,7 +113,12 @@ def credit_assignment(
         )
 
         if use_hind or use_llm_rm:
-            outcome_reward = traj_reward_agg
+            if use_hind:
+                outcome_reward = (
+                    (llm_reward - length_penalty) if (succ_end and answer_format) else 0.0
+                )
+            else:
+                outcome_reward = traj_reward_agg
             gamma = agentloop_config.get("gamma", 0.9)
 
             planner_turn_rewards: list[float] = []
@@ -144,7 +149,9 @@ def credit_assignment(
                 else:
                     turn_rewards.append(0.0)
         else:
-            outcome_reward = traj_reward_agg
+            outcome_reward = (
+                (llm_reward - length_penalty) if (succ_end and answer_format) else 0.0
+            )
             turn_rewards = [traj_reward_agg] * len(output_buffer)
 
     else:
@@ -207,6 +214,7 @@ def credit_assignment(
 async def compute_hind_weights(
     output_buffer: list[AgentLoopOutput],
     extract_answer: str,
+    traj_reward_agg: float = 0.0,
     temperature: float = 1.0,
     c_min: float = 0.1,
     c_max: float = 5.0,
@@ -215,9 +223,10 @@ async def compute_hind_weights(
     """Compute hindsight importance weights for each non-outcome planner turn.
 
     For each turn t, builds a hindsight prompt
-    ``[state_i,t, "Given that the final outcome was {extract_answer}, how
-    necessary was this step?", action_i,t]``, runs it through *compute_logprobs*
-    to get token-level logprobs for the action tokens, then computes:
+    ``[state_i,t, "Given that the final outcome was {extract_answer} and final
+    reward was {traj_reward_agg}, what actions do you take in the next step?",
+    action_i,t]``, runs it through *compute_logprobs* to get token-level
+    logprobs for the action tokens, then computes:
 
         hind_i,t = exp(sum_logprobs / (temperature × len(action_tokens)))
         rho_i,t  = clip(hind_i,t / mean(hind), c_min, c_max)
@@ -228,6 +237,7 @@ async def compute_hind_weights(
     Args:
         output_buffer: All turns of the trajectory.
         extract_answer: Parsed final answer text.
+        traj_reward_agg: Trajectory-level aggregated reward.
         temperature: Softmax temperature for logprob weighting.
         c_min, c_max: Clipping bounds for rho.
         compute_logprobs: Async callback (prompt_ids) → per-token logprobs.
@@ -264,7 +274,8 @@ async def compute_hind_weights(
 
         # Build hindsight prompt.
         final_statement = (
-            f"Given that the final outcome was {extract_answer}, "
+            f"Given that the final outcome was {extract_answer} "
+            f"and final reward was {traj_reward_agg}, "
             "what actions do you take in the next step?"
         )
         hindsight_prompt = f"{state_text}\n{final_statement}"
