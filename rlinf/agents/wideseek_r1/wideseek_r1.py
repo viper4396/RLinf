@@ -1142,6 +1142,7 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
             "outcome_reward_metric": rollout_result.extra_fields_traj[
                 "outcome_reward"
             ],
+            "llm_reward_metric": rollout_result.extra_fields_traj["llm_reward"],
         }
         return _compute_rollout_metrics(
             rollout_batch=rollout_batch,

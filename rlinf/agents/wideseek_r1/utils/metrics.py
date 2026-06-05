@@ -269,6 +269,7 @@ def _compute_reward_metrics(rollout_batch: dict) -> dict:
     """Compute trajectory-level reward metrics."""
     traj_reward_agg = rollout_batch.get("traj_reward_agg_metric")
     outcome_reward = rollout_batch.get("outcome_reward_metric")
+    llm_reward = rollout_batch.get("llm_reward_metric")
 
     metrics: dict[str, float] = {}
     if traj_reward_agg is not None:
@@ -284,6 +285,14 @@ def _compute_reward_metrics(rollout_batch: dict) -> dict:
         _add_weighted_mean_metric(
             metrics,
             "wideseek_r1/traj/mean/outcome_reward",
+            sum(values),
+            len(values),
+        )
+    if llm_reward is not None:
+        values = [float(v) for v in llm_reward]
+        _add_weighted_mean_metric(
+            metrics,
+            "wideseek_r1/traj/mean/llm_reward",
             sum(values),
             len(values),
         )
