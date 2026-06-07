@@ -954,6 +954,7 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
             else None,
             llm_turn_rewards=llm_turn_rewards,
             hind_weights=hind_weights,
+            use_r1_method=self.cfg.agentloop.get("use_r1_method", False),
         )
 
         assert len(turn_rewards) == len(output_buffer), (

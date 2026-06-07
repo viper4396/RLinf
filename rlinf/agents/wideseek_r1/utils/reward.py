@@ -36,6 +36,7 @@ def credit_assignment(
     access_search_ratio: list[float] | None = None,
     llm_turn_rewards: list[float] | None = None,
     hind_weights: list[float] | None = None,
+    use_r1_method: bool = False,
 ):
     """Assign turn-level or trajectory-level rewards.
 
@@ -92,6 +93,84 @@ def credit_assignment(
         t_frac = (max_response_len - length_limit) / (max_length_limit - length_limit)
         t_frac = max(0.0, min(1.0, t_frac))
         length_penalty = t_frac * length_p
+
+    if use_r1_method:
+        format_reward = agentloop_config.get("format_reward", 0.0)
+        call_search_reward = agentloop_config.get("call_search_reward", 0.0)
+
+        search_credit = 0.0
+        for turn_output in output_buffer:
+            tool_call_info = turn_output.tool_call_info
+            if tool_call_info is None:
+                continue
+            if tool_call_info.get("access", 0) > 0:
+                search_credit = call_search_reward
+                break
+
+        one_turn_failed = any(
+            turn_output.extra_fields.get("turn_repeat_failed", False)
+            for turn_output in output_buffer
+        )
+
+        train_buffer: list[AgentLoopOutput] = []
+        if answer_format:
+            flag = False
+            for turn_output in output_buffer:
+                if (
+                    turn_output.extra_fields.get("context_failed", False)
+                    or turn_output.extra_fields.get("max_turn_limit_failed", False)
+                ) and turn_output.extra_fields.get("role", "") != "worker":
+                    flag = True
+
+            if not flag:
+                for turn_output in output_buffer:
+                    if not (
+                        turn_output.extra_fields.get("context_failed", False)
+                        or turn_output.extra_fields.get("max_turn_limit_failed", False)
+                    ):
+                        train_buffer.append(turn_output)
+                reward_score = (
+                    llm_reward + format_reward + search_credit - length_penalty
+                )
+                final_answer_format = 1
+            else:
+                for turn_output in output_buffer:
+                    if (
+                        turn_output.extra_fields.get("context_failed", False)
+                        or turn_output.extra_fields.get("max_turn_limit_failed", False)
+                    ) and turn_output.extra_fields.get("role", "") != "worker":
+                        train_buffer.append(turn_output)
+                reward_score = 0.0
+                final_answer_format = 0
+        else:
+            reward_score = 0.0
+            final_answer_format = 0
+            if succ_end:
+                train_buffer.append(output_buffer[-1])
+
+            if one_turn_failed:
+                for turn_output in output_buffer:
+                    if turn_output.extra_fields.get("turn_repeat_failed", False):
+                        if turn_output not in train_buffer:
+                            train_buffer.append(turn_output)
+            else:
+                for turn_output in output_buffer:
+                    if (
+                        turn_output.extra_fields.get("max_turn_limit_failed", False)
+                        or turn_output.extra_fields.get("context_failed", False)
+                    ):
+                        if turn_output not in train_buffer:
+                            train_buffer.append(turn_output)
+
+        turn_rewards = [reward_score] * len(output_buffer)
+        return (
+            output_buffer,
+            train_buffer,
+            final_answer_format,
+            turn_rewards,
+            reward_score,
+            reward_score,
+        )
 
     P = len(num_turn_subagents) if num_turn_subagents else 0
 

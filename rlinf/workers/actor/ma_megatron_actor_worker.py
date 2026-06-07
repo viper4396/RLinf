@@ -580,11 +580,16 @@ class MAMegatronActor(MegatronActor):
             if batch.get("advantages", None) is None:
                 mask = batch["response_mask"]  # [num_sequence, seq_len]
                 planner_turn_idx_list = batch.get("extra:planner_turn_idx", None)
+                use_r1 = self.cfg.agentloop.get("use_r1_method", False)
                 advantages, _ = calculate_adv_and_returns(
                     task_type=self.cfg.runner.task_type,
                     adv_type=self.cfg.algorithm.adv_type,
-                    advantage_mode=self.cfg.algorithm.advantage_mode,
-                    reward_mode=self.cfg.agentloop.get("reward_mode", "turn"),
+                    advantage_mode="trajectory"
+                    if use_r1
+                    else self.cfg.algorithm.advantage_mode,
+                    reward_mode="trajectory"
+                    if use_r1
+                    else self.cfg.agentloop.get("reward_mode", "turn"),
                     rewards=batch["rewards"].cuda(),
                     loss_mask=mask.cuda(),
                     num_sequence=len(batch["input_ids"]),
