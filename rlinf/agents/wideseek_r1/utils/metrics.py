@@ -296,6 +296,33 @@ def _compute_reward_metrics(rollout_batch: dict) -> dict:
             sum(values),
             len(values),
         )
+
+    # snapshot F1 scores: compute final-snapshot F1 and snapshot count.
+    snapshot_f1_scores = rollout_batch.get("snapshot_f1_scores_metric")
+    if snapshot_f1_scores is not None:
+        final_f1_values = []
+        snapshot_counts = []
+        for entry in snapshot_f1_scores:
+            if entry is None or not isinstance(entry, list):
+                continue
+            scores = [e[0] if isinstance(e, (list, tuple)) else float(e)
+                      for e in entry]
+            final_f1_values.append(scores[-1] if scores else 0.0)
+            snapshot_counts.append(len(scores))
+        if final_f1_values:
+            _add_weighted_mean_metric(
+                metrics,
+                "wideseek_r1/traj/mean/snapshot_f1_final",
+                sum(final_f1_values),
+                len(final_f1_values),
+            )
+        if snapshot_counts:
+            _add_weighted_mean_metric(
+                metrics,
+                "wideseek_r1/traj/mean/snapshot_count",
+                sum(snapshot_counts),
+                len(snapshot_counts),
+            )
     return metrics
 
 

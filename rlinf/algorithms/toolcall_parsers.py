@@ -208,6 +208,11 @@ class WideSeekQwenToolCallParser:
                         },
                     )
                 )
+        elif tool_name == "update_table":
+            cells = tool_arguments.get("cells", [])
+            if not isinstance(cells, list):
+                return []
+            return [ToolRequest(name="update_table", arguments={"cells": cells})]
         return function_calls
 
     @staticmethod

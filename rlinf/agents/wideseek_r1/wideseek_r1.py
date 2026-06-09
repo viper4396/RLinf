@@ -37,6 +37,7 @@ from rlinf.agents.wideseek_r1.utils.reward import (
     _compute_traj_bonuses,
     compute_hind_weights,
     credit_assignment,
+    evaluate_markdown,
     evaluate_turn_rewards,
     extract_final_answer,
     get_final_reward_score,
@@ -57,6 +58,94 @@ from rlinf.workers.agent.agent_loop import (
     MultiAgentLoopOutput,
     MultiAgentLoopWorker,
 )
+
+
+def _format_table_summary(table_state: dict, language: str) -> str:
+    """Format the current answer table as a text summary for worker prompts.
+
+    Args:
+        table_state: Double-dict with ``columns``, ``key_column``, and ``rows``.
+        language: ``"en"`` or ``"zh"``.
+
+    Returns:
+        Plain-text summary appended to the worker's user message.
+    """
+    if not table_state or not table_state.get("rows"):
+        return ""
+
+    columns = table_state.get("columns", [])
+    key_col = table_state.get("key_column", columns[0] if columns else "key")
+    rows = table_state.get("rows", {})
+
+    header = "| " + " | ".join(columns) + " |"
+    separator = "|" + "|".join("-" * (len(c) + 2) for c in columns) + "|"
+
+    body_lines = []
+    for row_key, row_data in rows.items():
+        cells = []
+        for col in columns:
+            if col == key_col:
+                cells.append(str(row_key))
+            else:
+                cell = row_data.get(col)
+                if cell is None:
+                    cells.append("(empty)")
+                else:
+                    val = cell["value"] if isinstance(cell, dict) else str(cell)
+                    cells.append(str(val))
+        body_lines.append("| " + " | ".join(cells) + " |")
+
+    table_md = "\n".join([header, separator] + body_lines)
+
+    if language == "zh":
+        return (
+            f"\n\n当前答案表格 ({len(rows)} 行, "
+            f"{len(columns)} 列, 主键: {key_col}):\n"
+            f"{table_md}\n\n"
+            f"收集到信息后，请使用 update_table 工具将已验证的数据写入表格的对应单元格。"
+        )
+    return (
+        f"\n\nCurrent answer table ({len(rows)} rows, "
+        f"{len(columns)} columns, key: {key_col}):\n"
+        f"{table_md}\n\n"
+        f"After collecting information, use the update_table tool to write "
+        f"verified cell values into the table."
+    )
+
+
+def _table_state_to_dataframe(table_state: dict):
+    """Convert a table_state double-dict to a pandas DataFrame.
+
+    Returns ``None`` when the table has no rows or is empty.
+    """
+    import pandas as pd
+
+    if not table_state or not table_state.get("rows"):
+        return None
+    columns = table_state.get("columns", [])
+    key_col = table_state.get("key_column", columns[0] if columns else "key")
+    if not columns:
+        return None
+
+    data = []
+    for row_key, row_data in table_state["rows"].items():
+        row = {col: None for col in columns}
+        row[key_col] = row_key
+        for col in columns:
+            cell = row_data.get(col)
+            if cell is not None and isinstance(cell, dict):
+                row[col] = cell.get("value")
+            elif cell is not None:
+                row[col] = cell
+        data.append(row)
+
+    return pd.DataFrame(data, columns=columns)
+
+
+def _deep_copy_table(table_state: dict) -> dict:
+    """Return a deep copy of *table_state* suitable for snapshot storage."""
+    import copy
+    return copy.deepcopy(table_state)
 
 
 class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
@@ -91,6 +180,7 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
             "llm_reward",
             "traj_reward_agg",
             "outcome_reward",
+            "snapshot_f1_scores",
         ]
 
         self.max_prompt_len = int(self.cfg.data.max_prompt_length)
@@ -285,7 +375,8 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
         is_markdown: bool,
         language: str,
         sub_traj_id: int,
-    ) -> tuple[list[AgentLoopOutput], str]:
+        table_state: dict | None = None,
+    ) -> tuple[list[AgentLoopOutput], str, list[int], bool, list[dict]]:
         """Execute one planner-created subtask through the worker role loop.
 
         Args:
@@ -294,9 +385,11 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
             is_markdown: Whether this sample expects markdown-table final answers.
             language: Prompt language (`en` or `zh`).
             sub_traj_id: Sub-trajectory index used for training regrouping.
+            table_state: Current answer table state for worker awareness.
 
         Returns:
-            Worker turn outputs, worker summary text, turn statistics, and failure flag.
+            Worker turn outputs, worker summary text, turn statistics, failure flag,
+            and pending cell writes from this worker.
         """
         assert worker_request.name == "subtask", (
             f"Expected 'subtask' tool, got {worker_request.name}"
@@ -316,6 +409,7 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
             _,
             task_failed,
             _,
+            worker_pending_cells,
         ) = await self.run_one_query_role(
             question=subtask,
             role="worker",
@@ -323,8 +417,15 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
             main_task=main_task,
             is_markdown=is_markdown,
             language=language,
+            table_state=table_state,
         )
-        return worker_outputs_buffer, answer_text, total_turn_list, task_failed
+        return (
+            worker_outputs_buffer,
+            answer_text,
+            total_turn_list,
+            task_failed,
+            worker_pending_cells,
+        )
 
     def _set_max_turns(self, role: str) -> int:
         if role == "planner":
@@ -362,6 +463,7 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
         is_markdown: bool,
         language: str,
         main_task: str | None,
+        table_state: dict | None = None,
     ) -> tuple[list[dict], list[dict]]:
         """Build role-specific prompt history and exposed tool descriptions.
 
@@ -371,6 +473,7 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
             is_markdown: Whether markdown answer format is required.
             language: Prompt language identifier (`en` or `zh`).
             main_task: Parent task text required for worker prompts.
+            table_state: Current answer table state, injected into worker prompt.
 
         Returns:
             A tuple of `(message_history, tools)` for chat-template rendering.
@@ -389,6 +492,14 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
                 main_task, origin_question, language=language
             )
             tools = [tools_description["search"], tools_description["access"]]
+            if is_markdown:
+                tools.append(tools_description["update_table"])
+                if table_state is not None and table_state.get("rows"):
+                    table_summary = _format_table_summary(table_state, language)
+                    assert message_history[-1]["role"] == "user"
+                    message_history[-1]["content"] = (
+                        message_history[-1]["content"] + table_summary
+                    )
         elif role == "single":
             message_history = get_prompt_single_agent(
                 origin_question, is_markdown=is_markdown, language=language
@@ -460,7 +571,8 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
         main_task: str | None = None,
         is_markdown: bool = False,
         language: str = "en",
-    ) -> tuple[list[AgentLoopOutput], str, list[int], list[int], list[float], list[int], bool, bool]:
+        table_state: dict | None = None,
+    ) -> tuple[list[AgentLoopOutput], str, list[int], list[int], list[float], list[int], bool, bool, list[dict]]:
         """Run one query under a specific role until stop, failure, or turn budget.
 
         Args:
@@ -470,9 +582,12 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
             main_task: Original task text required when `role == "worker"`.
             is_markdown: Whether markdown answer format is required.
             language: Prompt language.
+            table_state: Answer table state (planner-created, worker-read-only).
 
         Returns:
-            Tuple of `(output_buffer, answer_text, total_turn_list, num_turn_subagents, num_effective_subagents, access_search_ratio, task_failed, succ_end)`.
+            Tuple of `(output_buffer, answer_text, total_turn_list, num_turn_subagents,
+            num_effective_subagents, access_search_ratio, task_failed, succ_end,
+            pending_cells)`.
         """
 
         origin_question = question
@@ -481,6 +596,16 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
         num_turn_subagents = []
         num_effective_subagents = []
         access_search_ratio = []
+        worker_pending_cells: list[dict] = []
+
+        # Init table_state for markdown questions.
+        if is_markdown and role in ("planner", "single") and table_state is None:
+            table_state = {
+                "key_column": None,
+                "columns": [],
+                "rows": {},
+            }
+        table_snapshots: list[dict] = []
 
         # Planner turn counter: increments each time the planner/single-agent
         # executes a new turn.  Workers inherit their parentʼs counter.
@@ -492,6 +617,7 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
             is_markdown=is_markdown,
             language=language,
             main_task=main_task,
+            table_state=table_state,
         )
         max_turns = self._set_max_turns(role=role)
         max_allow_turns = self._set_max_allow_turns(role=role)
@@ -616,17 +742,26 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
                             is_markdown,
                             language,
                             sub_traj_id + i + sub_traj_num,
+                            table_state=table_state,
                         )
                     )
                 sub_traj_num += len(tasks)
                 num_turn_subagents.append(len(tasks))
                 worker_results = await asyncio.gather(*tasks)
 
-                # Count effective sub-agents and compute access/search ratio.
+                # Count effective sub-agents, compute access/search ratio,
+                # and collect deferred table cell writes.
                 num_effective = 0
                 turn_total_search = 0
                 turn_total_access = 0
-                for worker_outputs_buffer, _, _, w_task_failed in worker_results:
+                turn_pending_cells: list[dict] = []
+                for (
+                    worker_outputs_buffer,
+                    _,
+                    _,
+                    w_task_failed,
+                    w_pending_cells,
+                ) in worker_results:
                     has_search = False
                     for t in worker_outputs_buffer:
                         if t.tool_call_info:
@@ -638,6 +773,8 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
                                 has_search = True
                     if has_search and not w_task_failed:
                         num_effective += 1
+                    if w_pending_cells:
+                        turn_pending_cells.extend(w_pending_cells)
                 num_effective_subagents.append(num_effective)
                 ratio = (
                     turn_total_access / turn_total_search
@@ -646,12 +783,36 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
                 )
                 access_search_ratio.append(ratio)
 
+                # Batch-commit all pending cell writes from this planner turn.
+                if table_state is not None and turn_pending_cells:
+                    for cell in turn_pending_cells:
+                        row_key = cell["row_key"]
+                        column = cell["column"]
+                        value = cell["value"]
+                        if column not in table_state["columns"]:
+                            table_state["columns"].append(column)
+                        if table_state["key_column"] is None:
+                            table_state["key_column"] = table_state["columns"][0] if table_state["columns"] else "key"
+                        if row_key not in table_state["rows"]:
+                            table_state["rows"][row_key] = {}
+                        table_state["rows"][row_key][column] = {
+                            "value": value,
+                            "_meta": {
+                                "turn": len(num_turn_subagents),
+                                "worker": len(turn_pending_cells),
+                            },
+                        }
+                # Save table snapshot for this planner turn.
+                if table_state is not None:
+                    table_snapshots.append(_deep_copy_table(table_state))
+
                 tool_messages_text = []
                 for idx, (
                     worker_outputs_buffer,
                     worker_summary,
                     total_turn_list_worker,
                     task_failed,
+                    _w_pending_cells,
                 ) in enumerate(worker_results):
                     worker_buffer.extend(worker_outputs_buffer)
                     worker_turn_list.extend(total_turn_list_worker)
@@ -690,71 +851,97 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
 
             else:
                 # Worker/single executes search/access tools in parallel.
-                for tool_request in tool_requests:
-                    tasks.append(self.tool_call(tool_request))
-                tool_responses: list[ToolResponse] = await asyncio.gather(*tasks)
-
+                # Intercept update_table — deferred write, no external tool call.
+                search_access_requests = []
                 tool_messages_text = []
-                access_summary_jobs = []
-                for idx, (tool_request, tool_response) in enumerate(
-                    zip(tool_requests, tool_responses)
-                ):
-                    # Include the original request and the result
-                    if tool_request.name == "search":
-                        query = tool_request.arguments["query"]
-                        tool_messages_text.append(
-                            get_search_tool_message(
-                                query=query,
-                                search_result=tool_response.text,
-                                language=language,
-                            )
-                        )
-                    elif tool_request.name == "access":
-                        url = tool_request.arguments["url"]
-                        info_to_extract = tool_request.arguments["info_to_extract"]
-                        page_content = tool_response.text
-                        if self.use_access_summary:
-                            tool_messages_text.append(None)
-                            coro = self.access_sumamry(info_to_extract, page_content)
-                            access_summary_jobs.append(
-                                (idx, url, info_to_extract, coro)
+                for tool_request in tool_requests:
+                    if tool_request.name == "update_table":
+                        cells = tool_request.arguments.get("cells", [])
+                        for cell in cells:
+                            if isinstance(cell, dict) and all(
+                                k in cell for k in ("row_key", "column", "value")
+                            ):
+                                worker_pending_cells.append(cell)
+                        n = len(cells)
+                        if language == "zh":
+                            tool_messages_text.append(
+                                f"[表格写入] {n} 个单元格已加入待写入队列。"
                             )
                         else:
                             tool_messages_text.append(
-                                get_access_tool_message(
-                                    url=url,
-                                    page_content=page_content,
+                                f"[Table] {n} cell(s) queued for write."
+                            )
+                    else:
+                        search_access_requests.append(tool_request)
+
+                if search_access_requests:
+                    tasks = [
+                        self.tool_call(tr) for tr in search_access_requests
+                    ]
+                    tool_responses: list[ToolResponse] = await asyncio.gather(*tasks)
+
+                    access_summary_jobs = []
+                    for idx, (tool_request, tool_response) in enumerate(
+                        zip(search_access_requests, tool_responses)
+                    ):
+                        if tool_request.name == "search":
+                            query = tool_request.arguments["query"]
+                            tool_messages_text.append(
+                                get_search_tool_message(
+                                    query=query,
+                                    search_result=tool_response.text,
                                     language=language,
                                 )
                             )
-                    else:
-                        raise ValueError(
-                            f"Unknown tool request name: {tool_request.name}"
-                        )
+                        elif tool_request.name == "access":
+                            url = tool_request.arguments["url"]
+                            info_to_extract = tool_request.arguments.get(
+                                "info_to_extract", ""
+                            )
+                            page_content = tool_response.text
+                            if self.use_access_summary:
+                                tool_messages_text.append(None)
+                                coro = self.access_sumamry(
+                                    info_to_extract, page_content
+                                )
+                                access_summary_jobs.append(
+                                    (idx, url, info_to_extract, coro)
+                                )
+                            else:
+                                tool_messages_text.append(
+                                    get_access_tool_message(
+                                        url=url,
+                                        page_content=page_content,
+                                        language=language,
+                                    )
+                                )
 
-                if self.use_access_summary and access_summary_jobs:
-                    coros = [job[-1] for job in access_summary_jobs]
-                    summaries = await asyncio.gather(*coros)
-                    for job, summary in zip(access_summary_jobs, summaries):
-                        idx, url, info_to_extract, _ = job
-                        tool_messages_text[idx] = get_access_summary_tool_message(
-                            url=url,
-                            info_to_extract=info_to_extract,
-                            summary=summary,
-                            language=language,
-                        )
+                    if self.use_access_summary and access_summary_jobs:
+                        coros = [job[-1] for job in access_summary_jobs]
+                        summaries = await asyncio.gather(*coros)
+                        for job, summary in zip(access_summary_jobs, summaries):
+                            aidx, url, info_to_extract, _ = job
+                            tool_messages_text[aidx] = (
+                                get_access_summary_tool_message(
+                                    url=url,
+                                    info_to_extract=info_to_extract,
+                                    summary=summary,
+                                    language=language,
+                                )
+                            )
 
                 turn_hint = get_next_turn_hint(
                     next_turn_idx=turn_idx + 2,
                     max_turns=max_allow_turns,
                     language=language,
                 )
-                tool_messages.append(
-                    {
-                        "role": "tool",
-                        "content": "\n\n".join(tool_messages_text) + turn_hint,
-                    }
-                )
+                if tool_messages_text:
+                    tool_messages.append(
+                        {
+                            "role": "tool",
+                            "content": "\n\n".join(tool_messages_text) + turn_hint,
+                        }
+                    )
 
             # Tokenize tool responses
             tool_response_ids = self.get_tool_response_ids(tool_messages)
@@ -791,7 +978,18 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
             total_turn_list.append(turn_idx + 1)  # with no summary
         else:
             total_turn_list.append(turn_idx + 1)
-        return output_buffer, answer_text, total_turn_list, num_turn_subagents, num_effective_subagents, access_search_ratio, task_failed, succ_end
+
+        # Store final table state and snapshots on the last output turn.
+        if (
+            table_state is not None
+            and table_state.get("rows")
+            and output_buffer
+            and role in ("planner", "single")
+        ):
+            output_buffer[-1].extra_fields["table_state"] = table_state
+            output_buffer[-1].extra_fields["table_snapshots"] = table_snapshots
+
+        return output_buffer, answer_text, total_turn_list, num_turn_subagents, num_effective_subagents, access_search_ratio, task_failed, succ_end, worker_pending_cells
 
     async def run_one_query(self, prompt_ids: list[int], *, answer) -> AgentLoopOutput:
         """Run one sample end-to-end and attach reward/training metadata.
@@ -822,6 +1020,7 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
             access_search_ratio,
             task_failed,
             succ_end,
+            _,
         ) = await self.run_one_query_role(
             question=origin_question,
             role=role,
@@ -829,6 +1028,10 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
             is_markdown=is_markdown,
             language=language,
         )
+
+        final_table_state = None
+        if is_markdown and output_buffer:
+            final_table_state = output_buffer[-1].extra_fields.get("table_state")
 
         if is_markdown:
             final_answer_extract = extract_final_answer(answer_text, mode="markdown")
@@ -887,6 +1090,44 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
             + completion_weight * c_bonus
             - length_penalty_val
         ) if (succ_end and answer_format_ok) else 0.0
+
+        # Evaluate table snapshots against ground truth via LLM judge.
+        # Done before credit_assignment so info_gain (delta F1) can be used
+        # as a per-turn reward signal.
+        snapshot_f1_scores = []
+        if (
+            is_markdown
+            and self.llm_generator is not None
+            and output_buffer
+        ):
+            table_snapshots_eval = output_buffer[-1].extra_fields.get(
+                "table_snapshots", []
+            )
+            if table_snapshots_eval:
+                snapshot_jobs = []
+                for ts in table_snapshots_eval:
+                    df = _table_state_to_dataframe(ts)
+                    if df is not None and not df.empty:
+                        snapshot_jobs.append(
+                            evaluate_markdown(
+                                df, answer, self.llm_generator, norm_column
+                            )
+                        )
+                    else:
+                        snapshot_jobs.append(None)
+                if any(j is not None for j in snapshot_jobs):
+                    results = await asyncio.gather(
+                        *[j for j in snapshot_jobs if j is not None]
+                    )
+                    result_iter = iter(results)
+                    snapshot_f1_scores = [
+                        next(result_iter) if j is not None else (0.0, False)
+                        for j in snapshot_jobs
+                    ]
+                else:
+                    snapshot_f1_scores = [
+                        (0.0, False)
+                    ] * len(table_snapshots_eval)
 
         llm_as_turn_rm_cfg = self.cfg.agentloop.get("llm_as_turn_rm", False)
         if (
@@ -955,6 +1196,7 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
             llm_turn_rewards=llm_turn_rewards,
             hind_weights=hind_weights,
             use_r1_method=self.cfg.agentloop.get("use_r1_method", False),
+            info_gain_scores=snapshot_f1_scores,
         )
 
         assert len(turn_rewards) == len(output_buffer), (
@@ -1027,6 +1269,8 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
                 "num_valid_planner_turns": num_valid_planner_turns,
                 "num_valid_worker_turns": num_valid_worker_turns,
                 "final_answer_format": final_answer_format,
+                "table_state": final_table_state,
+                "snapshot_f1_scores": snapshot_f1_scores,
             },
         )
         return output
@@ -1144,6 +1388,9 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
                 "outcome_reward"
             ],
             "llm_reward_metric": rollout_result.extra_fields_traj["llm_reward"],
+            "snapshot_f1_scores_metric": rollout_result.extra_fields_traj[
+                "snapshot_f1_scores"
+            ],
         }
         return _compute_rollout_metrics(
             rollout_batch=rollout_batch,

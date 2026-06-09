@@ -37,6 +37,7 @@ def credit_assignment(
     llm_turn_rewards: list[float] | None = None,
     hind_weights: list[float] | None = None,
     use_r1_method: bool = False,
+    info_gain_scores: list[tuple[float, bool]] | None = None,
 ):
     """Assign turn-level or trajectory-level rewards.
 
@@ -194,7 +195,7 @@ def credit_assignment(
         if use_hind or use_llm_rm:
             if use_hind:
                 outcome_reward = (
-                    (llm_reward - length_penalty) if (succ_end and answer_format) else 0.0
+                    llm_reward if (succ_end and answer_format) else 0.0
                 )
             else:
                 outcome_reward = traj_reward_agg
@@ -229,7 +230,7 @@ def credit_assignment(
                     turn_rewards.append(0.0)
         else:
             outcome_reward = (
-                (llm_reward - length_penalty) if (succ_end and answer_format) else 0.0
+                llm_reward if (succ_end and answer_format) else 0.0
             )
             turn_rewards = [traj_reward_agg] * len(output_buffer)
 
@@ -242,7 +243,7 @@ def credit_assignment(
             outcome_reward = traj_reward_agg
         else:
             outcome_reward = (
-                (llm_reward - length_penalty) if (succ_end and answer_format) else 0.0
+                llm_reward if (succ_end and answer_format) else 0.0
             )
 
         planner_turn_rewards: list[float] = []
@@ -268,6 +269,21 @@ def credit_assignment(
                     c_i = 0.0
                 reward = parallelism_weight * p_i + completion_weight * c_i
             planner_turn_rewards.append(reward)
+
+        # Info-gain reward: delta F1 between adjacent snapshots.
+        # Only applies when llm_as_turn_rm=False (formula-based turn rewards).
+        if (
+            not use_llm_rm
+            and info_gain_scores is not None
+            and len(info_gain_scores) >= P
+        ):
+            info_gain_weight = agentloop_config.get("info_gain_weight", 0.0)
+            if info_gain_weight != 0.0:
+                for i in range(P):
+                    cur_f1 = info_gain_scores[i][0]
+                    prev_f1 = info_gain_scores[i - 1][0] if i > 0 else 0.0
+                    delta_f1 = cur_f1 - prev_f1
+                    planner_turn_rewards[i] += info_gain_weight * delta_f1
 
         # Scale all turn rewards when total planner turns exceeds soft limit.
         if P > max_planner_turns:

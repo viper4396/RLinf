@@ -122,8 +122,19 @@ agentloop:
   max_toolcall_per_worker: 5
   is_dynamic_rollout_batch: True
 
+  # use original R1 flat reward (format + search + llm - length) instead of turn/traj modes.
+  # When true, reward_mode and advantage_mode are forced to "trajectory".
+  use_r1_method: False
+
   # reward mode: "turn" for per-turn rewards, "trajectory" for single traj-level reward
   reward_mode: turn
+
+  # r1 method rewards (only used when use_r1_method=True)
+  format_reward: 0.1               # bonus for producing a valid answer format
+  call_search_reward: 0.05         # bonus when at least one access call exists in the trajectory
+
+  # info-gain reward: delta F1 between adjacent table snapshots (reward_mode=turn, llm_as_turn_rm=False)
+  info_gain_weight: 1.0           # weight for per-turn F1 delta; 0.0 to disable
 
   # turn-level reward shaping (reward_mode=turn)
   llm_as_turn_rm: False             # when True, use LLM judge for per-turn rewards; when False, use formula-based

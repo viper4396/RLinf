@@ -103,6 +103,41 @@ tools_description_en = {
             },
         },
     },
+    "update_table": {
+        "type": "function",
+        "function": {
+            "name": "update_table",
+            "description": "Write cell values to the answer table. Each cell is identified by a row key and column name. New rows and columns are auto-created if they don't exist. You may write multiple cells in a single call, but only write cells whose values you have reliably verified from your search/access results.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "cells": {
+                        "type": "array",
+                        "description": "List of cells to write to the answer table.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "row_key": {
+                                    "type": "string",
+                                    "description": "The primary key value identifying the row (e.g. company name, entity name).",
+                                },
+                                "column": {
+                                    "type": "string",
+                                    "description": "The column name for this cell.",
+                                },
+                                "value": {
+                                    "type": "string",
+                                    "description": "The verified value to write into this cell.",
+                                },
+                            },
+                            "required": ["row_key", "column", "value"],
+                        },
+                    },
+                },
+                "required": ["cells"],
+            },
+        },
+    },
     "access_single_agent": {
         "type": "function",
         "function": {
@@ -236,6 +271,41 @@ tools_description_zh = {
                     },
                 },
                 "required": ["queries"],
+            },
+        },
+    },
+    "update_table": {
+        "type": "function",
+        "function": {
+            "name": "update_table",
+            "description": "将单元格值写入答案表格。每个单元格由行键和列名唯一标识。如果行或列不存在，系统会自动创建。一次调用可以写入多个单元格，但请只写入通过搜索/访问工具可靠验证过的值。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "cells": {
+                        "type": "array",
+                        "description": "要写入答案表格的单元格列表。",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "row_key": {
+                                    "type": "string",
+                                    "description": "标识该行的主键值（例如公司名称、实体名称）。",
+                                },
+                                "column": {
+                                    "type": "string",
+                                    "description": "该单元格的列名。",
+                                },
+                                "value": {
+                                    "type": "string",
+                                    "description": "要写入该单元格的已验证值。",
+                                },
+                            },
+                            "required": ["row_key", "column", "value"],
+                        },
+                    },
+                },
+                "required": ["cells"],
             },
         },
     },
