@@ -224,6 +224,15 @@ A common approach is to first use the search tool for high-level snippet discove
 
 You can perform multiple turns of tool calls. In each turn, you should reflect on the results from the previous tool call before deciding on the next set of actions. Continue this process until you believe you have gathered sufficient knowledge to solve your subtask.
 
+# Table Writing Tool (update_table)
+When your task involves filling in an answer table, you may also use the update_table tool to write verified cell values into the shared table. Important rules:
+
+- Only write cells whose values you have reliably verified from your search/access results. Do not guess or fabricate values.
+- Write at the individual cell level: each entry specifies a row_key, a column name, and a verified value.
+- You are not responsible for filling the entire table — only the cells relevant to your assigned subtask.
+- The current table state (with empty/non-empty cells) is shown in your user message. Use it to identify which cells your subtask should fill.
+- Your cell writes will be batched together with writes from other sub-agents and applied after all sub-agents in the current round complete. You will not see the updated table until the next planner turn.
+
 # Final Answer
 If you determine that no further external knowledge is required, you may proceed to provide a final summary along with supporting detailed information for this subtask. This summary will be returned to the main agent to assist it in making subsequent decisions.
 
@@ -248,6 +257,15 @@ SYSTEM_PROMPT_WORKER_ZH = """# 角色
 一种常见做法是：先用搜索工具进行高层次的片段发现，然后再对某个具体URL使用访问工具，以提取更详细的内容。记住：只能使用搜索工具提供的URL——不要自行编造或虚构URL。
 
 你可以进行多轮工具调用。在每一轮中，你都应先反思上一轮工具调用的结果，再决定下一组行动。持续这一过程，直到你认为已收集到足够的知识来完成你的子任务。
+
+# 表格写入工具（update_table）
+当你的任务涉及填写答案表格时，你还可以使用 update_table 工具将已验证的单元格值写入共享表格。重要规则：
+
+- 只能写入通过搜索/访问工具可靠验证过的值。不要猜测或编造数据。
+- 以单元格为单位写入：每条记录指定一个行键（row_key）、一个列名（column）和一个已验证的值（value）。
+- 你不需要填写整个表格——只填写与你的子任务相关的单元格即可。
+- 当前表格状态（包含已填和未填的单元格）会在你的用户消息中显示。请根据它判断你的子任务需要填写哪些单元格。
+- 你的单元格写入会与本轮其他子代理的写入一起批处理，在当前轮所有子代理完成后统一应用。你在下一轮 planner turn 之前不会看到更新后的表格。
 
 # 最终答案
 如果你判断不需要进一步的外部知识，你可以继续提供该子任务的最终总结，并附上支持性的详细信息。该总结将返回给主代理，以帮助其进行后续决策。
