@@ -229,6 +229,7 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
         subtask_count = 0
         search_count = 0
         access_count = 0
+        update_table_count = 0
         for request in tool_requests:
             if request.name == "subtask":
                 subtask_count += 1
@@ -236,10 +237,13 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
                 search_count += 1
             elif request.name == "access":
                 access_count += 1
+            elif request.name == "update_table":
+                update_table_count += 1
         return {
             "subtask": subtask_count,
             "search": search_count,
             "access": access_count,
+            "update_table": update_table_count,
             "role": role,
         }
 
@@ -1225,22 +1229,34 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
             subtask_count = 0
             search_count = 0
             access_count = 0
+            update_table_count = 0
             if single_turn_output.tool_call_info is not None:
                 role = single_turn_output.tool_call_info.get("role", "")
                 subtask_count = single_turn_output.tool_call_info.get("subtask", 0)
                 search_count = single_turn_output.tool_call_info.get("search", 0)
                 access_count = single_turn_output.tool_call_info.get("access", 0)
+                update_table_count = single_turn_output.tool_call_info.get(
+                    "update_table", 0
+                )
 
                 # Track valid turns by role
                 if role == "planner":
                     assert subtask_count > 0
                     num_valid_planner_turns += 1
                 elif role == "worker" or role == "single":
-                    assert search_count > 0 or access_count > 0
+                    update_table_count = single_turn_output.tool_call_info.get(
+                        "update_table", 0
+                    )
+                    assert (
+                        search_count > 0
+                        or access_count > 0
+                        or update_table_count > 0
+                    )
                     num_valid_worker_turns += 1
             single_turn_output.extra_fields["subtask_count"] = subtask_count
             single_turn_output.extra_fields["search_count"] = search_count
             single_turn_output.extra_fields["access_count"] = access_count
+            single_turn_output.extra_fields["update_table_count"] = update_table_count
             single_turn_output.extra_fields["tool_call_info"] = (
                 single_turn_output.tool_call_info
             )
