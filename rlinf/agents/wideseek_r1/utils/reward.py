@@ -36,7 +36,6 @@ def credit_assignment(
     access_search_ratio: list[float] | None = None,
     llm_turn_rewards: list[float] | None = None,
     hind_weights: list[float] | None = None,
-    use_r1_method: bool = False,
 ):
     """Assign turn-level or trajectory-level rewards.
 
@@ -67,7 +66,7 @@ def credit_assignment(
         hind_weights: Optional hindsight importance weights (rho_i,t).
 
     Returns:
-        ``(output_buffer, train_buffer, final_answer_format, turn_rewards)``.
+        ``(output_buffer, train_buffer, final_answer_format, turn_rewards, traj_reward_agg, outcome_reward)``.
     """
     reward_mode = agentloop_config.get("reward_mode", "turn")
     length_penalty = 0.0
@@ -94,84 +93,6 @@ def credit_assignment(
         t_frac = max(0.0, min(1.0, t_frac))
         length_penalty = t_frac * length_p
 
-    if use_r1_method:
-        format_reward = agentloop_config.get("format_reward", 0.0)
-        call_search_reward = agentloop_config.get("call_search_reward", 0.0)
-
-        search_credit = 0.0
-        for turn_output in output_buffer:
-            tool_call_info = turn_output.tool_call_info
-            if tool_call_info is None:
-                continue
-            if tool_call_info.get("access", 0) > 0:
-                search_credit = call_search_reward
-                break
-
-        one_turn_failed = any(
-            turn_output.extra_fields.get("turn_repeat_failed", False)
-            for turn_output in output_buffer
-        )
-
-        train_buffer: list[AgentLoopOutput] = []
-        if answer_format:
-            flag = False
-            for turn_output in output_buffer:
-                if (
-                    turn_output.extra_fields.get("context_failed", False)
-                    or turn_output.extra_fields.get("max_turn_limit_failed", False)
-                ) and turn_output.extra_fields.get("role", "") != "worker":
-                    flag = True
-
-            if not flag:
-                for turn_output in output_buffer:
-                    if not (
-                        turn_output.extra_fields.get("context_failed", False)
-                        or turn_output.extra_fields.get("max_turn_limit_failed", False)
-                    ):
-                        train_buffer.append(turn_output)
-                reward_score = (
-                    llm_reward + format_reward + search_credit - length_penalty
-                )
-                final_answer_format = 1
-            else:
-                for turn_output in output_buffer:
-                    if (
-                        turn_output.extra_fields.get("context_failed", False)
-                        or turn_output.extra_fields.get("max_turn_limit_failed", False)
-                    ) and turn_output.extra_fields.get("role", "") != "worker":
-                        train_buffer.append(turn_output)
-                reward_score = 0.0
-                final_answer_format = 0
-        else:
-            reward_score = 0.0
-            final_answer_format = 0
-            if succ_end:
-                train_buffer.append(output_buffer[-1])
-
-            if one_turn_failed:
-                for turn_output in output_buffer:
-                    if turn_output.extra_fields.get("turn_repeat_failed", False):
-                        if turn_output not in train_buffer:
-                            train_buffer.append(turn_output)
-            else:
-                for turn_output in output_buffer:
-                    if (
-                        turn_output.extra_fields.get("max_turn_limit_failed", False)
-                        or turn_output.extra_fields.get("context_failed", False)
-                    ):
-                        if turn_output not in train_buffer:
-                            train_buffer.append(turn_output)
-
-        turn_rewards = [reward_score] * len(output_buffer)
-        return (
-            output_buffer,
-            train_buffer,
-            final_answer_format,
-            turn_rewards,
-            reward_score,
-            reward_score,
-        )
-
     P = len(num_turn_subagents) if num_turn_subagents else 0
 
     # trajectory-level aggregate bonuses (used by both modes)
@@ -192,12 +113,7 @@ def credit_assignment(
         )
 
         if use_hind or use_llm_rm:
-            if use_hind:
-                outcome_reward = (
-                    (llm_reward - length_penalty) if (succ_end and answer_format) else 0.0
-                )
-            else:
-                outcome_reward = traj_reward_agg
+            outcome_reward = traj_reward_agg
             gamma = agentloop_config.get("gamma", 0.9)
 
             planner_turn_rewards: list[float] = []
@@ -228,9 +144,7 @@ def credit_assignment(
                 else:
                     turn_rewards.append(0.0)
         else:
-            outcome_reward = (
-                (llm_reward - length_penalty) if (succ_end and answer_format) else 0.0
-            )
+            outcome_reward = traj_reward_agg
             turn_rewards = [traj_reward_agg] * len(output_buffer)
 
     else:
@@ -287,13 +201,12 @@ def credit_assignment(
 
     train_buffer: list[AgentLoopOutput] = list(output_buffer)
     final_answer_format = 1 if answer_format else 0
-    return output_buffer, train_buffer, final_answer_format, turn_rewards
+    return output_buffer, train_buffer, final_answer_format, turn_rewards, traj_reward_agg, outcome_reward
 
 
 async def compute_hind_weights(
     output_buffer: list[AgentLoopOutput],
     extract_answer: str,
-    traj_reward_agg: float = 0.0,
     temperature: float = 1.0,
     c_min: float = 0.1,
     c_max: float = 5.0,
@@ -302,10 +215,9 @@ async def compute_hind_weights(
     """Compute hindsight importance weights for each non-outcome planner turn.
 
     For each turn t, builds a hindsight prompt
-    ``[state_i,t, "Given that the final outcome was {extract_answer} and final
-    reward was {traj_reward_agg}, what actions do you take in the next step?",
-    action_i,t]``, runs it through *compute_logprobs* to get token-level
-    logprobs for the action tokens, then computes:
+    ``[state_i,t, "Given that the final outcome was {extract_answer}, how
+    necessary was this step?", action_i,t]``, runs it through *compute_logprobs*
+    to get token-level logprobs for the action tokens, then computes:
 
         hind_i,t = exp(sum_logprobs / (temperature × len(action_tokens)))
         rho_i,t  = clip(hind_i,t / mean(hind), c_min, c_max)
@@ -316,7 +228,6 @@ async def compute_hind_weights(
     Args:
         output_buffer: All turns of the trajectory.
         extract_answer: Parsed final answer text.
-        traj_reward_agg: Trajectory-level aggregated reward.
         temperature: Softmax temperature for logprob weighting.
         c_min, c_max: Clipping bounds for rho.
         compute_logprobs: Async callback (prompt_ids) → per-token logprobs.
@@ -353,8 +264,7 @@ async def compute_hind_weights(
 
         # Build hindsight prompt.
         final_statement = (
-            f"Given that the final outcome was {extract_answer} "
-            f"and final reward was {traj_reward_agg}, "
+            f"Given that the final outcome was {extract_answer}, "
             "what actions do you take in the next step?"
         )
         hindsight_prompt = f"{state_text}\n{final_statement}"

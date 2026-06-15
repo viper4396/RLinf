@@ -84,9 +84,6 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
             "num_valid_planner_turns",
             "num_valid_worker_turns",
             "total_turn_list",
-            "num_turn_subagents",
-            "num_effective_subagents",
-            "access_search_ratio",
             "final_answer_format",
             "llm_reward",
             "traj_reward_agg",
@@ -857,37 +854,9 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
             reward_mode == "trajectory" and advantage_mode == "trajectory"
         )
 
-        # Pre-compute traj_reward_agg once for both LLM turn judge and hindsight.
-        length_limit = self.cfg.agentloop.get("length_limit", 5000)
-        max_length_limit = self.cfg.agentloop.get("max_length_limit", 7000)
-        length_p = self.cfg.agentloop.get("length_penalty", 0.0)
-        max_response_len = max(
-            (len(t.response_ids) for t in output_buffer if t.response_ids),
-            default=0,
-        )
-        length_penalty_val = 0.0
-        if max_response_len > length_limit:
-            t_frac = (max_response_len - length_limit) / (max_length_limit - length_limit)
-            t_frac = max(0.0, min(1.0, t_frac))
-            length_penalty_val = t_frac * length_p
-
-        p_bonus, c_bonus = _compute_traj_bonuses(
-            num_turn_subagents,
-            num_effective_subagents,
-            output_buffer,
-            self.cfg.agentloop.get("max_workers_per_planner", 10),
-            self.cfg.agentloop.get("parallelism_epsilon", 0.01),
-        )
-        parallelism_weight = self.cfg.agentloop.get("parallelism_weight", 0.0)
-        completion_weight = self.cfg.agentloop.get("completion_weight", 0.0)
-        answer_format_ok = final_answer_extract is not None and format is True
-        traj_reward_agg_pre = (
-            llm_reward
-            + parallelism_weight * p_bonus
-            + completion_weight * c_bonus
-            - length_penalty_val
-        ) if (succ_end and answer_format_ok) else 0.0
-
+        # Pre-compute outcome_reward for the LLM turn judge so it sees the
+        # full traj_reward_agg (bonuses + length_penalty) rather than bare
+        # llm_reward.  Mirrors the formula in credit_assignment.
         llm_as_turn_rm_cfg = self.cfg.agentloop.get("llm_as_turn_rm", False)
         if (
             llm_as_turn_rm_cfg
@@ -895,13 +864,45 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
             and self.llm_generator is not None
             and not skip_llm_judge
         ):
+            # length_penalty
+            length_limit = self.cfg.agentloop.get("length_limit", 5000)
+            max_length_limit = self.cfg.agentloop.get("max_length_limit", 7000)
+            length_p = self.cfg.agentloop.get("length_penalty", 0.0)
+            max_response_len = max(
+                (len(t.response_ids) for t in output_buffer if t.response_ids),
+                default=0,
+            )
+            length_penalty_val = 0.0
+            if max_response_len > length_limit:
+                t_frac = (max_response_len - length_limit) / (max_length_limit - length_limit)
+                t_frac = max(0.0, min(1.0, t_frac))
+                length_penalty_val = t_frac * length_p
+
+            p_bonus, c_bonus = _compute_traj_bonuses(
+                num_turn_subagents,
+                num_effective_subagents,
+                output_buffer,
+                self.cfg.agentloop.get("max_workers_per_planner", 10),
+                self.cfg.agentloop.get("parallelism_epsilon", 0.01),
+            )
+            parallelism_weight = self.cfg.agentloop.get("parallelism_weight", 0.0)
+            completion_weight = self.cfg.agentloop.get("completion_weight", 0.0)
+
+            answer_format_ok = final_answer_extract is not None and format is True
+            outcome_reward = (
+                llm_reward
+                + parallelism_weight * p_bonus
+                + completion_weight * c_bonus
+                - length_penalty_val
+            ) if (succ_end and answer_format_ok) else 0.0
+
             ground_truth = answer.get("answer", "")
             if isinstance(ground_truth, list):
                 ground_truth = ground_truth[0] if ground_truth else ""
             llm_turn_rewards = await evaluate_turn_rewards(
                 question=origin_question,
                 ground_truth=str(ground_truth),
-                outcome_reward=traj_reward_agg_pre,
+                outcome_reward=outcome_reward,
                 output_buffer=output_buffer,
                 judge_llm_generator=self.llm_generator,
                 num_planner_turns=len(num_turn_subagents)
@@ -923,7 +924,6 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
             hind_weights = await compute_hind_weights(
                 output_buffer=output_buffer,
                 extract_answer=str(final_answer_extract),
-                traj_reward_agg=traj_reward_agg_pre,
                 temperature=self.cfg.agentloop.get("hind_temperature", 1.0),
                 c_min=self.cfg.agentloop.get("hind_clip_min", 0.1),
                 c_max=self.cfg.agentloop.get("hind_clip_max", 5.0),
@@ -954,7 +954,6 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
             else None,
             llm_turn_rewards=llm_turn_rewards,
             hind_weights=hind_weights,
-            use_r1_method=self.cfg.agentloop.get("use_r1_method", False),
         )
 
         assert len(turn_rewards) == len(output_buffer), (
@@ -1143,6 +1142,7 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
             "outcome_reward_metric": rollout_result.extra_fields_traj[
                 "outcome_reward"
             ],
+            "llm_reward_metric": rollout_result.extra_fields_traj["llm_reward"],
         }
         return _compute_rollout_metrics(
             rollout_batch=rollout_batch,

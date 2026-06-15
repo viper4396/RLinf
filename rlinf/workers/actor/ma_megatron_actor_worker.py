@@ -595,6 +595,11 @@ class MAMegatronActor(MegatronActor):
                     num_sequence=len(batch["input_ids"]),
                     group_size=self.cfg.algorithm.group_size,
                     idx_to_traj=batch["idx_to_traj"],
+                    planner_turn_idx=planner_turn_idx_list.tolist()
+                    if planner_turn_idx_list is not None
+                    else None,
+                    gamma=self.cfg.algorithm.get("gamma", 0.9),
+                    omega=self.cfg.algorithm.get("omega", 0.5),
                     kl_beta=self.cfg.algorithm.get("reinpp_kl_beta", 0.0),
                     kl_penalty_type=self.kl_penalty_type,
                     logprob=batch["prev_logprobs"].cuda()
