@@ -1431,7 +1431,9 @@ class DynamicRolloutResult:
         for suffix, prefixes in pack_map.items():
             idxes = [*prefixes, suffix]
             assert len(idxes) >= 2
-            assert len({split_params["rewards"][idx].item() for idx in idxes}) == 1
+            # Note: rewards may differ across turns (turn-level reward shaping).
+            # They are already consumed by advantage computation before packing,
+            # so this invariant is no longer required.
 
             # Merge additive token-level stats over response tokens only.
             for key in ["prev_logprobs", "advantages"]:

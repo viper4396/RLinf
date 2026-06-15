@@ -84,10 +84,11 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
             "num_valid_planner_turns",
             "num_valid_worker_turns",
             "total_turn_list",
+            "num_turn_subagents",
+            "num_effective_subagents",
+            "access_search_ratio",
             "final_answer_format",
             "llm_reward",
-            "traj_reward_agg",
-            "outcome_reward",
         ]
 
         self.max_prompt_len = int(self.cfg.data.max_prompt_length)
@@ -930,30 +931,25 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
                 compute_logprobs=self.compute_token_logprobs,
             )
 
-        (
-            output_buffer,
-            train_buffer,
-            final_answer_format,
-            turn_rewards,
-            traj_reward_agg,
-            outcome_reward,
-        ) = credit_assignment(
-            agentloop_config=self.cfg.agentloop,
-            output_buffer=output_buffer,
-            llm_reward=llm_reward,
-            succ_end=succ_end,
-            answer_format=final_answer_extract is not None and format is True,
-            num_turn_subagents=num_turn_subagents
-            if self.workflow == "mas"
-            else None,
-            num_effective_subagents=num_effective_subagents
-            if self.workflow == "mas"
-            else None,
-            access_search_ratio=access_search_ratio
-            if self.workflow == "mas"
-            else None,
-            llm_turn_rewards=llm_turn_rewards,
-            hind_weights=hind_weights,
+        output_buffer, train_buffer, final_answer_format, turn_rewards = (
+            credit_assignment(
+                agentloop_config=self.cfg.agentloop,
+                output_buffer=output_buffer,
+                llm_reward=llm_reward,
+                succ_end=succ_end,
+                answer_format=final_answer_extract is not None and format is True,
+                num_turn_subagents=num_turn_subagents
+                if self.workflow == "mas"
+                else None,
+                num_effective_subagents=num_effective_subagents
+                if self.workflow == "mas"
+                else None,
+                access_search_ratio=access_search_ratio
+                if self.workflow == "mas"
+                else None,
+                llm_turn_rewards=llm_turn_rewards,
+                hind_weights=hind_weights,
+            )
         )
 
         assert len(turn_rewards) == len(output_buffer), (
@@ -1014,10 +1010,9 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
             extra_fields={
                 "final_answer": final_answer_extract,
                 "final_answer_text": answer_text,
+                "reward": reward_score,
                 "origin_question": origin_question,
                 "llm_reward": llm_reward,
-                "traj_reward_agg": traj_reward_agg,
-                "outcome_reward": outcome_reward,
                 "total_turn_list": total_turn_list if self.workflow == "mas" else None,
                 "num_turn_subagents": num_turn_subagents if self.workflow == "mas" else None,
                 "num_effective_subagents": num_effective_subagents if self.workflow == "mas" else None,
@@ -1136,13 +1131,6 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
             "final_answer_format": rollout_result.extra_fields_traj[
                 "final_answer_format"
             ],
-            "traj_reward_agg_metric": rollout_result.extra_fields_traj[
-                "traj_reward_agg"
-            ],
-            "outcome_reward_metric": rollout_result.extra_fields_traj[
-                "outcome_reward"
-            ],
-            "llm_reward_metric": rollout_result.extra_fields_traj["llm_reward"],
         }
         return _compute_rollout_metrics(
             rollout_batch=rollout_batch,
