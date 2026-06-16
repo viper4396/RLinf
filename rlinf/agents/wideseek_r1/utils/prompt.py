@@ -510,12 +510,10 @@ USER_PROMPT_SINGLE_AGENT_ZH = """# 任务
 # 说明
 请为此任务提供详细的答案和支持信息。"""
 
-BOXED_FORMAT_EN = "If you determine that no further external knowledge is required, you have to wrap your final answer in \\boxed{}."
-MARKDOWN_FORMAT_EN = "If you determine that no further external knowledge is required, you have to wrap your final answer in the following format \n```markdown\n{data_content}\n```"
-BOXED_FORMAT_ZH = (
-    "如果你判断不再需要额外的外部知识，你必须将最终答案用 \\boxed{} 包裹。"
-)
-MARKDOWN_FORMAT_ZH = "如果你判断不再需要额外的外部知识，你必须将最终答案按如下格式包裹：\n```markdown\n{data_content}\n```"
+BOXED_FORMAT_EN = "If you determine that no further external knowledge is required, you have to wrap your final answer in <answer> tags with \\boxed{} inside:\n<answer>\n\\boxed{{{data_content}}}\n</answer>"
+MARKDOWN_FORMAT_EN = "If you determine that no further external knowledge is required, you have to wrap your final answer in <answer> tags with markdown format inside:\n<answer>\n```markdown\n{data_content}\n```\n</answer>"
+BOXED_FORMAT_ZH = "如果你判断不再需要额外的外部知识，你必须将最终答案用 <answer> 标签包裹，并在其中使用 \\boxed{}：\n<answer>\n\\boxed{{{data_content}}}\n</answer>"
+MARKDOWN_FORMAT_ZH = "如果你判断不再需要额外的外部知识，你必须将最终答案用 <answer> 标签包裹，并在其中使用 markdown 格式：\n<answer>\n```markdown\n{data_content}\n```\n</answer>"
 
 
 LLM_JUDGE_PROMPT = """Question: {question}
@@ -527,3 +525,20 @@ Predicted Answer: {response}
 Did the model give an answer **equivalent** to the labeled answer?
 
 Please respond with "Correct" if they are equivalent, or "Incorrect" if they are not equivalent. Do not include any other text."""
+
+LLM_JUDGE_TURN_PROMPT = """Question: {question}
+Ground Truth: {ground_truth}
+Overall Outcome Reward: {outcome_reward}
+
+Full Trajectory:
+{trajectory_text}
+
+For each planner turn in the trajectory above, evaluate how much that turn contributed to
+the final outcome.  A positive score (>0) means the turn's actions (creating sub-agents,
+choosing subtasks, processing results) helped move toward the correct answer.  A negative
+score (<0) means the turn's actions hurt progress (e.g., irrelevant subtasks, wrong focus).
+
+Output a JSON array of scores, one per planner turn, each in [-1.0, 1.0].  The array length
+must equal the number of planner turns shown above.  Output ONLY the JSON array, no other text.
+
+Example output: [0.8, -0.3, 0.5]"""

@@ -572,7 +572,11 @@ class MultiAgentLoopWorker(AgentLoopWorker):
             "__sum__/": sum,
             "__max__/": max,
             "__min__/": min,
-            "__mean__/": lambda x: sum(i[0] for i in x) / sum(i[1] for i in x),
+            "__mean__/": lambda x: (
+                sum(i[0] for i in x) / sum(i[1] for i in x)
+                if sum(i[1] for i in x) > 0
+                else 0.0
+            ),
         }
         for key in all_keys:
             for stat_key in stat_methods:

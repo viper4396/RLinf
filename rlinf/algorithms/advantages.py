@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from typing import Optional
 
 import torch
@@ -134,32 +135,39 @@ def compute_grpo_dynamic_advantages(
     Compute GRPO advantages for multi-turn multi-agent scenarios.
 
     IMPORTANT: This function computes advantages PER QUESTION, not globally.
-    - idx_to_traj maps turn_idx -> global_traj_idx (e.g., [0,0,1,1,2,2,3,3,4,4,...,15,15])
-    - Trajectories 0-3 belong to question 0, 4-7 to question 1, etc.
-    - We must compute GRPO separately for each question's group_size trajectories
+    - idx_to_traj maps turn_idx -> global_traj_idx
+    - Trajectories 0..(group_size-1) belong to question 0, etc.
 
-    Two advantage computation modes:
-    1. "trajectory": Trajectory-level GRPO (Method 1)
-       - Compute mean/std over group_size trajectory rewards per question
-       - Broadcast same advantage to all turns in a trajectory
-       - Example: Q0 has 4 trajs with 1,2,3,4 turns. Compute GRPO over 4 traj rewards,
-                  then assign traj0_adv to its 1 turn, traj1_adv to its 2 turns, etc.
+    Two advantage computation modes (set via ``advantage_mode`` in config):
 
-    2. "turn": Turn-level GRPO (Method 2)
-       - Compute mean/std over all turns within each question
-       - Example: Q0 has 4 trajs with 1,2,3,4 turns = 10 turns total.
-                  Compute GRPO over these 10 turn rewards (currently all same within traj).
-       - Future-proof: works when turns have different rewards within same trajectory
+    1. **"trajectory"** — discounted trajectory-level GRPO.
+       ``traj_reward_i = Σ(k=0..T_i-2) γ^(T_i-k) × r_i,k + outcome_i``
+       z-score across G trajectories; all turns in the same traj share A_i.
+
+    2. **"turn"** — turn-level GRPO with discounted cumulative + outcome blend.
+       Non-outcome turns: z-score across all non-outcome turns in the question.
+       Outcome rewards: z-score across G trajectories.
+       ``D_i,t = Σ(k=t..T_i-1) γ^(T_i-k) × R_i,k / √(T_i - t)``
+       ``A_i,t = ω × D_i,t + (1-ω) × R_o_i``  (t < T_i-1)
+       ``A_i,t = R_o_i``                        (t = T_i-1)
+
+    Both modes require ``planner_turn_idx`` mapping (turn → planner turn index
+    within its trajectory).
 
     Args:
-        rewards: Shape [num_sequence, 1] after preprocessing (num_sequence = total turns)
-        loss_mask: Shape [seq_len, num_sequence] after preprocessing
-        group_size: Number of trajectories per question (e.g., 4)
-        idx_to_traj: List mapping turn_idx -> global_traj_idx
-        advantage_mode: "trajectory" or "turn"
+        rewards: Shape [num_sequence, 1] (num_sequence = total turns).
+        loss_mask: Shape [seq_len, num_sequence].
+        group_size: Number of trajectories per question.
+        idx_to_traj: List mapping turn_idx → global_traj_idx.
+        advantage_mode: ``"trajectory"`` or ``"turn"``.
+
+    Keyword Args:
+        planner_turn_idx: List mapping turn_idx → planner turn index (required).
+        gamma: Discount factor (default 0.9).
+        omega: Outcome blending weight (default 0.5).
 
     Returns:
-        advantages: Shape [seq_len, num_sequence]
+        advantages: Shape [seq_len, num_sequence].
     """
     num_sequence = len(idx_to_traj)
 
@@ -179,74 +187,141 @@ def compute_grpo_dynamic_advantages(
         num_sequence, dtype=rewards.dtype, device=rewards.device
     )
 
-    if advantage_mode == "trajectory":
-        # Aggregate turn rewards into per-trajectory rewards first.
-        trajectory_rewards = torch.zeros(
-            num_trajectories, dtype=rewards.dtype, device=rewards.device
-        )
-        trajectory_counts = torch.zeros(
-            num_trajectories, dtype=torch.long, device=rewards.device
-        )
+    planner_turn_idx = kwargs.get("planner_turn_idx", None)
+    gamma = kwargs.get("gamma", 0.9)
+    omega = kwargs.get("omega", 0.5)
 
-        for turn_idx, traj_idx in enumerate(idx_to_traj):
-            trajectory_rewards[traj_idx] += rewards_flat[turn_idx]
-            trajectory_counts[traj_idx] += 1
+    assert planner_turn_idx is not None, (
+        "grpo_dynamic requires planner_turn_idx mapping"
+    )
 
-        # Step 1: Average rewards per trajectory.
-        trajectory_rewards = trajectory_rewards / trajectory_counts.clamp(min=1).float()
+    turn_to_question = torch.tensor(
+        [idx_to_traj[i] // group_size for i in range(num_sequence)],
+        dtype=torch.long,
+        device=rewards.device,
+    )
 
-        # Step 2: reshape to [num_questions, group_size] for per-question GRPO.
-        trajectory_rewards_grouped = trajectory_rewards.view(num_questions, group_size)
+    for question_idx in range(num_questions):
+        question_mask = turn_to_question == question_idx
+        q_indices = question_mask.nonzero(as_tuple=True)[0]
 
-        # Step 3: compute per-question mean and std.
-        per_question_mean = trajectory_rewards_grouped.mean(
-            dim=-1, keepdim=True
-        )  # [num_questions, 1]
-        per_question_std = trajectory_rewards_grouped.std(
-            dim=-1, keepdim=True
-        )  # [num_questions, 1]
+        # Build per-trajectory info for this question.
+        traj_turns: dict[int, list[tuple[int, int, float]]] = {}
+        for seq_idx in q_indices.tolist():
+            traj = idx_to_traj[seq_idx]
+            pti = planner_turn_idx[seq_idx]
+            if traj not in traj_turns:
+                traj_turns[traj] = []
+            traj_turns[traj].append((seq_idx, pti, float(rewards_flat[seq_idx])))
 
-        # Step 4: normalize within each question group.
-        normalized_trajectory_rewards = (
-            trajectory_rewards_grouped - per_question_mean
-        ) / (per_question_std + 1e-6)  # [num_questions, group_size]
+        # Separate outcome (last planner turn) from non-outcome.
+        outcome_entries: list[tuple[int, int, float]] = []
+        non_outcome_entries: list[tuple[int, float]] = []
+        for traj, entries in traj_turns.items():
+            entries.sort(key=lambda x: x[1])
+            for j, (seq_idx, pti, r) in enumerate(entries):
+                if j == len(entries) - 1:
+                    outcome_entries.append((traj, seq_idx, r))
+                else:
+                    non_outcome_entries.append((seq_idx, r))
 
-        # Step 5: flatten back to [num_trajectories].
-        normalized_trajectory_rewards = normalized_trajectory_rewards.view(-1)
+        if advantage_mode == "trajectory":
+            # ---- trajectory-level GRPO ----
+            # When reward_mode="trajectory", all turns in a traj share the same
+            # traj_reward_agg, so use the reward directly without discount-sum.
+            # When reward_mode="turn", per-turn rewards differ and need to be
+            # aggregated via discounted sum.
+            reward_mode = kwargs.get("reward_mode", "turn")
+            if reward_mode == "trajectory":
+                trajectory_rewards = torch.zeros(
+                    num_trajectories, dtype=rewards.dtype, device=rewards.device
+                )
+                for traj, entries in traj_turns.items():
+                    entries.sort(key=lambda x: x[1])
+                    trajectory_rewards[traj] = entries[-1][2]
+            else:
+                # traj_reward_i = Σ(k=0..T_i-2) γ^(T_i - k) × r_i,k + outcome_i
+                trajectory_rewards = torch.zeros(
+                    num_trajectories, dtype=rewards.dtype, device=rewards.device
+                )
+                for traj, entries in traj_turns.items():
+                    entries.sort(key=lambda x: x[1])
+                    T_i = len(entries)
+                    total = 0.0
+                    for j, (seq_idx, pti, r) in enumerate(entries):
+                        if j == T_i - 1:
+                            total += r  # outcome
+                        else:
+                            total += (gamma ** (T_i - j)) * r
+                    trajectory_rewards[traj] = total
 
-        # Step 6: broadcast trajectory advantages to all turns in that trajectory.
-        for turn_idx, traj_idx in enumerate(idx_to_traj):
-            turn_advantages[turn_idx] = normalized_trajectory_rewards[traj_idx]
+            grouped = trajectory_rewards.view(num_questions, group_size)
+            mean = grouped.mean(dim=-1, keepdim=True)
+            std = grouped.std(dim=-1, keepdim=True)
+            normalized = ((grouped - mean) / (std + 1e-6)).view(-1)
+            for turn_idx in range(num_sequence):
+                if turn_to_question[turn_idx] == question_idx:
+                    turn_advantages[turn_idx] = normalized[idx_to_traj[turn_idx]]
 
-    elif advantage_mode == "turn":
-        # Step 1: map each turn to its owning question.
-        turn_to_question = torch.tensor(
-            [idx_to_traj[i] // group_size for i in range(num_sequence)],
-            dtype=torch.long,
-            device=rewards.device,
-        )
+        elif advantage_mode == "turn":
+            # ---- turn-level z-score + discounted cumulative + outcome blend ----
+            # Non-outcome: z-score across all non-outcome turns in the question.
+            if non_outcome_entries:
+                non_rewards = torch.tensor(
+                    [r for _, r in non_outcome_entries],
+                    dtype=rewards.dtype,
+                    device=rewards.device,
+                )
+                non_mean = non_rewards.mean()
+                non_std = non_rewards.std()
+                for seq_idx, r in non_outcome_entries:
+                    turn_advantages[seq_idx] = (r - non_mean) / (non_std + 1e-6)
 
-        # Step 2: normalize turn rewards within each question group.
-        for question_idx in range(num_questions):
-            question_mask = turn_to_question == question_idx
-            question_turn_rewards = rewards_flat[question_mask]
-
-            # Step 3: compute mean and std for all turns in this question.
-            question_mean = question_turn_rewards.mean()
-            question_std = question_turn_rewards.std()
-
-            # Step 4: normalize turn rewards within the question.
-            normalized_question_rewards = (question_turn_rewards - question_mean) / (
-                question_std + 1e-6
+            # Outcome: z-score across G trajectories.
+            R_o = torch.zeros(
+                num_trajectories, dtype=rewards.dtype, device=rewards.device
             )
+            if outcome_entries:
+                out_rewards = torch.tensor(
+                    [r for _, _, r in outcome_entries],
+                    dtype=rewards.dtype,
+                    device=rewards.device,
+                )
+                o_mean = out_rewards.mean()
+                o_std = out_rewards.std()
+                for traj, seq_idx, r in outcome_entries:
+                    R_o[traj] = (r - o_mean) / (o_std + 1e-6)
 
-            # Step 5: write normalized turn-level advantages back.
-            turn_advantages[question_mask] = normalized_question_rewards
+            # D_i,t = Σ(k=t..T_i-1) γ^(T_i - k) × R_i,k / √(T_i - t)
+            # A_i,t = ω × D_i,t + (1-ω) × R_o_i  ...  A_i,T_i-1 = R_o_i
+            for traj, entries in traj_turns.items():
+                entries.sort(key=lambda x: x[1])
+                T_i = len(entries)
 
-    else:
-        raise ValueError(
-            f"Invalid advantage_mode: {advantage_mode}. Must be 'trajectory' or 'turn'"
-        )
+                R_list = [
+                    float(R_o[traj])
+                    if j == T_i - 1
+                    else float(turn_advantages[seq_idx])
+                    for j, (seq_idx, pti, r) in enumerate(entries)
+                ]
+
+                for t in range(T_i):
+                    D = 0.0
+                    tn = T_i - t
+                    for k in range(t, T_i):
+                        D += (gamma ** (T_i - k)) * R_list[k]
+                    D /= math.sqrt(tn)
+                    seq_idx = entries[t][0]
+                    if t == T_i - 1:
+                        turn_advantages[seq_idx] = R_o[traj]
+                    else:
+                        turn_advantages[seq_idx] = omega * D + (1.0 - omega) * R_o[traj]
+
+        else:
+            raise ValueError(
+                f"Invalid advantage_mode: {advantage_mode}. "
+                "Must be 'trajectory' or 'turn'"
+            )
 
     advantages = torch.zeros_like(
         loss_mask, dtype=rewards.dtype

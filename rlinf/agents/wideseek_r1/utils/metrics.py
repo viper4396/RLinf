@@ -150,6 +150,102 @@ def _compute_mas_turn_metrics(rollout_batch: dict) -> dict:
     return metrics
 
 
+def _compute_num_turn_subagents_metrics(rollout_batch: dict) -> dict:
+    """Compute per-trajectory num_turn_subagents statistics.
+
+    ``num_turn_subagents`` records how many sub-agents the planner created at
+    each turn.  The sum across all planner turns must equal the total number of
+    sub-agents (i.e. ``len(total_turn_list) - 1``).
+    """
+    num_turn_subagents_metric = rollout_batch.get("num_turn_subagents_metric")
+    if num_turn_subagents_metric is None:
+        return {}
+
+    sum_num_subagents = 0
+    sum_num_creation_events = 0
+    num_valid_trajs = 0
+    for nts in num_turn_subagents_metric:
+        if nts is None:
+            continue
+        s = sum(nts)
+        sum_num_subagents += s
+        sum_num_creation_events += len(nts)
+        num_valid_trajs += 1
+
+    metrics: dict[str, float] = {}
+    _add_weighted_mean_metric(
+        metrics,
+        "wideseek_r1/avg_num_subagents_per_traj_v2",
+        sum_num_subagents,
+        num_valid_trajs,
+    )
+    _add_weighted_mean_metric(
+        metrics,
+        "wideseek_r1/avg_subagent_creation_events_per_traj",
+        sum_num_creation_events,
+        num_valid_trajs,
+    )
+    return metrics
+
+
+def _compute_num_effective_subagents_metrics(rollout_batch: dict) -> dict:
+    """Compute per-trajectory effective sub-agent statistics.
+
+    An *effective* sub-agent is one that performed at least one ``search``
+    tool call during its execution.  ``num_effective_subagents`` has the same
+    length as ``num_turn_subagents``.
+    """
+    num_effective_subagents_metric = rollout_batch.get("num_effective_subagents_metric")
+    if num_effective_subagents_metric is None:
+        return {}
+
+    sum_effective = 0
+    num_valid_trajs = 0
+    for nes in num_effective_subagents_metric:
+        if nes is None:
+            continue
+        sum_effective += sum(nes)
+        num_valid_trajs += 1
+
+    metrics: dict[str, float] = {}
+    _add_weighted_mean_metric(
+        metrics,
+        "wideseek_r1/avg_num_effective_subagents_per_traj",
+        sum_effective,
+        num_valid_trajs,
+    )
+    return metrics
+
+
+def _compute_access_search_ratio_metrics(rollout_batch: dict) -> dict:
+    """Compute per-trajectory access/search ratio statistics.
+
+    Each element of ``access_search_ratio`` is ``turn_total_access /
+    turn_total_search`` across all sub-agents in one planner turn.
+    """
+    access_search_ratio_metric = rollout_batch.get("access_search_ratio_metric")
+    if access_search_ratio_metric is None:
+        return {}
+
+    sum_ratio = 0.0
+    num_entries = 0
+    for asr in access_search_ratio_metric:
+        if asr is None:
+            continue
+        for v in asr:
+            sum_ratio += v
+            num_entries += 1
+
+    metrics: dict[str, float] = {}
+    _add_weighted_mean_metric(
+        metrics,
+        "wideseek_r1/avg_access_search_ratio_per_turn",
+        sum_ratio,
+        num_entries,
+    )
+    return metrics
+
+
 def _compute_final_answer_format_metrics(rollout_batch: dict) -> dict:
     """Compute trajectory-level final-answer-format metrics."""
     final_answer_format = rollout_batch.get("final_answer_format")
@@ -164,6 +260,40 @@ def _compute_final_answer_format_metrics(rollout_batch: dict) -> dict:
         sum(values),
         len(values),
     )
+    return metrics
+
+
+def _compute_reward_metrics(rollout_batch: dict) -> dict:
+    """Compute trajectory-level reward metrics."""
+    traj_reward_agg = rollout_batch.get("traj_reward_agg_metric")
+    outcome_reward = rollout_batch.get("outcome_reward_metric")
+    llm_reward = rollout_batch.get("llm_reward_metric")
+
+    metrics: dict[str, float] = {}
+    if traj_reward_agg is not None:
+        values = [float(v) for v in traj_reward_agg]
+        _add_weighted_mean_metric(
+            metrics,
+            "wideseek_r1/traj/mean/traj_reward_agg",
+            sum(values),
+            len(values),
+        )
+    if outcome_reward is not None:
+        values = [float(v) for v in outcome_reward]
+        _add_weighted_mean_metric(
+            metrics,
+            "wideseek_r1/traj/mean/outcome_reward",
+            sum(values),
+            len(values),
+        )
+    if llm_reward is not None:
+        values = [float(v) for v in llm_reward]
+        _add_weighted_mean_metric(
+            metrics,
+            "wideseek_r1/traj/mean/llm_reward",
+            sum(values),
+            len(values),
+        )
     return metrics
 
 
@@ -182,5 +312,11 @@ def _compute_rollout_metrics(
         )
     )
     metrics.update(_compute_mas_turn_metrics(rollout_batch=rollout_batch))
+    metrics.update(_compute_num_turn_subagents_metrics(rollout_batch=rollout_batch))
+    metrics.update(
+        _compute_num_effective_subagents_metrics(rollout_batch=rollout_batch)
+    )
+    metrics.update(_compute_access_search_ratio_metrics(rollout_batch=rollout_batch))
     metrics.update(_compute_final_answer_format_metrics(rollout_batch=rollout_batch))
+    metrics.update(_compute_reward_metrics(rollout_batch=rollout_batch))
     return metrics
