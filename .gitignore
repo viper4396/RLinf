@@ -22,4 +22,3 @@ PKG-INFO
 *.egg-info/
 .claude/settings.json
 .humanize/
-prepare_wideseek_r2.md
