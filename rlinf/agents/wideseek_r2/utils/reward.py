@@ -71,29 +71,24 @@ async def get_final_reward_score(
     if judge_llm_generator is None:
         return 0.0, False
 
-    format = True
     if answer_mode == "markdown":
-        reward_score, format = await evaluate_markdown(
+        return await evaluate_markdown(
             extract_answer, label_answer, judge_llm_generator, norm_column
         )
-        return reward_score, format
 
     label_answer = label_answer["answer"]
     if label_answer is not None and extract_answer is not None:
         # Use LLM as judge
-        llm_score = await verify_answer_with_llm_judge(
+        reward_score = await verify_answer_with_llm_judge(
             question=origin_question,
             predicted_answer=extract_answer,
             correct_answer=label_answer,
             judge_llm_generator=judge_llm_generator,
         )
-
-        reward_score = llm_score
-
     else:
         reward_score = 0.0
 
-    return reward_score, format
+    return reward_score, True
 
 
 async def verify_answer_with_llm_judge(
@@ -115,17 +110,13 @@ async def verify_answer_with_llm_judge(
     """
     from rlinf.agents.wideseek_r2.utils.prompt import LLM_JUDGE_PROMPT
 
-    if len(correct_answer) == 1:
-        # Format the judge prompt
-        judge_prompt_text = LLM_JUDGE_PROMPT.format(
-            question=question,
-            correct_answer=correct_answer[0],
-            response=predicted_answer,
-        )
-    else:
-        judge_prompt_text = LLM_JUDGE_PROMPT.format(
-            question=question, correct_answer=correct_answer, response=predicted_answer
-        )
+    # A single-element reference list is unwrapped to its only element.
+    reference = correct_answer[0] if len(correct_answer) == 1 else correct_answer
+    judge_prompt_text = LLM_JUDGE_PROMPT.format(
+        question=question,
+        correct_answer=reference,
+        response=predicted_answer,
+    )
 
     judge_messages = [
         {
@@ -457,13 +448,11 @@ The reference vocabulary is as follows:
 """
 
     # Format the prompt
-    system_prompt = primary_key_preprocess_prompt
-
     user_prompt = user_prompt.format(response=response_list, reference=reference_list)
 
     # Create messages
     messages = [
-        {"role": "system", "content": system_prompt},
+        {"role": "system", "content": primary_key_preprocess_prompt},
         {"role": "user", "content": user_prompt},
     ]
 
@@ -484,7 +473,7 @@ The reference vocabulary is as follows:
     return primary_key_map
 
 
-def extract_final_answer(text: str, mode: bool = "boxed", strict=True):
+def extract_final_answer(text: str, mode: str = "boxed", strict=True):
     """Extract final answer from generated text using a specific parsing mode.
 
     Args:

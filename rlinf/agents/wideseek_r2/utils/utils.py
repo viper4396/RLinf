@@ -20,7 +20,9 @@ from rlinf.data.tool_call.tool_io_struct import ToolRequest
 from rlinf.workers.agent.agent_loop import AgentLoopOutput
 
 
-def _build_tool_call_info(role: str, tool_requests: list[ToolRequest]) -> Optional[dict]:
+def _build_tool_call_info(
+    role: str, tool_requests: list[ToolRequest]
+) -> Optional[dict]:
     """Summarize subtask/search/access counts for a set of tool requests.
 
     Args:
@@ -102,7 +104,7 @@ def populate_turn_extra_fields(
             if role == "planner":
                 assert subtask_count > 0
                 num_valid_planner_turns += 1
-            elif role == "worker" or role == "single":
+            elif role in ("worker", "single"):
                 assert search_count > 0 or access_count > 0
                 num_valid_worker_turns += 1
         single_turn_output.extra_fields["subtask_count"] = subtask_count

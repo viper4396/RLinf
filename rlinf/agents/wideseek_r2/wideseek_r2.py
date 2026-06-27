@@ -266,7 +266,7 @@ class WideSeekR2AgentLoopWorker(MultiAgentLoopWorker):
 
         turn_hint = get_first_turn_hint(max_turns=max_turns)
         assert message_history[-1]["role"] == "user"
-        message_history[-1]["content"] = message_history[-1]["content"] + turn_hint
+        message_history[-1]["content"] += turn_hint
 
         prompt_ids = self.tokenizer.apply_chat_template(
             message_history, tokenize=True, add_generation_prompt=True, tools=tools

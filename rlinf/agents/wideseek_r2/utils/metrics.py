@@ -13,11 +13,6 @@
 # limitations under the License.
 
 
-def _safe_max(values: list[int]) -> int:
-    """Return the max value for a list, or 0 when the list is empty."""
-    return max(values) if values else 0
-
-
 def _add_weighted_mean_metric(
     metrics: dict[str, float],
     key: str,
@@ -58,9 +53,9 @@ def _compute_tool_call_metrics(
         len(turn_access_counts),
     )
 
-    traj_subtask_counts = [0 for _ in range(num_trajectories)]
-    traj_search_counts = [0 for _ in range(num_trajectories)]
-    traj_access_counts = [0 for _ in range(num_trajectories)]
+    traj_subtask_counts = [0] * num_trajectories
+    traj_search_counts = [0] * num_trajectories
+    traj_access_counts = [0] * num_trajectories
     for turn_idx in range(num_mapped_turns):
         traj_idx = idx_to_traj[turn_idx]
         if 0 <= traj_idx < num_trajectories:

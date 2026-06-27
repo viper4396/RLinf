@@ -260,9 +260,9 @@ class WideSeekR2AgentEvalRunner(AgentEvalRunner):
 
             num_turns = len(prompt_lengths)
             total_num_turns += num_turns
-            sum_prompt_length += sum(prompt_lengths) if prompt_lengths else 0
-            sum_response_length += sum(response_lengths) if response_lengths else 0
-            sum_total_length += sum(total_lengths) if total_lengths else 0
+            sum_prompt_length += sum(prompt_lengths)
+            sum_response_length += sum(response_lengths)
+            sum_total_length += sum(total_lengths)
 
             total_num_trajectories += group_size
             total_turns_all += sum(num_turns_list)
@@ -309,15 +309,13 @@ class WideSeekR2AgentEvalRunner(AgentEvalRunner):
                 mas_sum_num_subagents += sum(mas_num_subagents_list)
                 mas_num_valid_trajs += len(mas_main_agent_turns_list)
 
-            if markdown_mode:
-                values = [float(sample.get("llm_reward", 0) or 0) for sample in samples]
-                if values:
+            values = [float(sample.get("llm_reward", 0) or 0) for sample in samples]
+            if values:
+                if markdown_mode:
                     acc["f1_1"].append(values[0])
                     acc["avg_f1_k"].append(sum(values) / len(values))
                     acc["max_f1_k"].append(max(values))
-            else:
-                values = [float(sample.get("llm_reward", 0) or 0) for sample in samples]
-                if values:
+                else:
                     acc["pass1"].append(1.0 if values[0] > 0 else 0.0)
                     acc["avgk"].append(sum(values) / len(values))
                     acc["passk"].append(1.0 if any(v > 0 for v in values) else 0.0)
@@ -337,14 +335,10 @@ class WideSeekR2AgentEvalRunner(AgentEvalRunner):
                 sum(acc["f1_1"]) / len(acc["f1_1"]) if acc["f1_1"] else 0.0
             )
             aggregated_metrics["avg_item_f1@k"] = (
-                sum(acc["avg_f1_k"]) / len(acc["avg_f1_k"])
-                if acc["avg_f1_k"]
-                else 0.0
+                sum(acc["avg_f1_k"]) / len(acc["avg_f1_k"]) if acc["avg_f1_k"] else 0.0
             )
             aggregated_metrics["max_item_f1@k"] = (
-                sum(acc["max_f1_k"]) / len(acc["max_f1_k"])
-                if acc["max_f1_k"]
-                else 0.0
+                sum(acc["max_f1_k"]) / len(acc["max_f1_k"]) if acc["max_f1_k"] else 0.0
             )
         else:
             aggregated_metrics["pass@1"] = (

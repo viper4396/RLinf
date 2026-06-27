@@ -176,11 +176,10 @@ def get_access_summary_messages(info_to_extract, page_content):
         "Follow all instructions strictly."
     )
 
-    message = [
+    return [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
-    return message
 
 
 def get_first_turn_hint(max_turns: int) -> str:
