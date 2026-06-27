@@ -17,8 +17,11 @@
 import pytest
 from omegaconf import OmegaConf
 
-from rlinf.agents.wideseek_r2.utils.reward import credit_assignment, extract_final_answer
-from rlinf.data.datasets.wideseek_r2 import normalize_answer_mode
+from rlinf.agents.wideseek_r2.utils.reward import (
+    credit_assignment,
+    extract_final_answer,
+)
+from rlinf.data.datasets.wideseek_r2 import WideSeekR2Dataset, normalize_answer_mode
 
 
 def test_normalize_answer_mode_legacy_bool():
@@ -76,3 +79,40 @@ def test_credit_assignment_preserves_llm_reward_when_format_invalid():
     assert credit_assignment(cfg, llm_reward=0.8, answer_format=False) == pytest.approx(
         0.8
     )
+
+
+def test_config_answer_mode_ignores_config_level_is_markdown():
+    # Config-level legacy `is_markdown` must NOT be accepted; default is boxed.
+    assert (
+        WideSeekR2Dataset._config_answer_mode(OmegaConf.create({"is_markdown": True}))
+        == "boxed"
+    )
+    assert WideSeekR2Dataset._config_answer_mode(OmegaConf.create({})) == "boxed"
+    # Only `answer_mode` is honored at config level (even if is_markdown is set).
+    assert (
+        WideSeekR2Dataset._config_answer_mode(
+            OmegaConf.create({"answer_mode": "markdown"})
+        )
+        == "markdown"
+    )
+    assert (
+        WideSeekR2Dataset._config_answer_mode(
+            OmegaConf.create({"answer_mode": "boxed", "is_markdown": True})
+        )
+        == "boxed"
+    )
+
+
+def test_record_answer_mode_supports_legacy_per_record_is_markdown():
+    # Per-record legacy `is_markdown` is still normalized (approved DEC-4 surface).
+    assert WideSeekR2Dataset._record_answer_mode({"is_markdown": True}, "boxed") == (
+        "markdown"
+    )
+    assert WideSeekR2Dataset._record_answer_mode(
+        {"is_markdown": False}, "markdown"
+    ) == ("boxed")
+    # Per-record `answer_mode` takes precedence; absent keys fall back to default.
+    assert WideSeekR2Dataset._record_answer_mode(
+        {"answer_mode": "boxed"}, "markdown"
+    ) == ("boxed")
+    assert WideSeekR2Dataset._record_answer_mode({}, "markdown") == "markdown"

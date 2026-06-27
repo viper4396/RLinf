@@ -61,28 +61,36 @@ class WideSeekR2Dataset(ReasoningDataset):
         tokenizer: PreTrainedTokenizer,
     ):
         super().__init__(data_paths, config, tokenizer)
-        # Config-level answer mode. Prefer the new `answer_mode` key and fall back
-        # to the legacy boolean `is_markdown` for backward compatibility.
-        if config.data.get("answer_mode", None) is not None:
-            self.answer_mode = normalize_answer_mode(config.data.get("answer_mode"))
-        else:
-            self.answer_mode = normalize_answer_mode(
-                config.data.get("is_markdown", False)
-            )
+        # Config-level answer mode is resolved ONLY from `data.answer_mode`
+        # (default "boxed"); a config-level legacy `is_markdown` key is
+        # intentionally NOT accepted. Per-record legacy `is_markdown` is still
+        # normalized in `_record_answer_mode` (the approved DEC-4 compatibility
+        # surface for existing hybrid data).
+        self.answer_mode = self._config_answer_mode(config.data)
         self.unique_columns_key = config.data.get("unique_columns", "unique_columns")
         self.is_hybrid = config.data.get("is_hybrid", False)
 
-    def _record_answer_mode(self, record: dict) -> str:
+    @staticmethod
+    def _config_answer_mode(data_cfg) -> str:
+        """Resolve the dataset-level default answer mode from config.
+
+        Only ``data.answer_mode`` is honored (defaulting to ``"boxed"`` when
+        unset); a config-level legacy ``is_markdown`` key is NOT accepted.
+        """
+        return normalize_answer_mode(data_cfg.get("answer_mode", "boxed"))
+
+    @staticmethod
+    def _record_answer_mode(record: dict, default: str) -> str:
         """Resolve the answer mode for one hybrid record.
 
         Prefers a per-record ``answer_mode``, then a legacy per-record
-        ``is_markdown`` flag, and finally the dataset-level default.
+        ``is_markdown`` flag, and finally the dataset-level ``default``.
         """
         if "answer_mode" in record:
             return normalize_answer_mode(record["answer_mode"])
         if "is_markdown" in record:
             return normalize_answer_mode(record["is_markdown"])
-        return self.answer_mode
+        return default
 
     def __getitem__(self, idx):
         """Return a single prompt with its answer payload."""
@@ -91,7 +99,9 @@ class WideSeekR2Dataset(ReasoningDataset):
         answer = record[self.answer_key]
 
         answer_mode = (
-            self._record_answer_mode(record) if self.is_hybrid else self.answer_mode
+            self._record_answer_mode(record, self.answer_mode)
+            if self.is_hybrid
+            else self.answer_mode
         )
 
         if answer_mode == "markdown":
