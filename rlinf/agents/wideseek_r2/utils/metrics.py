@@ -184,3 +184,36 @@ def _compute_rollout_metrics(
     metrics.update(_compute_mas_turn_metrics(rollout_batch=rollout_batch))
     metrics.update(_compute_final_answer_format_metrics(rollout_batch=rollout_batch))
     return metrics
+
+
+def get_rollout_metrics(rollout_result, is_eval: bool) -> dict:
+    """Compute wideseek rollout metrics from packed dynamic rollout outputs.
+
+    Args:
+        rollout_result: Dynamic rollout structure produced by the agent worker.
+        is_eval: Whether this is an evaluation rollout (metrics are skipped).
+
+    Returns:
+        Aggregated metric dictionary for logging.
+    """
+    if is_eval:
+        return {}
+
+    rollout_batch = {
+        "turn_subtask_counts": rollout_result.extra_fields_turn["subtask_count"],
+        "turn_search_counts": rollout_result.extra_fields_turn["search_count"],
+        "turn_access_counts": rollout_result.extra_fields_turn["access_count"],
+        "num_valid_planner_turns": sum(
+            rollout_result.extra_fields_traj["num_valid_planner_turns"]
+        ),
+        "num_valid_worker_turns": sum(
+            rollout_result.extra_fields_traj["num_valid_worker_turns"]
+        ),
+        "total_turn_list_metric": rollout_result.extra_fields_traj["total_turn_list"],
+        "final_answer_format": rollout_result.extra_fields_traj["final_answer_format"],
+    }
+    return _compute_rollout_metrics(
+        rollout_batch=rollout_batch,
+        idx_to_traj=rollout_result.idx_to_traj,
+        num_trajectories=int(rollout_result.group_size),
+    )

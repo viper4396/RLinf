@@ -40,7 +40,7 @@ logging.getLogger().setLevel(logging.INFO)
 
 
 class WideSeekR2AgentEvalRunner(AgentEvalRunner):
-    """Runner for wideseek r1 task RL evaluation."""
+    """Runner for wideseek r2 task RL evaluation."""
 
     def __init__(
         self,
@@ -176,7 +176,8 @@ class WideSeekR2AgentEvalRunner(AgentEvalRunner):
         Returns:
             Tuple of `(processed_results, aggregated_metrics)`.
         """
-        is_markdown = self.cfg.data.get("is_markdown", False)
+        answer_mode = self.cfg.data.get("answer_mode", "boxed")
+        markdown_mode = answer_mode == "markdown"
 
         processed_results = []
         total_queries = len(self.accumulated_raw_results)
@@ -207,7 +208,7 @@ class WideSeekR2AgentEvalRunner(AgentEvalRunner):
         mas_sum_num_subagents = 0
         mas_num_valid_trajs = 0
 
-        if is_markdown:
+        if markdown_mode:
             acc = {}
         else:
             acc = {"pass1": [], "passk": [], "avgk": [], "maxk": []}
@@ -308,7 +309,7 @@ class WideSeekR2AgentEvalRunner(AgentEvalRunner):
                 mas_sum_num_subagents += sum(mas_num_subagents_list)
                 mas_num_valid_trajs += len(mas_main_agent_turns_list)
 
-            if is_markdown:
+            if markdown_mode:
                 pass
             else:
                 values = [float(sample.get("llm_reward", 0) or 0) for sample in samples]
@@ -327,7 +328,7 @@ class WideSeekR2AgentEvalRunner(AgentEvalRunner):
             )
 
         aggregated_metrics = {}
-        if is_markdown:
+        if markdown_mode:
             pass
         else:
             aggregated_metrics["pass@1"] = (

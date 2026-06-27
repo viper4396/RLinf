@@ -22,120 +22,40 @@ from typing import Awaitable, Callable
 import pandas as pd
 from omegaconf import DictConfig
 
-from rlinf.workers.agent.agent_loop import AgentLoopOutput
-
 
 def credit_assignment(
     agentloop_config: DictConfig,
-    output_buffer: list[AgentLoopOutput],
     llm_reward,
-    succ_end,
     answer_format,
 ):
-    """Assign trajectory reward and select trainable turns for policy updates.
+    """Compute the trajectory reward from the answer score and format reward.
+
+    The reward is intentionally simple: the answer score (item-level F1 for
+    markdown answers or the LLM-judge score for boxed answers) plus a format
+    bonus that is granted only when the final answer was extracted with a valid
+    format.
 
     Args:
-        agentloop_config: Agent-loop config containing reward shaping weights.
-        output_buffer: All turns generated in one trajectory.
+        agentloop_config: Agent-loop config containing the ``format_reward`` weight.
         llm_reward: End-of-trajectory reward from answer evaluation.
-        succ_end: Whether the agent stopped naturally without tool calls.
         answer_format: Whether final-answer extraction/format validation succeeded.
 
     Returns:
-        Tuple of `(output_buffer, train_buffer, final_answer_format, reward_score)`.
+        The scalar ``reward_score`` shared by every turn in the trajectory.
     """
-    final_answer_format = 0
-    search_credit = 0.0
-    length_penalty = 0.0
-
     format_reward = agentloop_config.get("format_reward", 0.0)
-    call_search_reward = agentloop_config.get("call_search_reward", 0.0)
-    length_limit = agentloop_config.get("length_limit", 5000)
-    max_length_limit = agentloop_config.get("max_length_limit", 7000)
-    length_p = agentloop_config.get("length_penalty", 0.0)
-
-    for turn_output in output_buffer:
-        # Reward search behavior when at least one access call exists in trajectory.
-        tool_call_info = turn_output.tool_call_info
-        if tool_call_info is None:
-            continue
-        if tool_call_info.get("access", 0) > 0:
-            search_credit = call_search_reward
-            break
-
-    max_response_len = max(
-        len(turn_output.response_ids) for turn_output in output_buffer
-    )
-    if max_response_len > length_limit:
-        t = (max_response_len - length_limit) / (max_length_limit - length_limit)
-        t = max(0.0, min(1.0, t))
-        length_penalty = t * length_p
-
-    one_turn_failed = False
-
-    for turn in output_buffer:
-        if turn.extra_fields["turn_repeat_failed"]:
-            one_turn_failed = True
-
-    train_buffer: list[AgentLoopOutput] = []
     if answer_format:
-        flag = False
-        for turn in output_buffer:
-            if (
-                turn.extra_fields["context_failed"]
-                or turn.extra_fields["max_turn_limit_failed"]
-            ) and turn.extra_fields["role"] != "worker":
-                # main agent or sa failed but extract good format
-                flag = True
-
-        if not flag:
-            for turn in output_buffer:
-                if not (
-                    turn.extra_fields["context_failed"]
-                    or turn.extra_fields["max_turn_limit_failed"]
-                ):
-                    train_buffer.append(turn)
-
-            reward_score = llm_reward + format_reward + search_credit - length_penalty
-            final_answer_format = 1
-        else:
-            for turn in output_buffer:
-                if (
-                    turn.extra_fields["context_failed"]
-                    or turn.extra_fields["max_turn_limit_failed"]
-                ) and turn.extra_fields["role"] != "worker":
-                    train_buffer.append(turn)
-
-            reward_score = 0.0
-
+        reward_score = llm_reward + format_reward
     else:
         reward_score = 0.0
-        if succ_end:
-            train_buffer.append(output_buffer[-1])
-
-        if one_turn_failed:
-            for turn in output_buffer:
-                if turn.extra_fields["turn_repeat_failed"]:
-                    if turn not in train_buffer:
-                        train_buffer.append(turn)
-        else:
-            for turn in output_buffer:
-                if (
-                    turn.extra_fields["max_turn_limit_failed"]
-                    or turn.extra_fields["context_failed"]
-                ):
-                    assert not turn.extra_fields["turn_repeat_failed"]
-                    if turn not in train_buffer:
-                        train_buffer.append(turn)
-
-    return output_buffer, train_buffer, final_answer_format, reward_score
+    return reward_score
 
 
 async def get_final_reward_score(
     origin_question,
     extract_answer,
     label_answer,
-    is_markdown,
+    answer_mode,
     norm_column,
     judge_llm_generator: Callable[[list], Awaitable[str]] | None,
 ):
@@ -145,7 +65,7 @@ async def get_final_reward_score(
         origin_question: Original user question text.
         extract_answer: Parsed model answer (string or DataFrame).
         label_answer: Ground-truth answer payload from dataset.
-        is_markdown: Whether to evaluate in markdown-table mode.
+        answer_mode: Answer mode for this sample (``markdown`` or ``boxed``).
         norm_column: Whether to normalize markdown column names aggressively.
         judge_llm_generator: Shared LLM judge generator function backed by SGLang.
 
@@ -156,7 +76,7 @@ async def get_final_reward_score(
         return 0.0, False
 
     format = True
-    if is_markdown:
+    if answer_mode == "markdown":
         reward_score, format = await evaluate_markdown(
             extract_answer, label_answer, judge_llm_generator, norm_column
         )

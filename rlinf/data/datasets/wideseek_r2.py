@@ -25,6 +25,34 @@ from rlinf.data.datasets.reasoning import ReasoningDataset
 from rlinf.data.utils import batch_pad_to_fixed_len
 
 
+def normalize_answer_mode(value) -> str:
+    """Normalize a config/record answer-mode value to ``markdown`` or ``boxed``.
+
+    Accepts the new string form (``"markdown"`` / ``"boxed"``) as well as the
+    legacy boolean ``is_markdown`` form (``True`` -> ``"markdown"``,
+    ``False`` -> ``"boxed"``) so that existing datasets keep working.
+
+    Args:
+        value: A string answer mode or a legacy boolean ``is_markdown`` flag.
+
+    Returns:
+        Either ``"markdown"`` or ``"boxed"``.
+
+    Raises:
+        ValueError: If the value cannot be interpreted as a supported mode.
+    """
+    if isinstance(value, bool):
+        return "markdown" if value else "boxed"
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in ("markdown", "boxed"):
+            return normalized
+    raise ValueError(
+        f"Unsupported answer_mode {value!r}; expected 'markdown' or 'boxed' "
+        "(or the legacy boolean is_markdown)."
+    )
+
+
 class WideSeekR2Dataset(ReasoningDataset):
     def __init__(
         self,
@@ -33,85 +61,63 @@ class WideSeekR2Dataset(ReasoningDataset):
         tokenizer: PreTrainedTokenizer,
     ):
         super().__init__(data_paths, config, tokenizer)
-        self.is_markdown = config.data.get("is_markdown", False)
+        # Config-level answer mode. Prefer the new `answer_mode` key and fall back
+        # to the legacy boolean `is_markdown` for backward compatibility.
+        if config.data.get("answer_mode", None) is not None:
+            self.answer_mode = normalize_answer_mode(config.data.get("answer_mode"))
+        else:
+            self.answer_mode = normalize_answer_mode(
+                config.data.get("is_markdown", False)
+            )
         self.unique_columns_key = config.data.get("unique_columns", "unique_columns")
         self.is_hybrid = config.data.get("is_hybrid", False)
-        self.enable_zh = config.data.get("enable_zh", False)
+
+    def _record_answer_mode(self, record: dict) -> str:
+        """Resolve the answer mode for one hybrid record.
+
+        Prefers a per-record ``answer_mode``, then a legacy per-record
+        ``is_markdown`` flag, and finally the dataset-level default.
+        """
+        if "answer_mode" in record:
+            return normalize_answer_mode(record["answer_mode"])
+        if "is_markdown" in record:
+            return normalize_answer_mode(record["is_markdown"])
+        return self.answer_mode
 
     def __getitem__(self, idx):
-        """
-        Return a single prompt.
-        """
-        language = "en"
-        if self.enable_zh:
-            instance_id = self.data[idx].get("instance_id", "")
-            if "zh" in str(instance_id) or self.data[idx].get("language", "en") == "zh":
-                language = "zh"
-        if not self.is_hybrid:
-            prompt = self.data[idx][self.prompt_key]
-            answer = self.data[idx][self.answer_key]
+        """Return a single prompt with its answer payload."""
+        record = self.data[idx]
+        prompt = record[self.prompt_key]
+        answer = record[self.answer_key]
 
-            if self.is_markdown:
-                # Build answer dict from data
-                answer_dict = {
-                    "answer": answer,
-                    "unique_columns": self.data[idx].get(self.unique_columns_key, []),
-                    "is_markdown": self.is_markdown,
-                    "instance_id": self.data[idx].get("instance_id", idx),
-                    "language": language,
-                }
-                # Try to get evaluation info if available
-                evaluation = self.data[idx].get("evaluation", None)
-                if evaluation:
-                    if isinstance(evaluation, str):
-                        try:
-                            evaluation = json.loads(evaluation)
-                        except json.JSONDecodeError:
-                            pass
-                if isinstance(evaluation, dict):
-                    answer_dict["required"] = evaluation.get("required", [])
-                answer = answer_dict
-            else:
-                answer_dict = {
-                    "answer": answer if isinstance(answer, list) else [answer],
-                    "is_markdown": self.is_markdown,
-                    "instance_id": self.data[idx].get("instance_id", idx),
-                    "language": language,
-                }
-                answer = answer_dict
+        answer_mode = (
+            self._record_answer_mode(record) if self.is_hybrid else self.answer_mode
+        )
+
+        if answer_mode == "markdown":
+            answer_dict = {
+                "answer": answer,
+                "unique_columns": record.get(self.unique_columns_key, []),
+                "answer_mode": answer_mode,
+                "instance_id": record.get("instance_id", idx),
+            }
+            # Try to get evaluation info if available
+            evaluation = record.get("evaluation", None)
+            if evaluation:
+                if isinstance(evaluation, str):
+                    try:
+                        evaluation = json.loads(evaluation)
+                    except json.JSONDecodeError:
+                        pass
+            if isinstance(evaluation, dict):
+                answer_dict["required"] = evaluation.get("required", [])
+            answer = answer_dict
         else:
-            prompt = self.data[idx][self.prompt_key]
-            answer = self.data[idx][self.answer_key]
-            is_markdown = self.data[idx].get("is_markdown", False)
-
-            if is_markdown:
-                # Build answer dict from data
-                answer_dict = {
-                    "answer": answer,
-                    "unique_columns": self.data[idx].get(self.unique_columns_key, []),
-                    "is_markdown": is_markdown,
-                    "instance_id": self.data[idx].get("instance_id", idx),
-                    "language": language,
-                }
-                # Try to get evaluation info if available
-                evaluation = self.data[idx].get("evaluation", None)
-                if evaluation:
-                    if isinstance(evaluation, str):
-                        try:
-                            evaluation = json.loads(evaluation)
-                        except json.JSONDecodeError:
-                            pass
-                if isinstance(evaluation, dict):
-                    answer_dict["required"] = evaluation.get("required", [])
-                answer = answer_dict
-            else:
-                answer_dict = {
-                    "answer": answer if isinstance(answer, list) else [answer],
-                    "is_markdown": is_markdown,
-                    "instance_id": self.data[idx].get("instance_id", idx),
-                    "language": language,
-                }
-                answer = answer_dict
+            answer = {
+                "answer": answer if isinstance(answer, list) else [answer],
+                "answer_mode": answer_mode,
+                "instance_id": record.get("instance_id", idx),
+            }
 
         prompt_tokens, prompt_length = self.encode(prompt)
         prompt_tokens_tensor = torch.as_tensor(prompt_tokens, dtype=torch.int64)

@@ -14,143 +14,142 @@
 
 from rlinf.agents.wideseek_r2.utils.prompt import (
     BOXED_FORMAT_EN,
-    BOXED_FORMAT_ZH,
     MARKDOWN_FORMAT_EN,
-    MARKDOWN_FORMAT_ZH,
     SYSTEM_PROMPT_PLANNER,
     SYSTEM_PROMPT_PLANNER_NOSHOT,
-    SYSTEM_PROMPT_PLANNER_ZH,
-    SYSTEM_PROMPT_PLANNER_ZH_NOSHOT,
     SYSTEM_PROMPT_SINGLE_AGENT,
     SYSTEM_PROMPT_SINGLE_AGENT_NOSHOT,
-    SYSTEM_PROMPT_SINGLE_AGENT_ZH,
-    SYSTEM_PROMPT_SINGLE_AGENT_ZH_NOSHOT,
     SYSTEM_PROMPT_WORKER,
-    SYSTEM_PROMPT_WORKER_ZH,
     USER_PROMPT_PLANNER,
-    USER_PROMPT_PLANNER_ZH,
     USER_PROMPT_SINGLE_AGENT,
-    USER_PROMPT_SINGLE_AGENT_ZH,
     USER_PROMPT_WORKER,
-    USER_PROMPT_WORKER_ZH,
 )
+from rlinf.agents.wideseek_r2.utils.tool_description import get_tools_description
 
 
-def get_prompt_planner(question: str, is_markdown: bool, language: str) -> str:
-    if language == "zh":
-        return get_prompt_planner_zh(question, is_markdown)
-    else:
-        return get_prompt_planner_en(question, is_markdown)
+def _format_instruction(answer_mode: str) -> str:
+    """Return the final-answer format instruction for the given answer mode.
+
+    Args:
+        answer_mode: Either ``"markdown"`` or ``"boxed"``.
+
+    Returns:
+        The format instruction string injected into the system prompt.
+
+    Raises:
+        ValueError: If ``answer_mode`` is not a supported value.
+    """
+    if answer_mode == "markdown":
+        return MARKDOWN_FORMAT_EN
+    if answer_mode == "boxed":
+        return BOXED_FORMAT_EN
+    raise ValueError(
+        f"Unsupported answer_mode {answer_mode!r}; expected 'markdown' or 'boxed'."
+    )
 
 
-def get_prompt_planner_en(question: str, is_markdown: bool) -> str:
-    # Add fewshot only for markdown questions
-    add_few_shot = is_markdown
-
+def get_prompt_planner(
+    question: str,
+    answer_mode: str,
+    add_few_shot: bool,
+    max_workers_per_planner: int,
+) -> list:
+    """Build the planner prompt with optional few-shot examples."""
+    format_instruction = _format_instruction(answer_mode)
     if add_few_shot:
-        if is_markdown:
-            system = SYSTEM_PROMPT_PLANNER.format(MARKDOWN_FORMAT_EN)
-        else:
-            system = SYSTEM_PROMPT_PLANNER.format(BOXED_FORMAT_EN)
+        system = SYSTEM_PROMPT_PLANNER.format(
+            format_instruction, max_workers_per_planner=max_workers_per_planner
+        )
     else:
-        if is_markdown:
-            system = SYSTEM_PROMPT_PLANNER_NOSHOT.format(MARKDOWN_FORMAT_EN)
-        else:
-            system = SYSTEM_PROMPT_PLANNER_NOSHOT.format(BOXED_FORMAT_EN)
-
+        system = SYSTEM_PROMPT_PLANNER_NOSHOT.format(format_instruction)
     return [
         {"role": "system", "content": system},
         {"role": "user", "content": USER_PROMPT_PLANNER.format(question)},
     ]
 
 
-def get_prompt_planner_zh(question: str, is_markdown: bool) -> str:
-    # Add fewshot only for markdown questions
-    add_few_shot = is_markdown
-
-    if add_few_shot:
-        if is_markdown:
-            system = SYSTEM_PROMPT_PLANNER_ZH.format(MARKDOWN_FORMAT_ZH)
-        else:
-            system = SYSTEM_PROMPT_PLANNER_ZH.format(BOXED_FORMAT_ZH)
-    else:
-        if is_markdown:
-            system = SYSTEM_PROMPT_PLANNER_ZH_NOSHOT.format(MARKDOWN_FORMAT_ZH)
-        else:
-            system = SYSTEM_PROMPT_PLANNER_ZH_NOSHOT.format(BOXED_FORMAT_ZH)
-
+def get_prompt_worker(origin_question: str, subtask: str) -> list:
+    """Build the worker prompt for a single subtask."""
     return [
-        {"role": "system", "content": system},
-        {"role": "user", "content": USER_PROMPT_PLANNER_ZH.format(question)},
-    ]
-
-
-def get_prompt_worker(origin_question: str, subtask: str, language="en") -> str:
-    if language == "zh":
-        text = USER_PROMPT_WORKER_ZH.format(origin_question, subtask)
-    else:
-        text = USER_PROMPT_WORKER.format(origin_question, subtask)
-    return [
+        {"role": "system", "content": SYSTEM_PROMPT_WORKER},
         {
-            "role": "system",
-            "content": SYSTEM_PROMPT_WORKER_ZH
-            if language == "zh"
-            else SYSTEM_PROMPT_WORKER,
+            "role": "user",
+            "content": USER_PROMPT_WORKER.format(origin_question, subtask),
         },
-        {"role": "user", "content": text},
     ]
 
 
-def get_prompt_single_agent(question: str, is_markdown: bool, language) -> str:
-    if language == "zh":
-        return get_prompt_single_agent_zh(question, is_markdown)
-    else:
-        return get_prompt_single_agent_en(question, is_markdown)
-
-
-def get_prompt_single_agent_en(question: str, is_markdown: bool) -> str:
-    # Add fewshot only for markdown questions
-    add_few_shot = is_markdown
-
+def get_prompt_single_agent(
+    question: str,
+    answer_mode: str,
+    add_few_shot: bool,
+) -> list:
+    """Build the single-agent prompt with optional few-shot examples."""
+    format_instruction = _format_instruction(answer_mode)
     if add_few_shot:
-        if is_markdown:
-            system = SYSTEM_PROMPT_SINGLE_AGENT.format(MARKDOWN_FORMAT_EN)
-        else:
-            system = SYSTEM_PROMPT_SINGLE_AGENT.format(BOXED_FORMAT_EN)
+        system = SYSTEM_PROMPT_SINGLE_AGENT.format(format_instruction)
     else:
-        if is_markdown:
-            system = SYSTEM_PROMPT_SINGLE_AGENT_NOSHOT.format(MARKDOWN_FORMAT_EN)
-        else:
-            system = SYSTEM_PROMPT_SINGLE_AGENT_NOSHOT.format(BOXED_FORMAT_EN)
-
+        system = SYSTEM_PROMPT_SINGLE_AGENT_NOSHOT.format(format_instruction)
     return [
         {"role": "system", "content": system},
         {"role": "user", "content": USER_PROMPT_SINGLE_AGENT.format(question)},
     ]
 
 
-def get_prompt_single_agent_zh(question: str, is_markdown: bool) -> str:
-    # Add fewshot only for markdown questions
-    add_few_shot = is_markdown
+def build_message_history_and_tools(
+    origin_question: str,
+    role: str,
+    answer_mode: str,
+    add_few_shot: bool,
+    max_workers_per_planner: int,
+    max_toolcall_per_worker: int,
+    main_task: str | None = None,
+) -> tuple[list[dict], list[dict]]:
+    """Build role-specific prompt history and exposed tool descriptions.
 
-    if add_few_shot:
-        if is_markdown:
-            system = SYSTEM_PROMPT_SINGLE_AGENT_ZH.format(MARKDOWN_FORMAT_ZH)
-        else:
-            system = SYSTEM_PROMPT_SINGLE_AGENT_ZH.format(BOXED_FORMAT_ZH)
+    Args:
+        origin_question: Query text for this role loop.
+        role: Current role (`planner`, `worker`, or `single`).
+        answer_mode: Answer mode for this sample (``markdown`` or ``boxed``).
+        add_few_shot: Whether to include few-shot examples in the system prompt.
+        max_workers_per_planner: Sub-agent per-call limit for tool descriptions.
+        max_toolcall_per_worker: Search/access per-call limit for tool descriptions.
+        main_task: Parent task text required for worker prompts.
+
+    Returns:
+        A tuple of `(message_history, tools)` for chat-template rendering.
+    """
+    tools_description = get_tools_description(
+        max_workers_per_planner=max_workers_per_planner,
+        max_toolcall_per_worker=max_toolcall_per_worker,
+    )
+    if role == "planner":
+        message_history = get_prompt_planner(
+            origin_question,
+            answer_mode=answer_mode,
+            add_few_shot=add_few_shot,
+            max_workers_per_planner=max_workers_per_planner,
+        )
+        tools = [tools_description["create_sub_agents"]]
+    elif role == "worker":
+        assert main_task is not None, "Worker must have main_task provided"
+        message_history = get_prompt_worker(main_task, origin_question)
+        tools = [tools_description["search"], tools_description["access"]]
+    elif role == "single":
+        message_history = get_prompt_single_agent(
+            origin_question, answer_mode=answer_mode, add_few_shot=add_few_shot
+        )
+        tools = [
+            tools_description["search_single_agent"],
+            tools_description["access_single_agent"],
+        ]
     else:
-        if is_markdown:
-            system = SYSTEM_PROMPT_SINGLE_AGENT_ZH_NOSHOT.format(MARKDOWN_FORMAT_ZH)
-        else:
-            system = SYSTEM_PROMPT_SINGLE_AGENT_ZH_NOSHOT.format(BOXED_FORMAT_ZH)
-
-    return [
-        {"role": "system", "content": system},
-        {"role": "user", "content": USER_PROMPT_SINGLE_AGENT_ZH.format(question)},
-    ]
+        raise ValueError(f"Invalid role: {role}")
+    return message_history, tools
 
 
 def get_access_summary_messages(info_to_extract, page_content):
+    """Build extraction messages that summarize accessed page content."""
     system_prompt = (
         "You are an information extraction assistant.\n"
         "You MUST base your output ONLY on the provided webpage content.\n"
@@ -184,24 +183,19 @@ def get_access_summary_messages(info_to_extract, page_content):
     return message
 
 
-def get_first_turn_hint(max_turns: int, language: str) -> str:
-    if language == "en":
-        return (
-            "\n\nThis is your first turn to answer the question. "
-            f"You must finish your answer within {max_turns} turns"
-        )
-    return f"\n\n这是你回答该问题的第一轮。你必须在 {max_turns} 轮之内完成你的回答"
-
-
-def get_next_turn_hint(next_turn_idx: int, max_turns: int, language: str) -> str:
-    if language == "en":
-        return (
-            f"\n\nYour next answer will be on turn {next_turn_idx}. "
-            f"You MUST finish the entire answer by turn {max_turns}."
-        )
+def get_first_turn_hint(max_turns: int) -> str:
+    """Return the hint appended to the first user turn."""
     return (
-        f"\n\n你的下一次回答将是第 {next_turn_idx} 轮。"
-        f"你必须在第 {max_turns} 轮之内完成整个回答。"
+        "\n\nThis is your first turn to answer the question. "
+        f"You must finish your answer within {max_turns} turns"
+    )
+
+
+def get_next_turn_hint(next_turn_idx: int, max_turns: int) -> str:
+    """Return the hint appended after a tool response."""
+    return (
+        f"\n\nYour next answer will be on turn {next_turn_idx}. "
+        f"You MUST finish the entire answer by turn {max_turns}."
     )
 
 
@@ -209,53 +203,41 @@ def get_planner_subtask_result_message(
     subtask_idx: int,
     subtask_text: str,
     worker_summary: str,
-    language: str,
 ) -> str:
-    if language == "en":
-        return f"# Subtask {subtask_idx}:\n{subtask_text}\n# Result:\n{worker_summary}"
-    return f"# 子任务 {subtask_idx}:\n{subtask_text}\n# 结果:\n{worker_summary}"
+    """Format a successful subtask result for the planner."""
+    return f"# Subtask {subtask_idx}:\n{subtask_text}\n# Result:\n{worker_summary}"
 
 
 def get_planner_subtask_failed_message(
     subtask_idx: int,
     subtask_text: str,
-    language: str,
 ) -> str:
-    if language == "en":
-        return (
-            f"# Subtask {subtask_idx}:\n{subtask_text}\n# Result:\n"
-            "The current subagent exceeded its context window limit while "
-            "executing this subtask, which caused the failure. Please retry."
-        )
+    """Format a failed subtask result for the planner."""
     return (
-        f"# 子任务 {subtask_idx}:\n{subtask_text}\n# 结果:\n"
-        "当前子智能体在执行该子任务时超出其上下文窗口限制，导致失败。请重试。"
+        f"# Subtask {subtask_idx}:\n{subtask_text}\n# Result:\n"
+        "The current subagent did not return a valid final answer "
+        "(no <answer>...</answer> block was produced) for this subtask. "
+        "Please retry."
     )
 
 
-def get_search_tool_message(query: str, search_result: str, language: str) -> str:
-    if language == "en":
-        return f"# Search query:\n{query}\n# Result:\n{search_result}"
-    return f"# 搜索查询:\n{query}\n# 结果:\n{search_result}"
+def get_search_tool_message(query: str, search_result: str) -> str:
+    """Format a search tool response."""
+    return f"# Search query:\n{query}\n# Result:\n{search_result}"
 
 
-def get_access_tool_message(url: str, page_content: str, language: str) -> str:
-    if language == "en":
-        return f"# Access URL:\n{url}\n# Result:\n{page_content}"
-    return f"# 访问URL:\n{url}\n# 结果:\n{page_content}"
+def get_access_tool_message(url: str, page_content: str) -> str:
+    """Format an access tool response."""
+    return f"# Access URL:\n{url}\n# Result:\n{page_content}"
 
 
 def get_access_summary_tool_message(
     url: str,
     info_to_extract: str | None,
     summary: str,
-    language: str,
 ) -> str:
-    if language == "en":
-        return (
-            f"# Access URL:\n{url}\n# Info to extract:\n{info_to_extract}\n"
-            f"# Result:\n{summary}"
-        )
+    """Format a summarized access tool response."""
     return (
-        f"# 访问URL:\n{url}\n# 需要提取的信息:\n{info_to_extract}\n# 结果:\n{summary}"
+        f"# Access URL:\n{url}\n# Info to extract:\n{info_to_extract}\n"
+        f"# Result:\n{summary}"
     )
