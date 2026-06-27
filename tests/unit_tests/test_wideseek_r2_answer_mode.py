@@ -15,8 +15,9 @@
 """Unit tests for wideseek_r2 answer_mode normalization and <answer> extraction."""
 
 import pytest
+from omegaconf import OmegaConf
 
-from rlinf.agents.wideseek_r2.utils.reward import extract_final_answer
+from rlinf.agents.wideseek_r2.utils.reward import credit_assignment, extract_final_answer
 from rlinf.data.datasets.wideseek_r2 import normalize_answer_mode
 
 
@@ -59,3 +60,19 @@ def test_extract_tag_missing_returns_none():
     assert extract_final_answer("", mode="tag") is None
     # An unclosed tag is not a valid answer block.
     assert extract_final_answer("<answer>unclosed", mode="tag") is None
+
+
+def test_credit_assignment_adds_format_bonus_when_format_valid():
+    cfg = OmegaConf.create({"format_reward": 0.1})
+
+    assert credit_assignment(cfg, llm_reward=0.8, answer_format=True) == pytest.approx(
+        0.9
+    )
+
+
+def test_credit_assignment_preserves_llm_reward_when_format_invalid():
+    cfg = OmegaConf.create({"format_reward": 0.1})
+
+    assert credit_assignment(cfg, llm_reward=0.8, answer_format=False) == pytest.approx(
+        0.8
+    )

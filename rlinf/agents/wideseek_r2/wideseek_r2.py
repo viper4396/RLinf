@@ -39,9 +39,9 @@ from rlinf.agents.wideseek_r2.utils.reward import (
 )
 from rlinf.agents.wideseek_r2.utils.sglang_client import SGLangClient
 from rlinf.agents.wideseek_r2.utils.utils import (
-    build_tool_call_info,
+    _build_tool_call_info,
+    _set_max_turns,
     populate_turn_extra_fields,
-    set_max_turns,
 )
 from rlinf.data.io_struct import DynamicRolloutResult
 from rlinf.data.tool_call.tool_io_struct import (
@@ -158,7 +158,7 @@ class WideSeekR2AgentLoopWorker(MultiAgentLoopWorker):
             max_workers_per_planner=max_workers_per_planner,
             max_toolcall_per_worker=max_toolcall_per_worker,
         )
-        tool_call_info = build_tool_call_info(role=role, tool_requests=tool_requests)
+        tool_call_info = _build_tool_call_info(role=role, tool_requests=tool_requests)
         return tool_requests, tool_call_info
 
     async def access_sumamry(self, info_to_extract, page_content):
@@ -262,7 +262,7 @@ class WideSeekR2AgentLoopWorker(MultiAgentLoopWorker):
             max_toolcall_per_worker=max_toolcall_per_worker,
             main_task=main_task,
         )
-        max_turns = set_max_turns(self.cfg.agentloop, role)
+        max_turns = _set_max_turns(self.cfg.agentloop, role)
 
         turn_hint = get_first_turn_hint(max_turns=max_turns)
         assert message_history[-1]["role"] == "user"

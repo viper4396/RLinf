@@ -209,9 +209,9 @@ class WideSeekR2AgentEvalRunner(AgentEvalRunner):
         mas_num_valid_trajs = 0
 
         if markdown_mode:
-            acc = {}
+            acc = {"f1_1": [], "avg_f1_k": [], "max_f1_k": []}
         else:
-            acc = {"pass1": [], "passk": [], "avgk": [], "maxk": []}
+            acc = {"pass1": [], "passk": [], "avgk": []}
 
         for idx, raw_result in enumerate(self.accumulated_raw_results):
             group_size = raw_result.get("group_size", 1)
@@ -310,7 +310,11 @@ class WideSeekR2AgentEvalRunner(AgentEvalRunner):
                 mas_num_valid_trajs += len(mas_main_agent_turns_list)
 
             if markdown_mode:
-                pass
+                values = [float(sample.get("llm_reward", 0) or 0) for sample in samples]
+                if values:
+                    acc["f1_1"].append(values[0])
+                    acc["avg_f1_k"].append(sum(values) / len(values))
+                    acc["max_f1_k"].append(max(values))
             else:
                 values = [float(sample.get("llm_reward", 0) or 0) for sample in samples]
                 if values:
@@ -329,7 +333,19 @@ class WideSeekR2AgentEvalRunner(AgentEvalRunner):
 
         aggregated_metrics = {}
         if markdown_mode:
-            pass
+            aggregated_metrics["item_f1@1"] = (
+                sum(acc["f1_1"]) / len(acc["f1_1"]) if acc["f1_1"] else 0.0
+            )
+            aggregated_metrics["avg_item_f1@k"] = (
+                sum(acc["avg_f1_k"]) / len(acc["avg_f1_k"])
+                if acc["avg_f1_k"]
+                else 0.0
+            )
+            aggregated_metrics["max_item_f1@k"] = (
+                sum(acc["max_f1_k"]) / len(acc["max_f1_k"])
+                if acc["max_f1_k"]
+                else 0.0
+            )
         else:
             aggregated_metrics["pass@1"] = (
                 sum(acc["pass1"]) / len(acc["pass1"]) if acc["pass1"] else 0.0

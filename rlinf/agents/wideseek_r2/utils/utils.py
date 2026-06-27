@@ -20,7 +20,7 @@ from rlinf.data.tool_call.tool_io_struct import ToolRequest
 from rlinf.workers.agent.agent_loop import AgentLoopOutput
 
 
-def build_tool_call_info(role: str, tool_requests: list[ToolRequest]) -> Optional[dict]:
+def _build_tool_call_info(role: str, tool_requests: list[ToolRequest]) -> Optional[dict]:
     """Summarize subtask/search/access counts for a set of tool requests.
 
     Args:
@@ -52,7 +52,7 @@ def build_tool_call_info(role: str, tool_requests: list[ToolRequest]) -> Optiona
     }
 
 
-def set_max_turns(agentloop_config: DictConfig, role: str) -> int:
+def _set_max_turns(agentloop_config: DictConfig, role: str) -> int:
     """Resolve the maximum number of turns for a role from agent-loop config.
 
     Args:

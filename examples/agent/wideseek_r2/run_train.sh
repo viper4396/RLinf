@@ -16,7 +16,7 @@ if [ -z "$1" ]; then
     CONFIG_NAME="train_qwen3_hybrid"
 else
     CONFIG_NAME=$1
+    shift
 fi
 
-python ${REPO_PATH}/examples/agent/wideseek_r2/train.py --config-path ${CONFIG_PATH}/config/  --config-name $CONFIG_NAME
-
+python ${REPO_PATH}/examples/agent/wideseek_r2/train.py --config-path ${CONFIG_PATH}/config/  --config-name $CONFIG_NAME "$@"

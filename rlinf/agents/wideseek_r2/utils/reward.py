@@ -44,11 +44,7 @@ def credit_assignment(
         The scalar ``reward_score`` shared by every turn in the trajectory.
     """
     format_reward = agentloop_config.get("format_reward", 0.0)
-    if answer_format:
-        reward_score = llm_reward + format_reward
-    else:
-        reward_score = 0.0
-    return reward_score
+    return llm_reward + (format_reward if answer_format else 0.0)
 
 
 async def get_final_reward_score(
