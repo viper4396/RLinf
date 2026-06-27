@@ -25,6 +25,7 @@ from rlinf.data.datasets.reasoning import ReasoningDataset
 from rlinf.data.datasets.rstar2 import Rstar2Dataset
 from rlinf.data.datasets.vlm import VLMDatasetRegistry
 from rlinf.data.datasets.wideseek_r1 import WideSeekR1Dataset
+from rlinf.data.datasets.wideseek_r2 import WideSeekR2Dataset
 
 
 def create_rl_dataset(
@@ -46,6 +47,7 @@ def create_rl_dataset(
         "reasoning": ReasoningDataset,
         "math": ReasoningDataset,
         "wideseek_r1": WideSeekR1Dataset,
+        "wideseek_r2": WideSeekR2Dataset,
         "rstar2": Rstar2Dataset,
     }
     if config.data.type in dataset_type_map:
