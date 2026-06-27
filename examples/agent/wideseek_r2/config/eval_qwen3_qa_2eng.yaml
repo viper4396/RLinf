@@ -41,7 +41,7 @@ data:
   val_rollout_batch_size: 1000
   prompt_key: question
   answer_key: answer
-  is_markdown: False
+  answer_mode: boxed
   val_data_paths: /PATH/TO/EVAL/QA/DATASET # TODO:(USER) Replace with the actual path to the evaluation dataset
   validation_shuffle: True
   data_size: -1

@@ -69,7 +69,7 @@ algorithm:
   clip_log_ratio_min: -20 # if null or not set, will not clip
   clip_log_ratio_max: 20 # if null or not set, will not clip
 
-  adv_type: grpo_dynamic
+  adv_type: gigpo
   advantage_mode: trajectory  # "trajectory" for trajectory-level GRPO, "turn" for turn-level GRPO
   normalize_advantages: False
   early_stop_imp_ratio: 5.0
@@ -115,14 +115,10 @@ agentloop:
   print_outputs: False # whether to print the outputs (token ids, texts, tool calls, etc.) of agent loop worker.
   max_workers_per_planner: 10
   max_toolcall_per_worker: 5
+  add_few_shot: True  # include few-shot examples in planner/single-agent prompts
   is_dynamic_rollout_batch: True
 
   format_reward: 0.1
-  call_search_reward: 0.05
-  length_limit: 3000
-  max_length_limit: 5000
-  length_penalty: 0.1
-  over_context_penalty: 0.2
 
   # whether to enable Qwen3-30B-A3B LLM judge for access summary and answer reward, False is only for ci now
   use_llm_judge: True

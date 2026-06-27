@@ -37,7 +37,7 @@ data:
   val_rollout_batch_size: 64
   prompt_key: question
   answer_key: answer
-  is_markdown: True
+  answer_mode: markdown
   norm_column: True
   unique_columns: unique_columns 
   val_data_paths: /mnt/public/xzxuan/data/WideSeek-R1-train-data/width_20k.jsonl # TODO:(USER) Replace with the actual path to the evaluation dataset

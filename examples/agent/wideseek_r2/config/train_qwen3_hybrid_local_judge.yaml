@@ -93,7 +93,7 @@ data:
   rollout_batch_size: 2
   prompt_key: question
   answer_key: answer
-  is_markdown: True
+  answer_mode: markdown
   unique_columns: unique_columns 
   train_data_paths: /PATH/TO/TRAIN/DATASET # TODO:(USER) Replace with the actual path to the training dataset
   shuffle: False

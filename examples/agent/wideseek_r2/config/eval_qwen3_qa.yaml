@@ -35,7 +35,7 @@ data:
   val_rollout_batch_size: 64
   prompt_key: question
   answer_key: answer
-  is_markdown: False
+  answer_mode: boxed
   val_data_paths: /mnt/public/xzxuan/data/Asearcher-test-data/NQ_rand1000/test.jsonl # TODO:(USER) Replace with the actual path to the evaluation dataset
   validation_shuffle: True
   data_size: 64
