@@ -15,12 +15,150 @@
 import asyncio
 import copy
 import json
+import math
 import re
 from io import StringIO
 from typing import Awaitable, Callable
 
 import pandas as pd
 from omegaconf import DictConfig
+
+
+async def compute_planner_hindsight_weights(
+    planner_turns,
+    final_answer,
+    outcome_reward: float,
+    temperature: float,
+    c_min: float,
+    c_max: float,
+    compute_logprobs: Callable[[str, list[int], float], Awaitable[list[float]]] | None,
+) -> list[float]:
+    """Score non-outcome planner actions under final-outcome conditioning.
+
+    The final planner turn is assigned weight ``1``. Earlier turns are scored
+    by the geometric mean probability of their original action after adding
+    the observed final answer and reward to the prompt. The resulting scores
+    are mean-normalized and clipped within the trajectory.
+
+    Args:
+        planner_turns: Planner ``AgentLoopOutput`` objects in generation order.
+        final_answer: Extracted final answer, or the raw final response.
+        outcome_reward: Scalar trajectory reward.
+        temperature: Temperature used for action log-probability scoring.
+        c_min: Minimum normalized hindsight weight.
+        c_max: Maximum normalized hindsight weight.
+        compute_logprobs: Async callback that scores target action tokens.
+
+    Returns:
+        One weight per planner turn. Returns all ones when scoring is unavailable.
+    """
+    if not planner_turns:
+        return []
+    if len(planner_turns) == 1 or compute_logprobs is None:
+        return [1.0] * len(planner_turns)
+
+    hind_values = []
+    for turn in planner_turns[:-1]:
+        action_tokens = list(turn.response_ids)
+        if not action_tokens:
+            hind_values.append(1.0)
+            continue
+        hindsight_prompt = (
+            f"{turn.prompt_text or ''}\n"
+            f"Given that the final outcome was {final_answer} and final reward "
+            f"was {outcome_reward}, what actions do you take in the next step?"
+        )
+        try:
+            logprobs = await compute_logprobs(
+                hindsight_prompt, action_tokens, temperature
+            )
+            mean_logprob = sum(logprobs) / (temperature * len(action_tokens))
+            hind_values.append(math.exp(mean_logprob))
+        except Exception:
+            hind_values.append(1.0)
+
+    mean_hind = sum(hind_values) / len(hind_values)
+    if mean_hind <= 0:
+        return [1.0] * len(planner_turns)
+    normalized = [max(c_min, min(c_max, value / mean_hind)) for value in hind_values]
+    return [*normalized, 1.0]
+
+
+def _extract_json_object(text: str) -> dict | None:
+    """Extract the first valid JSON object from a judge response."""
+    candidates = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    candidates.extend(re.findall(r"\{[^{}]*\}", text, re.DOTALL))
+    for candidate in candidates:
+        try:
+            value = json.loads(candidate)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(value, dict):
+            return value
+    return None
+
+
+async def evaluate_worker_quality(
+    main_question: str,
+    subtask: str,
+    worker_summary: str | None,
+    evidence_context: str,
+    judge_llm_generator: Callable[[list], Awaitable[str]] | None,
+) -> tuple[float, bool]:
+    """Judge one worker's grounded subtask quality on a ``[0, 1]`` scale.
+
+    Args:
+        main_question: Original user question.
+        subtask: Subtask assigned by the planner.
+        worker_summary: Worker's final non-empty ``<answer>`` content.
+        evidence_context: Search/access context visible to the worker.
+        judge_llm_generator: Shared LLM judge callback.
+
+    Returns:
+        ``(quality, valid)``. ``valid`` is false when no usable judge score is
+        available, allowing the advantage code to substitute a neutral baseline.
+    """
+    if not worker_summary or not worker_summary.strip() or judge_llm_generator is None:
+        return 0.0, False
+
+    judge_messages = [
+        {
+            "role": "system",
+            "content": (
+                "You evaluate a research sub-agent. Score only information supported "
+                "by its evidence. Return JSON with numeric fields relevance, "
+                "groundedness, coverage, and usefulness, each between 0 and 1."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"MAIN QUESTION:\n{main_question}\n\n"
+                f"ASSIGNED SUBTASK:\n{subtask}\n\n"
+                f"EVIDENCE AND WORKER CONTEXT:\n{evidence_context}\n\n"
+                f"WORKER SUMMARY:\n{worker_summary}\n\n"
+                "Return JSON only."
+            ),
+        },
+    ]
+    try:
+        response = await judge_llm_generator(judge_messages)
+        scores = _extract_json_object(response)
+        if scores is None:
+            return 0.0, False
+        weights = {
+            "relevance": 0.25,
+            "groundedness": 0.30,
+            "coverage": 0.25,
+            "usefulness": 0.20,
+        }
+        quality = 0.0
+        for name, weight in weights.items():
+            value = float(scores[name])
+            quality += weight * max(0.0, min(1.0, value))
+        return quality, True
+    except Exception:
+        return 0.0, False
 
 
 def credit_assignment(

@@ -580,6 +580,14 @@ class MAMegatronActor(MegatronActor):
             if batch.get("advantages", None) is None:
                 mask = batch["response_mask"]  # [num_sequence, seq_len]
                 planner_turn_idx_list = batch.get("extra:planner_turn_idx", None)
+                hierarchical_credit = self.cfg.agentloop.get(
+                    "hierarchical_credit_assignment", False
+                )
+
+                def _extra_list(name):
+                    value = batch.get(f"extra:{name}")
+                    return value.tolist() if value is not None else None
+
                 use_r1 = self.cfg.agentloop.get("use_r1_method", False)
                 advantages, _ = calculate_adv_and_returns(
                     task_type=self.cfg.runner.task_type,
@@ -598,6 +606,43 @@ class MAMegatronActor(MegatronActor):
                     planner_turn_idx=planner_turn_idx_list.tolist()
                     if planner_turn_idx_list is not None
                     else None,
+                    role_ids=_extra_list("role_id") if hierarchical_credit else None,
+                    idx_to_sub_traj=_extra_list("idx_to_sub_traj")
+                    if hierarchical_credit
+                    else None,
+                    parent_planner_turn_idx=_extra_list("parent_planner_turn_idx")
+                    if hierarchical_credit
+                    else None,
+                    planner_hindsight_weight=_extra_list("planner_hindsight_weight")
+                    if hierarchical_credit
+                    else None,
+                    worker_quality_score=_extra_list("worker_quality_score")
+                    if hierarchical_credit
+                    else None,
+                    worker_quality_valid=_extra_list("worker_quality_valid")
+                    if hierarchical_credit
+                    else None,
+                    worker_format_valid=_extra_list("worker_format_valid")
+                    if hierarchical_credit
+                    else None,
+                    planner_hindsight_gamma=self.cfg.algorithm.get(
+                        "planner_hindsight_gamma", 0.9
+                    ),
+                    worker_parent_adv_weight=self.cfg.algorithm.get(
+                        "worker_parent_adv_weight", 0.5
+                    ),
+                    worker_local_adv_weight=self.cfg.algorithm.get(
+                        "worker_local_adv_weight", 0.5
+                    ),
+                    worker_format_reward=self.cfg.agentloop.get(
+                        "worker_format_reward", 0.1
+                    ),
+                    worker_quality_baseline=self.cfg.algorithm.get(
+                        "worker_quality_baseline", 0.5
+                    ),
+                    worker_quality_scale=self.cfg.algorithm.get(
+                        "worker_quality_scale", 0.5
+                    ),
                     gamma=self.cfg.algorithm.get("gamma", 0.9),
                     omega=self.cfg.algorithm.get("omega", 0.5),
                     kl_beta=self.cfg.algorithm.get("reinpp_kl_beta", 0.0),
