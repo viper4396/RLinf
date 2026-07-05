@@ -40,6 +40,19 @@ from rlinf.workers.agent.tool_worker import ToolChannelInfo
 from rlinf.workers.rollout.utils import green
 
 
+def _weighted_mean(pairs: list[tuple[float, float]]) -> float:
+    """Weighted mean ``sum(numerators) / sum(denominators)``.
+
+    Returns 0.0 when the total denominator (weight/count) is zero, which happens
+    for metrics that are undefined in the current workflow (e.g. planner-turn
+    metrics in single-agent mode) or for batches with no valid tool calls.
+    """
+    total_weight = sum(denominator for _, denominator in pairs)
+    if total_weight == 0:
+        return 0.0
+    return sum(numerator for numerator, _ in pairs) / total_weight
+
+
 @dataclass
 class AgentLoopOutput:
     """Agent loop output."""
@@ -572,7 +585,7 @@ class MultiAgentLoopWorker(AgentLoopWorker):
             "__sum__/": sum,
             "__max__/": max,
             "__min__/": min,
-            "__mean__/": lambda x: sum(i[0] for i in x) / sum(i[1] for i in x),
+            "__mean__/": _weighted_mean,
         }
         for key in all_keys:
             for stat_key in stat_methods:
