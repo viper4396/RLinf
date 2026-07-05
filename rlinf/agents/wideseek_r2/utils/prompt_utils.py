@@ -1,0 +1,242 @@
+# Copyright 2025 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from rlinf.agents.wideseek_r2.utils.prompt import (
+    BOXED_FORMAT_EN,
+    MARKDOWN_FORMAT_EN,
+    SYSTEM_PROMPT_PLANNER,
+    SYSTEM_PROMPT_PLANNER_NOSHOT,
+    SYSTEM_PROMPT_SINGLE_AGENT,
+    SYSTEM_PROMPT_SINGLE_AGENT_NOSHOT,
+    SYSTEM_PROMPT_WORKER,
+    USER_PROMPT_PLANNER,
+    USER_PROMPT_SINGLE_AGENT,
+    USER_PROMPT_WORKER,
+)
+from rlinf.agents.wideseek_r2.utils.tool_description import get_tools_description
+
+
+def _format_instruction(answer_mode: str) -> str:
+    """Return the final-answer format instruction for the given answer mode.
+
+    Args:
+        answer_mode: Either ``"markdown"`` or ``"boxed"``.
+
+    Returns:
+        The format instruction string injected into the system prompt.
+
+    Raises:
+        ValueError: If ``answer_mode`` is not a supported value.
+    """
+    if answer_mode == "markdown":
+        return MARKDOWN_FORMAT_EN
+    if answer_mode == "boxed":
+        return BOXED_FORMAT_EN
+    raise ValueError(
+        f"Unsupported answer_mode {answer_mode!r}; expected 'markdown' or 'boxed'."
+    )
+
+
+def get_prompt_planner(
+    question: str,
+    answer_mode: str,
+    add_few_shot: bool,
+    max_workers_per_planner: int,
+) -> list:
+    """Build the planner prompt with optional few-shot examples."""
+    format_instruction = _format_instruction(answer_mode)
+    if add_few_shot:
+        system = SYSTEM_PROMPT_PLANNER.format(
+            format_instruction, max_workers_per_planner=max_workers_per_planner
+        )
+    else:
+        system = SYSTEM_PROMPT_PLANNER_NOSHOT.format(format_instruction)
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": USER_PROMPT_PLANNER.format(question)},
+    ]
+
+
+def get_prompt_worker(origin_question: str, subtask: str) -> list:
+    """Build the worker prompt for a single subtask."""
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT_WORKER},
+        {
+            "role": "user",
+            "content": USER_PROMPT_WORKER.format(origin_question, subtask),
+        },
+    ]
+
+
+def get_prompt_single_agent(
+    question: str,
+    answer_mode: str,
+    add_few_shot: bool,
+) -> list:
+    """Build the single-agent prompt with optional few-shot examples."""
+    format_instruction = _format_instruction(answer_mode)
+    if add_few_shot:
+        system = SYSTEM_PROMPT_SINGLE_AGENT.format(format_instruction)
+    else:
+        system = SYSTEM_PROMPT_SINGLE_AGENT_NOSHOT.format(format_instruction)
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": USER_PROMPT_SINGLE_AGENT.format(question)},
+    ]
+
+
+def build_message_history_and_tools(
+    origin_question: str,
+    role: str,
+    answer_mode: str,
+    add_few_shot: bool,
+    max_workers_per_planner: int,
+    max_toolcall_per_worker: int,
+    main_task: str | None = None,
+) -> tuple[list[dict], list[dict]]:
+    """Build role-specific prompt history and exposed tool descriptions.
+
+    Args:
+        origin_question: Query text for this role loop.
+        role: Current role (`planner`, `worker`, or `single`).
+        answer_mode: Answer mode for this sample (``markdown`` or ``boxed``).
+        add_few_shot: Whether to include few-shot examples in the system prompt.
+        max_workers_per_planner: Sub-agent per-call limit for tool descriptions.
+        max_toolcall_per_worker: Search/access per-call limit for tool descriptions.
+        main_task: Parent task text required for worker prompts.
+
+    Returns:
+        A tuple of `(message_history, tools)` for chat-template rendering.
+    """
+    tools_description = get_tools_description(
+        max_workers_per_planner=max_workers_per_planner,
+        max_toolcall_per_worker=max_toolcall_per_worker,
+    )
+    if role == "planner":
+        message_history = get_prompt_planner(
+            origin_question,
+            answer_mode=answer_mode,
+            add_few_shot=add_few_shot,
+            max_workers_per_planner=max_workers_per_planner,
+        )
+        tools = [tools_description["create_sub_agents"]]
+    elif role == "worker":
+        assert main_task is not None, "Worker must have main_task provided"
+        message_history = get_prompt_worker(main_task, origin_question)
+        tools = [tools_description["search"], tools_description["access"]]
+    elif role == "single":
+        message_history = get_prompt_single_agent(
+            origin_question, answer_mode=answer_mode, add_few_shot=add_few_shot
+        )
+        tools = [
+            tools_description["search_single_agent"],
+            tools_description["access_single_agent"],
+        ]
+    else:
+        raise ValueError(f"Invalid role: {role}")
+    return message_history, tools
+
+
+def get_access_summary_messages(info_to_extract, page_content):
+    """Build extraction messages that summarize accessed page content."""
+    system_prompt = (
+        "You are an information extraction assistant.\n"
+        "You MUST base your output ONLY on the provided webpage content.\n"
+        "You are strictly forbidden from using any prior knowledge, assumptions, or external information.\n\n"
+        "Your task is NOT to answer the question directly, but to extract and summarize all information from the webpage that is relevant to the specified information requirement.\n\n"
+        "If the webpage does NOT contain the exact requested information:\n"
+        "- Extract the most closely related information from the webpage and explain its relevance.\n"
+        '- If there is truly nothing related, explicitly state: "This webpage contains no information relevant to the request."\n\n'
+        "You must NOT hallucinate, infer, or guess.\n"
+        "You must NOT answer from your own knowledge.\n\n"
+        "Your output MUST be a clear, complete, and well-structured summary report.\n"
+        "The report should:\n"
+        "- Be organized with headings or bullet points when appropriate\n"
+        "- Include concrete facts, statements, or quotations from the webpage as evidence\n"
+        "- Focus exclusively on information relevant to the request\n"
+        "- Exclude any general summaries or unrelated content\n"
+        "- Exclude any meta-commentary about your process\n"
+    )
+
+    user_prompt = (
+        f"INFORMATION TO EXTRACT:\n{info_to_extract}\n\n"
+        f"CONTENT TO ANALYZE:\n{page_content}\n\n"
+        "Extract and summarize only the information relevant to the request above.\n"
+        "Follow all instructions strictly."
+    )
+
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
+
+def get_first_turn_hint(max_turns: int) -> str:
+    """Return the hint appended to the first user turn."""
+    return (
+        "\n\nThis is your first turn to answer the question. "
+        f"You must finish your answer within {max_turns} turns"
+    )
+
+
+def get_next_turn_hint(next_turn_idx: int, max_turns: int) -> str:
+    """Return the hint appended after a tool response."""
+    return (
+        f"\n\nYour next answer will be on turn {next_turn_idx}. "
+        f"You MUST finish the entire answer by turn {max_turns}."
+    )
+
+
+def get_planner_subtask_result_message(
+    subtask_idx: int,
+    subtask_text: str,
+    worker_summary: str,
+) -> str:
+    """Format a successful subtask result for the planner."""
+    return f"# Subtask {subtask_idx}:\n{subtask_text}\n# Result:\n{worker_summary}"
+
+
+def get_planner_subtask_failed_message(
+    subtask_idx: int,
+    subtask_text: str,
+) -> str:
+    """Format a failed subtask result for the planner."""
+    return (
+        f"# Subtask {subtask_idx}:\n{subtask_text}\n# Result:\n"
+        "The current subagent did not return a valid final answer "
+        "(no <answer>...</answer> block was produced) for this subtask. "
+        "Please retry."
+    )
+
+
+def get_search_tool_message(query: str, search_result: str) -> str:
+    """Format a search tool response."""
+    return f"# Search query:\n{query}\n# Result:\n{search_result}"
+
+
+def get_access_tool_message(url: str, page_content: str) -> str:
+    """Format an access tool response."""
+    return f"# Access URL:\n{url}\n# Result:\n{page_content}"
+
+
+def get_access_summary_tool_message(
+    url: str,
+    info_to_extract: str | None,
+    summary: str,
+) -> str:
+    """Format a summarized access tool response."""
+    return (
+        f"# Access URL:\n{url}\n# Info to extract:\n{info_to_extract}\n"
+        f"# Result:\n{summary}"
+    )

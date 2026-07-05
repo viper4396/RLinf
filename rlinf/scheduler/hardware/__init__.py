@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .accelerators import Accelerator, AcceleratorType, AcceleratorUtil
+from .accelerators import Accelerator, AcceleratorType, AcceleratorUtil, ProfileConfig
 from .hardware import (
     Hardware,
     HardwareConfig,
@@ -27,6 +27,8 @@ from .robots import (
     DualFrankaHWInfo,
     FrankaConfig,
     FrankaHWInfo,
+    GimArmConfig,
+    GimArmHWInfo,
     Turtle2Config,
     Turtle2HWInfo,
 )
@@ -35,6 +37,7 @@ __all__ = [
     "AcceleratorUtil",
     "Accelerator",
     "AcceleratorType",
+    "ProfileConfig",
     "Hardware",
     "HardwareConfig",
     "HardwareInfo",
@@ -46,6 +49,8 @@ __all__ = [
     "DualFrankaHWInfo",
     "FrankaConfig",
     "FrankaHWInfo",
+    "GimArmConfig",
+    "GimArmHWInfo",
     "Turtle2Config",
     "Turtle2HWInfo",
 ]

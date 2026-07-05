@@ -295,3 +295,13 @@ class WideSeekQwenToolCallParser:
         # remaining text exclude tool call tokens
         content = self.tool_call_regex.sub("", response_text)
         return content, function_calls
+
+
+@register_toolcall_parser("wideseek_r2-qwen")
+class WideSeekR2QwenToolCallParser(WideSeekQwenToolCallParser):
+    """Tool-call parser for WideSeek-R2 planner/worker/single-agent roles.
+
+    WideSeek-R2 parses tool calls identically to WideSeek-R1; this subclass
+    exists so the ``wideseek_r2-qwen`` parser can diverge independently later
+    without affecting ``wideseek_r1-qwen``.
+    """

@@ -204,7 +204,7 @@ def preprocess_reasoning_advantages_inputs(
             }
         )
 
-    elif kwargs["adv_type"] == "grpo_dynamic":
+    elif kwargs["adv_type"] in ("grpo_dynamic", "gigpo"):
         grouped_rewards = (
             rewards.reshape(-1, kwargs["num_sequence"]).transpose(0, 1).contiguous()
         )

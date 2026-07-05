@@ -1,4 +1,4 @@
-# Copyright 2025 The RLinf Authors.
+# Copyright 2026 The RLinf Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -66,6 +66,11 @@ def _register_builtin_models():
 
         return get_model(cfg, torch_dtype)
 
+    def _build_dexbotic_dm0(cfg: DictConfig, torch_dtype):
+        from rlinf.models.embodiment.dexbotic_dm0 import get_model
+
+        return get_model(cfg, torch_dtype)
+
     def _build_mlp_policy(cfg: DictConfig, torch_dtype):
         from rlinf.models.embodiment.mlp_policy import get_model
 
@@ -91,6 +96,11 @@ def _register_builtin_models():
 
         return get_model(cfg, torch_dtype)
 
+    def _build_abot_m0(cfg: DictConfig, torch_dtype):
+        from rlinf.models.embodiment.abot_m0 import get_model
+
+        return get_model(cfg, torch_dtype)
+
     def _build_starvla(cfg: DictConfig, torch_dtype):
         from rlinf.models.embodiment.starvla import get_model
 
@@ -98,6 +108,11 @@ def _register_builtin_models():
 
     def _build_dreamzero(cfg: DictConfig, torch_dtype):
         from rlinf.models.embodiment.dreamzero import get_model
+
+        return get_model(cfg, torch_dtype)
+
+    def _build_gr00t_n1d6(cfg: DictConfig, torch_dtype):
+        from rlinf.models.embodiment.gr00t import get_model
 
         return get_model(cfg, torch_dtype)
 
@@ -136,6 +151,12 @@ def _register_builtin_models():
         force=True,
     )
     register_model(
+        SupportedModel.DEXBOTIC_DM0.value,
+        _build_dexbotic_dm0,
+        category="embodied",
+        force=True,
+    )
+    register_model(
         SupportedModel.MLP_POLICY.value,
         _build_mlp_policy,
         category="embodied",
@@ -166,6 +187,12 @@ def _register_builtin_models():
         force=True,
     )
     register_model(
+        SupportedModel.ABOT_M0.value,
+        _build_abot_m0,
+        category="embodied",
+        force=True,
+    )
+    register_model(
         SupportedModel.STARVLA.value,
         _build_starvla,
         category="embodied",
@@ -189,6 +216,12 @@ def _register_builtin_models():
         category="embodied",
         force=True,
     )
+    register_model(
+        SupportedModel.GR00T_N1D6.value,
+        _build_gr00t_n1d6,
+        category="embodied",
+        force=True,
+    )
 
 
 _register_builtin_models()
@@ -203,7 +236,11 @@ def get_model(cfg: DictConfig):
     torch_dtype = torch_dtype_from_precision(cfg.precision)
     model = model_builder(cfg, torch_dtype)
 
-    if Worker.torch_platform is not None and Worker.torch_platform.is_available():
+    if (
+        Worker.torch_platform is not None
+        and Worker.torch_platform.is_available()
+        and cfg.get("load_to_device", True)
+    ):
         model = model.to(Worker.torch_device_type)
 
     if cfg.is_lora:
