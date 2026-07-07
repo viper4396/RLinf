@@ -8,7 +8,7 @@ cluster:
     rollout: all
 
 runner:
-  experiment_name: mas_qwen3_4b_hybrid
+  experiment_name: test_minibatch_2
   output_dir: ../logs/train
   seq_length: 32768
   max_tokens_per_mbs: 32768
@@ -22,7 +22,7 @@ runner:
 algorithm:
   training_batch_size_per_gpu: 1
   group_size: 8
-  n_minibatches: 1
+  n_minibatches: 2
 
   clip_ratio_low: 0.2
   clip_ratio_high: 0.28

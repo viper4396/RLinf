@@ -440,7 +440,9 @@ class MAMegatronActor(MegatronActor):
                 self.cfg.actor.model.encoder_seq_length, batch.keys()
             )
             batch = self._dp_load_balance_dynamic(
-                batch, batch_pad, self.cfg.actor.micro_batch_size
+                batch,
+                batch_pad,
+                self.num_train_steps * self.cfg.actor.micro_batch_size,
             )
 
         global_batches = get_iterator_k_split(
@@ -461,14 +463,19 @@ class MAMegatronActor(MegatronActor):
                     continue
                 global_batch_size_per_dp = global_batch["input_ids"].shape[0]
                 dp_size = parallel_state.get_data_parallel_world_size()
+                mbs = self.cfg.actor.micro_batch_size
+                assert global_batch_size_per_dp % mbs == 0, (
+                    f"global_batch_size_per_dp ({global_batch_size_per_dp}) must be "
+                    f"divisible by micro_batch_size ({mbs})"
+                )
                 configure_batch_sizes(
                     rank=torch.distributed.get_rank(),
-                    mbs=self.cfg.actor.micro_batch_size,
+                    mbs=mbs,
                     gbs=global_batch_size_per_dp * dp_size,
                     dp=dp_size,
                 )
                 num_microbatches = get_num_microbatches()
-                assert num_microbatches == global_batch_size_per_dp
+                assert num_microbatches == global_batch_size_per_dp // mbs
                 training_metrics = self.training_step(global_batch)
                 training_metrics_list.append(training_metrics)
 
