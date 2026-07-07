@@ -500,6 +500,15 @@ class MAMegatronActor(MegatronActor):
 
         rollout_metrics = cpu_dict(rollout_metrics)
 
+        if self.cfg.agentloop.get(
+            "hierarchical_credit_assignment", False
+        ) and self.cfg.agentloop.get("log_hierarchical_credit_metrics", True):
+            rollout_metrics.update(
+                self._compute_hierarchical_credit_metrics(
+                    batch, rollout_metrics_compute_data_group
+                )
+            )
+
         if self.cfg.actor.get("calculate_flops", False):
             rollout_tflops = self.flops_calculator.flops_generate(
                 total_prompt_lengths, total_decode_lengths
@@ -518,6 +527,213 @@ class MAMegatronActor(MegatronActor):
                 }
             )
         return rollout_metrics
+
+    @staticmethod
+    def _distributed_credit_summary(
+        values: torch.Tensor,
+        data_parallel_group,
+        prefix: str,
+    ) -> dict[str, float]:
+        """Compute distributed scalar distribution metrics."""
+        values = values.float().flatten()
+        device = values.device
+        if values.numel() == 0:
+            local_min = torch.tensor(float("inf"), device=device)
+            local_max = torch.tensor(float("-inf"), device=device)
+        else:
+            local_min = values.min()
+            local_max = values.max()
+
+        sums = torch.stack(
+            [
+                values.sum(),
+                values.square().sum(),
+                torch.tensor(float(values.numel()), device=device),
+                (values > 0).float().sum(),
+            ]
+        )
+        torch.distributed.all_reduce(
+            sums, torch.distributed.ReduceOp.SUM, group=data_parallel_group
+        )
+        torch.distributed.all_reduce(
+            local_min, torch.distributed.ReduceOp.MIN, group=data_parallel_group
+        )
+        torch.distributed.all_reduce(
+            local_max, torch.distributed.ReduceOp.MAX, group=data_parallel_group
+        )
+
+        total, total_square, count, positive = sums.tolist()
+        if count == 0:
+            return {}
+        mean = total / count
+        variance = max(total_square / count - mean * mean, 0.0)
+        return {
+            f"credit/{prefix}_mean": mean,
+            f"credit/{prefix}_std": variance**0.5,
+            f"credit/{prefix}_min": local_min.item(),
+            f"credit/{prefix}_max": local_max.item(),
+            f"credit/{prefix}_positive_fraction": positive / count,
+        }
+
+    def _compute_hierarchical_credit_metrics(
+        self,
+        batch: dict[str, torch.Tensor],
+        data_parallel_group,
+    ) -> dict[str, float]:
+        """Summarize outcome, planner-turn, and worker-agent credit signals."""
+        required_keys = (
+            "extra:role_id",
+            "extra:idx_to_sub_traj",
+            "extra:planner_hindsight_weight",
+            "extra:worker_quality_score",
+            "extra:worker_quality_valid",
+            "extra:worker_format_valid",
+        )
+        if any(key not in batch for key in required_keys):
+            return {}
+
+        device = batch["advantages"].device
+        role_ids = batch["extra:role_id"].to(device=device)
+        response_mask = batch["response_mask"].to(device=device)
+        advantages = batch["advantages"].to(device=device)
+        valid_tokens = response_mask.sum(dim=-1).clamp(min=1)
+        sequence_advantages = (advantages * response_mask).sum(dim=-1) / valid_tokens
+
+        planner_mask = role_ids == 0
+        worker_mask = role_ids == 1
+        metrics = {}
+        metrics.update(
+            self._distributed_credit_summary(
+                sequence_advantages[planner_mask],
+                data_parallel_group,
+                "planner_advantage",
+            )
+        )
+        metrics.update(
+            self._distributed_credit_summary(
+                batch["extra:planner_hindsight_weight"].to(device=device)[planner_mask],
+                data_parallel_group,
+                "planner_hindsight",
+            )
+        )
+        if "extra:planner_information_gain" in batch:
+            metrics.update(
+                self._distributed_credit_summary(
+                    batch["extra:planner_information_gain"].to(device=device)[
+                        planner_mask
+                    ],
+                    data_parallel_group,
+                    "planner_information_gain",
+                )
+            )
+
+        # Worker credit is agent-level, so retain one value per
+        # (trajectory, sub-trajectory) instead of weighting long workers more.
+        idx_to_sub_traj = batch["extra:idx_to_sub_traj"].tolist()
+        worker_agent_indices = []
+        seen_workers = set()
+        for sequence_idx, trajectory_idx in enumerate(batch["idx_to_traj"]):
+            if not bool(worker_mask[sequence_idx]):
+                continue
+            worker_key = (trajectory_idx, idx_to_sub_traj[sequence_idx])
+            if worker_key not in seen_workers:
+                seen_workers.add(worker_key)
+                worker_agent_indices.append(sequence_idx)
+        worker_agent_indices = torch.tensor(
+            worker_agent_indices, dtype=torch.long, device=device
+        )
+
+        worker_advantages = sequence_advantages[worker_agent_indices]
+        quality_scores = batch["extra:worker_quality_score"].to(device=device)[
+            worker_agent_indices
+        ]
+        quality_valid = (
+            batch["extra:worker_quality_valid"]
+            .to(device=device)[worker_agent_indices]
+            .bool()
+        )
+        format_valid = (
+            batch["extra:worker_format_valid"]
+            .to(device=device)[worker_agent_indices]
+            .float()
+        )
+        quality_baseline = self.cfg.algorithm.get("worker_quality_baseline", 0.5)
+        worker_local_rewards = (
+            torch.where(
+                quality_valid,
+                quality_scores,
+                torch.full_like(quality_scores, quality_baseline),
+            )
+            + self.cfg.agentloop.get("worker_format_reward", 0.1) * format_valid
+        )
+        metrics.update(
+            self._distributed_credit_summary(
+                worker_advantages, data_parallel_group, "worker_advantage"
+            )
+        )
+        metrics.update(
+            self._distributed_credit_summary(
+                quality_scores[quality_valid],
+                data_parallel_group,
+                "worker_quality",
+            )
+        )
+        metrics.update(
+            self._distributed_credit_summary(
+                worker_local_rewards,
+                data_parallel_group,
+                "worker_local_reward",
+            )
+        )
+
+        worker_counts = torch.stack(
+            [
+                torch.tensor(float(worker_agent_indices.numel()), device=device),
+                quality_valid.float().sum(),
+                format_valid.sum(),
+            ]
+        )
+        torch.distributed.all_reduce(
+            worker_counts,
+            torch.distributed.ReduceOp.SUM,
+            group=data_parallel_group,
+        )
+        worker_count, quality_valid_count, format_valid_count = worker_counts.tolist()
+        if worker_count > 0:
+            metrics.update(
+                {
+                    "credit/worker_quality_valid_rate": quality_valid_count
+                    / worker_count,
+                    "credit/worker_format_valid_rate": format_valid_count
+                    / worker_count,
+                }
+            )
+
+        rewards = batch["rewards"].to(device=device)
+        trajectory_rewards = {}
+        for sequence_idx, trajectory_idx in enumerate(batch["idx_to_traj"]):
+            trajectory_rewards.setdefault(trajectory_idx, rewards[sequence_idx])
+        outcome_values = torch.stack(list(trajectory_rewards.values()))
+        metrics.update(
+            self._distributed_credit_summary(
+                outcome_values, data_parallel_group, "outcome_reward"
+            )
+        )
+        if "extra:llm_reward" in batch:
+            llm_rewards = batch["extra:llm_reward"].to(device=device)
+            trajectory_llm_rewards = {}
+            for sequence_idx, trajectory_idx in enumerate(batch["idx_to_traj"]):
+                trajectory_llm_rewards.setdefault(
+                    trajectory_idx, llm_rewards[sequence_idx]
+                )
+            metrics.update(
+                self._distributed_credit_summary(
+                    torch.stack(list(trajectory_llm_rewards.values())),
+                    data_parallel_group,
+                    "llm_reward",
+                )
+            )
+        return metrics
 
     def run_inference(
         self,

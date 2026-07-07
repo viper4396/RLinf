@@ -21,6 +21,7 @@ from rlinf.agents.wideseek_r2.utils.reward import (
     compute_planner_hindsight_weights,
     evaluate_worker_quality,
 )
+from rlinf.agents.wideseek_r2.wideseek_r2 import WideSeekR2AgentLoopWorker
 from rlinf.algorithms.advantages import compute_gigpo_advantages
 
 
@@ -107,9 +108,9 @@ def test_planner_hindsight_keeps_final_turn_weight_one():
         SimpleNamespace(prompt_text="final", response_ids=[4]),
     ]
 
-    async def compute_logprobs(_prompt, action_tokens, _temperature):
+    async def compute_logprob_sum(_prompt, action_tokens):
         value = -0.1 if action_tokens[0] == 1 else -1.0
-        return [value] * len(action_tokens)
+        return value * len(action_tokens)
 
     weights = asyncio.run(
         compute_planner_hindsight_weights(
@@ -119,7 +120,7 @@ def test_planner_hindsight_keeps_final_turn_weight_one():
             temperature=1.0,
             c_min=0.1,
             c_max=5.0,
-            compute_logprobs=compute_logprobs,
+            compute_logprob_sum=compute_logprob_sum,
         )
     )
 
@@ -127,3 +128,34 @@ def test_planner_hindsight_keeps_final_turn_weight_one():
     assert weights[0] > weights[1]
     assert abs((weights[0] + weights[1]) / 2 - 1.0) < 1e-6
     assert weights[2] == 1.0
+
+
+def test_hindsight_scores_only_aligned_action_prompt_logprobs():
+    class FakeTokenizer:
+        @staticmethod
+        def encode(_text, add_special_tokens=False):
+            assert add_special_tokens is False
+            return [10, 11, 12]
+
+    class FakeWorker:
+        tokenizer = FakeTokenizer()
+        max_total_len = 16
+
+        async def generate(
+            self, prompt_ids, sampling_params=None, logprob_start_len=None
+        ):
+            assert prompt_ids == [10, 11, 12, 20, 21]
+            assert sampling_params == {"max_new_tokens": 1}
+            assert logprob_start_len == 3
+            return {
+                "prompt_logprobs": [-9.0, -0.25, -0.75],
+                "prompt_logprob_token_ids": [12, 20, 21],
+            }
+
+    logprob_sum = asyncio.run(
+        WideSeekR2AgentLoopWorker.compute_token_logprob_sum(
+            FakeWorker(), "hindsight prompt", [20, 21]
+        )
+    )
+
+    assert logprob_sum == -1.0

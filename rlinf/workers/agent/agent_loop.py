@@ -151,6 +151,7 @@ class AgentLoopWorker(Worker):
         prompt_ids: list[int],
         sampling_params: Optional[dict] = None,
         rollout_name: Optional[str] = None,
+        logprob_start_len: Optional[int] = None,
     ):
         channel_key = uuid4().hex
         if rollout_name is None:
@@ -162,6 +163,7 @@ class AgentLoopWorker(Worker):
                 "channel_key": channel_key,
                 "prompt_ids": prompt_ids,
                 "sampling_params": sampling_params,
+                "logprob_start_len": logprob_start_len,
             },
             async_op=True,
         ).async_wait()

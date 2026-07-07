@@ -138,29 +138,39 @@ class WideSeekR2AgentLoopWorker(MultiAgentLoopWorker):
         judge_response_text = self.tokenizer.decode(generate_result["output_ids"])
         return judge_response_text
 
-    async def compute_token_logprobs(
+    async def compute_token_logprob_sum(
         self,
         prompt_text: str,
         target_token_ids: list[int],
-        temperature: float = 1.0,
-    ) -> list[float]:
-        """Compute target-action token log probabilities under a text prompt."""
+    ) -> float:
+        """Compute the summed target-action log probability under a text prompt."""
+        if not target_token_ids:
+            return 0.0
+        if len(target_token_ids) > self.max_total_len - 2:
+            raise ValueError("Target action is too long for hindsight scoring")
+
         prompt_ids = self.tokenizer.encode(prompt_text, add_special_tokens=False)
-        full_ids = (prompt_ids + list(target_token_ids))[: self.max_total_len - 1]
+        max_prompt_length = self.max_total_len - len(target_token_ids) - 1
+        prompt_ids = prompt_ids[-max_prompt_length:]
+        full_ids = prompt_ids + list(target_token_ids)
         generate_result = await self.generate(
             full_ids,
-            sampling_params={"max_new_tokens": 1, "temperature": temperature},
+            sampling_params={"max_new_tokens": 1},
+            logprob_start_len=len(prompt_ids),
         )
-        raw_logprobs = generate_result.get("logprobs") or []
         target_length = len(target_token_ids)
-        scored = (
-            raw_logprobs[-(target_length + 1) : -1]
-            if len(raw_logprobs) >= target_length + 1
-            else raw_logprobs
-        )
-        if len(scored) < target_length:
-            scored = [0.0] * (target_length - len(scored)) + scored
-        return scored[:target_length]
+        prompt_logprobs = generate_result.get("prompt_logprobs") or []
+        scored_token_ids = generate_result.get("prompt_logprob_token_ids") or []
+        if (
+            len(prompt_logprobs) < target_length
+            or len(scored_token_ids) < target_length
+            or scored_token_ids[-target_length:] != list(target_token_ids)
+        ):
+            raise ValueError("SGLang did not return aligned action-token logprobs")
+        action_logprobs = prompt_logprobs[-target_length:]
+        if any(logprob is None for logprob in action_logprobs):
+            raise ValueError("SGLang returned an empty action-token logprob")
+        return float(sum(action_logprobs))
 
     async def extract_tool_calls(
         self, response_text: str, role: str
@@ -615,7 +625,7 @@ class WideSeekR2AgentLoopWorker(MultiAgentLoopWorker):
                 temperature=self.cfg.agentloop.get("hind_temperature", 1.0),
                 c_min=self.cfg.agentloop.get("hind_clip_min", 0.1),
                 c_max=self.cfg.agentloop.get("hind_clip_max", 5.0),
-                compute_logprobs=self.compute_token_logprobs,
+                compute_logprob_sum=self.compute_token_logprob_sum,
             )
             for turn, weight in zip(planner_turns, hindsight_weights):
                 turn.extra_fields["planner_hindsight_weight"] = weight
@@ -697,9 +707,11 @@ class WideSeekR2AgentLoopWorker(MultiAgentLoopWorker):
         worker_quality_score = []
         worker_quality_valid = []
         worker_format_valid = []
+        llm_rewards = []
         role_to_id = {"planner": 0, "worker": 1, "single": 2}
         for task_result in task_results:
             sub_traj_map = {}
+            trajectory_llm_reward = task_result.extra_fields["llm_reward"]
             for single_turn_output in task_result.single_turn_outputs:
                 if single_turn_output.extra_fields["not_training"]:
                     continue
@@ -726,6 +738,7 @@ class WideSeekR2AgentLoopWorker(MultiAgentLoopWorker):
                 worker_format_valid.append(
                     single_turn_output.extra_fields["worker_format_valid"]
                 )
+                llm_rewards.append(trajectory_llm_reward)
         extra_fields_train = {
             "idx_to_sub_traj": idx_to_sub_traj,
             "role_id": role_ids,
@@ -735,6 +748,7 @@ class WideSeekR2AgentLoopWorker(MultiAgentLoopWorker):
             "worker_quality_score": worker_quality_score,
             "worker_quality_valid": worker_quality_valid,
             "worker_format_valid": worker_format_valid,
+            "llm_reward": llm_rewards,
         }
 
         return (

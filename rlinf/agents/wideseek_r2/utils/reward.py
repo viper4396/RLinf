@@ -31,7 +31,7 @@ async def compute_planner_hindsight_weights(
     temperature: float,
     c_min: float,
     c_max: float,
-    compute_logprobs: Callable[[str, list[int], float], Awaitable[list[float]]] | None,
+    compute_logprob_sum: Callable[[str, list[int]], Awaitable[float]] | None,
 ) -> list[float]:
     """Score non-outcome planner actions under final-outcome conditioning.
 
@@ -47,14 +47,14 @@ async def compute_planner_hindsight_weights(
         temperature: Temperature used for action log-probability scoring.
         c_min: Minimum normalized hindsight weight.
         c_max: Maximum normalized hindsight weight.
-        compute_logprobs: Async callback that scores target action tokens.
+        compute_logprob_sum: Async callback returning the target action logprob sum.
 
     Returns:
         One weight per planner turn. Returns all ones when scoring is unavailable.
     """
     if not planner_turns:
         return []
-    if len(planner_turns) == 1 or compute_logprobs is None:
+    if len(planner_turns) == 1 or compute_logprob_sum is None:
         return [1.0] * len(planner_turns)
 
     hind_values = []
@@ -69,10 +69,8 @@ async def compute_planner_hindsight_weights(
             f"was {outcome_reward}, what actions do you take in the next step?"
         )
         try:
-            logprobs = await compute_logprobs(
-                hindsight_prompt, action_tokens, temperature
-            )
-            mean_logprob = sum(logprobs) / (temperature * len(action_tokens))
+            logprob_sum = await compute_logprob_sum(hindsight_prompt, action_tokens)
+            mean_logprob = logprob_sum / (temperature * len(action_tokens))
             hind_values.append(math.exp(mean_logprob))
         except Exception:
             hind_values.append(1.0)
