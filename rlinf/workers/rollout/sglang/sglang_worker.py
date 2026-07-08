@@ -228,7 +228,6 @@ class SGLangWorker(Worker):
         input_ids: list[list[int]] | list[int] | None = None,
         image_data: list | None = None,
         return_logprob: list[bool] | bool | None = False,
-        logprob_start_len: list[int] | int | None = None,
         request_info: Any | None = None,
     ):
         """
@@ -245,8 +244,6 @@ class SGLangWorker(Worker):
             sampling_params (List[Dict] | Dict | None): Same as SGLang engine's sampling_params argument.
             input_ids (List[List[int]] | List[int] | None): Same as SGLang engine's input_ids argument.
             return_logprob (List[bool] | bool | None): Same as SGLang engine's return_logprob argument.
-            logprob_start_len (List[int] | int | None): Prompt position from which
-                SGLang returns input-token log probabilities.
             request_info (Any | None): Any additional request info you wish to be associated with this
                 generation request. This argument will not be passed to the SGLang engine and returned directly.
 
@@ -261,7 +258,6 @@ class SGLangWorker(Worker):
             if image_data is not None and any(image_data)
             else None,
             return_logprob=return_logprob,
-            logprob_start_len=logprob_start_len,
         )
         return result, request_info
 
@@ -477,7 +473,6 @@ class SGLangWorker(Worker):
         channel_key: str,
         prompt_ids: list[int],
         sampling_params: Optional[dict] = None,
-        logprob_start_len: Optional[int] = None,
     ):
         final_sampling_params = self._sampling_params
         if sampling_params is not None and len(sampling_params) > 0:
@@ -488,8 +483,7 @@ class SGLangWorker(Worker):
         result = await self._engine.async_generate(
             input_ids=prompt_ids,
             sampling_params=final_sampling_params,
-            return_logprob=self._return_logprobs or logprob_start_len is not None,
-            logprob_start_len=logprob_start_len,
+            return_logprob=self._return_logprobs,
         )
         # sglang will trim matched stop in result text, so we should only return output_ids
         result_dict = {
@@ -499,12 +493,6 @@ class SGLangWorker(Worker):
         if self._return_logprobs:
             result_dict["logprobs"] = [
                 item[0] for item in result["meta_info"]["output_token_logprobs"]
-            ]
-        if logprob_start_len is not None:
-            input_token_logprobs = result["meta_info"]["input_token_logprobs"]
-            result_dict["prompt_logprobs"] = [item[0] for item in input_token_logprobs]
-            result_dict["prompt_logprob_token_ids"] = [
-                item[1] for item in input_token_logprobs
             ]
         await output_channel.put(
             result_dict, key=channel_key, async_op=True
@@ -519,6 +507,5 @@ class SGLangWorker(Worker):
                     channel_key=rollout_request["channel_key"],
                     prompt_ids=rollout_request["prompt_ids"],
                     sampling_params=rollout_request.get("sampling_params", None),
-                    logprob_start_len=rollout_request.get("logprob_start_len"),
                 )
             )

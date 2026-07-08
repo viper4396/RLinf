@@ -71,11 +71,8 @@ algorithm:
 
   adv_type: gigpo
   advantage_mode: trajectory  # "trajectory" for trajectory-level GRPO, "turn" for turn-level GRPO
-  planner_hindsight_gamma: 0.9
-  worker_parent_adv_weight: 0.5
-  worker_local_adv_weight: 0.5
-  worker_quality_baseline: 0.5
-  worker_quality_scale: 0.5
+  worker_local_weight: 0.5
+  planner_worker_quality_weight: 0.25
   normalize_advantages: False
   early_stop_imp_ratio: 5.0
   use_valid_token_scale: False
@@ -125,14 +122,10 @@ agentloop:
 
   format_reward: 0.1
 
-  # Hierarchical credit assignment: planner turns use hindsight allocation;
-  # each worker receives one agent-level quality advantage shared by all turns.
-  hierarchical_credit_assignment: True
-  log_hierarchical_credit_metrics: True
-  planner_hindsight: True
-  hind_temperature: 1.0
-  hind_clip_min: 0.1
-  hind_clip_max: 5.0
+  # Agent-level credit assignment: all planner turns share one advantage;
+  # every worker receives one quality-and-format advantage shared by its turns.
+  agent_level_credit_assignment: True
+  log_agent_credit_metrics: True
   worker_quality_judge: True
   worker_quality_max_context_chars: 12000
   worker_format_reward: 0.1

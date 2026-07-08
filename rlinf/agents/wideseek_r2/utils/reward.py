@@ -15,71 +15,12 @@
 import asyncio
 import copy
 import json
-import math
 import re
 from io import StringIO
 from typing import Awaitable, Callable
 
 import pandas as pd
 from omegaconf import DictConfig
-
-
-async def compute_planner_hindsight_weights(
-    planner_turns,
-    final_answer,
-    outcome_reward: float,
-    temperature: float,
-    c_min: float,
-    c_max: float,
-    compute_logprob_sum: Callable[[str, list[int]], Awaitable[float]] | None,
-) -> list[float]:
-    """Score non-outcome planner actions under final-outcome conditioning.
-
-    The final planner turn is assigned weight ``1``. Earlier turns are scored
-    by the geometric mean probability of their original action after adding
-    the observed final answer and reward to the prompt. The resulting scores
-    are mean-normalized and clipped within the trajectory.
-
-    Args:
-        planner_turns: Planner ``AgentLoopOutput`` objects in generation order.
-        final_answer: Extracted final answer, or the raw final response.
-        outcome_reward: Scalar trajectory reward.
-        temperature: Temperature used for action log-probability scoring.
-        c_min: Minimum normalized hindsight weight.
-        c_max: Maximum normalized hindsight weight.
-        compute_logprob_sum: Async callback returning the target action logprob sum.
-
-    Returns:
-        One weight per planner turn. Returns all ones when scoring is unavailable.
-    """
-    if not planner_turns:
-        return []
-    if len(planner_turns) == 1 or compute_logprob_sum is None:
-        return [1.0] * len(planner_turns)
-
-    hind_values = []
-    for turn in planner_turns[:-1]:
-        action_tokens = list(turn.response_ids)
-        if not action_tokens:
-            hind_values.append(1.0)
-            continue
-        hindsight_prompt = (
-            f"{turn.prompt_text or ''}\n"
-            f"Given that the final outcome was {final_answer} and final reward "
-            f"was {outcome_reward}, what actions do you take in the next step?"
-        )
-        try:
-            logprob_sum = await compute_logprob_sum(hindsight_prompt, action_tokens)
-            mean_logprob = logprob_sum / (temperature * len(action_tokens))
-            hind_values.append(math.exp(mean_logprob))
-        except Exception:
-            hind_values.append(1.0)
-
-    mean_hind = sum(hind_values) / len(hind_values)
-    if mean_hind <= 0:
-        return [1.0] * len(planner_turns)
-    normalized = [max(c_min, min(c_max, value / mean_hind)) for value in hind_values]
-    return [*normalized, 1.0]
 
 
 def _extract_json_object(text: str) -> dict | None:

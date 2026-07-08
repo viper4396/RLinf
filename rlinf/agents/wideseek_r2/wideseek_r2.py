@@ -33,7 +33,6 @@ from rlinf.agents.wideseek_r2.utils.prompt_utils import (
     get_search_tool_message,
 )
 from rlinf.agents.wideseek_r2.utils.reward import (
-    compute_planner_hindsight_weights,
     credit_assignment,
     evaluate_worker_quality,
     extract_final_answer,
@@ -138,40 +137,6 @@ class WideSeekR2AgentLoopWorker(MultiAgentLoopWorker):
         judge_response_text = self.tokenizer.decode(generate_result["output_ids"])
         return judge_response_text
 
-    async def compute_token_logprob_sum(
-        self,
-        prompt_text: str,
-        target_token_ids: list[int],
-    ) -> float:
-        """Compute the summed target-action log probability under a text prompt."""
-        if not target_token_ids:
-            return 0.0
-        if len(target_token_ids) > self.max_total_len - 2:
-            raise ValueError("Target action is too long for hindsight scoring")
-
-        prompt_ids = self.tokenizer.encode(prompt_text, add_special_tokens=False)
-        max_prompt_length = self.max_total_len - len(target_token_ids) - 1
-        prompt_ids = prompt_ids[-max_prompt_length:]
-        full_ids = prompt_ids + list(target_token_ids)
-        generate_result = await self.generate(
-            full_ids,
-            sampling_params={"max_new_tokens": 1},
-            logprob_start_len=len(prompt_ids),
-        )
-        target_length = len(target_token_ids)
-        prompt_logprobs = generate_result.get("prompt_logprobs") or []
-        scored_token_ids = generate_result.get("prompt_logprob_token_ids") or []
-        if (
-            len(prompt_logprobs) < target_length
-            or len(scored_token_ids) < target_length
-            or scored_token_ids[-target_length:] != list(target_token_ids)
-        ):
-            raise ValueError("SGLang did not return aligned action-token logprobs")
-        action_logprobs = prompt_logprobs[-target_length:]
-        if any(logprob is None for logprob in action_logprobs):
-            raise ValueError("SGLang returned an empty action-token logprob")
-        return float(sum(action_logprobs))
-
     async def extract_tool_calls(
         self, response_text: str, role: str
     ) -> tuple[list[ToolRequest], Optional[dict]]:
@@ -223,7 +188,6 @@ class WideSeekR2AgentLoopWorker(MultiAgentLoopWorker):
         main_task: str,
         answer_mode: str,
         sub_traj_id: int,
-        parent_planner_turn_idx: int,
     ) -> tuple[list[AgentLoopOutput], Optional[str], list]:
         """Execute one planner-created subtask through the worker role loop.
 
@@ -232,7 +196,6 @@ class WideSeekR2AgentLoopWorker(MultiAgentLoopWorker):
             main_task: Original user question for worker grounding.
             answer_mode: Answer mode for this sample (``markdown`` or ``boxed``).
             sub_traj_id: Sub-trajectory index used for training regrouping.
-            parent_planner_turn_idx: Planner turn that created this worker.
 
         Returns:
             Worker turn outputs, extracted summary, and worker turn statistics.
@@ -256,13 +219,12 @@ class WideSeekR2AgentLoopWorker(MultiAgentLoopWorker):
             sub_traj_id=sub_traj_id,
             main_task=main_task,
             answer_mode=answer_mode,
-            parent_planner_turn_idx=parent_planner_turn_idx,
         )
         worker_format_valid = bool(answer_text and answer_text.strip())
         quality_score = 0.0
         quality_valid = False
         if (
-            self.cfg.agentloop.get("hierarchical_credit_assignment", False)
+            self.cfg.agentloop.get("agent_level_credit_assignment", False)
             and self.cfg.agentloop.get("worker_quality_judge", True)
             and not self.is_eval
         ):
@@ -294,7 +256,6 @@ class WideSeekR2AgentLoopWorker(MultiAgentLoopWorker):
         sub_traj_id: int,
         main_task: str | None = None,
         answer_mode: str = "boxed",
-        parent_planner_turn_idx: int = -1,
     ) -> tuple[list[AgentLoopOutput], Optional[str], list]:
         """Run one query under a specific role until stop or turn budget.
 
@@ -304,7 +265,6 @@ class WideSeekR2AgentLoopWorker(MultiAgentLoopWorker):
             sub_traj_id: Sub-trajectory id for downstream regrouping.
             main_task: Original task text required when `role == "worker"`.
             answer_mode: Answer mode for this sample (``markdown`` or ``boxed``).
-            parent_planner_turn_idx: Parent planner turn for worker executions.
 
         Returns:
             Tuple of `(output_buffer, answer_text, total_turn_list)`. For workers,
@@ -385,9 +345,6 @@ class WideSeekR2AgentLoopWorker(MultiAgentLoopWorker):
                     extra_fields={
                         "role": role,
                         "idx_to_sub_traj": sub_traj_id,
-                        "planner_turn_idx": turn_idx if role == "planner" else -1,
-                        "parent_planner_turn_idx": parent_planner_turn_idx,
-                        "planner_hindsight_weight": 1.0,
                         "worker_quality_score": 0.0,
                         "worker_quality_valid": False,
                         "worker_format_valid": False,
@@ -422,7 +379,6 @@ class WideSeekR2AgentLoopWorker(MultiAgentLoopWorker):
                             origin_question,
                             answer_mode,
                             sub_traj_id + i + sub_traj_num,
-                            turn_idx,
                         )
                     )
                 sub_traj_num += len(tasks)
@@ -603,33 +559,6 @@ class WideSeekR2AgentLoopWorker(MultiAgentLoopWorker):
         )
         final_answer_format = 1 if answer_format else 0
 
-        if (
-            self.cfg.agentloop.get("hierarchical_credit_assignment", False)
-            and self.cfg.agentloop.get("planner_hindsight", True)
-            and self.workflow == "mas"
-            and not self.is_eval
-        ):
-            planner_turns = [
-                turn
-                for turn in output_buffer
-                if turn.extra_fields.get("role") == "planner"
-            ]
-            hindsight_weights = await compute_planner_hindsight_weights(
-                planner_turns=planner_turns,
-                final_answer=(
-                    final_answer_extract
-                    if final_answer_extract is not None
-                    else answer_text
-                ),
-                outcome_reward=reward_score,
-                temperature=self.cfg.agentloop.get("hind_temperature", 1.0),
-                c_min=self.cfg.agentloop.get("hind_clip_min", 0.1),
-                c_max=self.cfg.agentloop.get("hind_clip_max", 5.0),
-                compute_logprob_sum=self.compute_token_logprob_sum,
-            )
-            for turn, weight in zip(planner_turns, hindsight_weights):
-                turn.extra_fields["planner_hindsight_weight"] = weight
-
         # In wideseek_r2 every generated turn is trainable: assign the trajectory
         # reward to all turns and mark them for training. The shared not_training
         # filter in agent_loop becomes a no-op because it is always False here.
@@ -701,9 +630,6 @@ class WideSeekR2AgentLoopWorker(MultiAgentLoopWorker):
 
         idx_to_sub_traj = []
         role_ids = []
-        planner_turn_idx = []
-        parent_planner_turn_idx = []
-        planner_hindsight_weight = []
         worker_quality_score = []
         worker_quality_valid = []
         worker_format_valid = []
@@ -720,15 +646,6 @@ class WideSeekR2AgentLoopWorker(MultiAgentLoopWorker):
                     sub_traj_map[role_idx] = len(sub_traj_map)
                 idx_to_sub_traj.append(sub_traj_map[role_idx])
                 role_ids.append(role_to_id[single_turn_output.extra_fields["role"]])
-                planner_turn_idx.append(
-                    single_turn_output.extra_fields["planner_turn_idx"]
-                )
-                parent_planner_turn_idx.append(
-                    single_turn_output.extra_fields["parent_planner_turn_idx"]
-                )
-                planner_hindsight_weight.append(
-                    single_turn_output.extra_fields["planner_hindsight_weight"]
-                )
                 worker_quality_score.append(
                     single_turn_output.extra_fields["worker_quality_score"]
                 )
@@ -742,9 +659,6 @@ class WideSeekR2AgentLoopWorker(MultiAgentLoopWorker):
         extra_fields_train = {
             "idx_to_sub_traj": idx_to_sub_traj,
             "role_id": role_ids,
-            "planner_turn_idx": planner_turn_idx,
-            "parent_planner_turn_idx": parent_planner_turn_idx,
-            "planner_hindsight_weight": planner_hindsight_weight,
             "worker_quality_score": worker_quality_score,
             "worker_quality_valid": worker_quality_valid,
             "worker_format_valid": worker_format_valid,

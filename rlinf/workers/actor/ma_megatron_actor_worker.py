@@ -25,6 +25,7 @@ from megatron.training.utils import average_losses_across_data_parallel_group
 from omegaconf import DictConfig
 
 import rlinf.algorithms  # noqa: F401
+from rlinf.algorithms.advantages import compute_worker_local_credits
 from rlinf.algorithms.registry import (
     calculate_adv_and_returns,
     get_loss_scales,
@@ -501,10 +502,10 @@ class MAMegatronActor(MegatronActor):
         rollout_metrics = cpu_dict(rollout_metrics)
 
         if self.cfg.agentloop.get(
-            "hierarchical_credit_assignment", False
-        ) and self.cfg.agentloop.get("log_hierarchical_credit_metrics", True):
+            "agent_level_credit_assignment", False
+        ) and self.cfg.agentloop.get("log_agent_credit_metrics", True):
             rollout_metrics.update(
-                self._compute_hierarchical_credit_metrics(
+                self._compute_agent_credit_metrics(
                     batch, rollout_metrics_compute_data_group
                 )
             )
@@ -575,16 +576,15 @@ class MAMegatronActor(MegatronActor):
             f"credit/{prefix}_positive_fraction": positive / count,
         }
 
-    def _compute_hierarchical_credit_metrics(
+    def _compute_agent_credit_metrics(
         self,
         batch: dict[str, torch.Tensor],
         data_parallel_group,
     ) -> dict[str, float]:
-        """Summarize outcome, planner-turn, and worker-agent credit signals."""
+        """Summarize outcome, planner-agent, and worker-agent credit signals."""
         required_keys = (
             "extra:role_id",
             "extra:idx_to_sub_traj",
-            "extra:planner_hindsight_weight",
             "extra:worker_quality_score",
             "extra:worker_quality_valid",
             "extra:worker_format_valid",
@@ -609,24 +609,6 @@ class MAMegatronActor(MegatronActor):
                 "planner_advantage",
             )
         )
-        metrics.update(
-            self._distributed_credit_summary(
-                batch["extra:planner_hindsight_weight"].to(device=device)[planner_mask],
-                data_parallel_group,
-                "planner_hindsight",
-            )
-        )
-        if "extra:planner_information_gain" in batch:
-            metrics.update(
-                self._distributed_credit_summary(
-                    batch["extra:planner_information_gain"].to(device=device)[
-                        planner_mask
-                    ],
-                    data_parallel_group,
-                    "planner_information_gain",
-                )
-            )
-
         # Worker credit is agent-level, so retain one value per
         # (trajectory, sub-trajectory) instead of weighting long workers more.
         idx_to_sub_traj = batch["extra:idx_to_sub_traj"].tolist()
@@ -652,19 +634,14 @@ class MAMegatronActor(MegatronActor):
             .to(device=device)[worker_agent_indices]
             .bool()
         )
-        format_valid = (
-            batch["extra:worker_format_valid"]
-            .to(device=device)[worker_agent_indices]
-            .float()
-        )
-        quality_baseline = self.cfg.algorithm.get("worker_quality_baseline", 0.5)
-        worker_local_rewards = (
-            torch.where(
-                quality_valid,
-                quality_scores,
-                torch.full_like(quality_scores, quality_baseline),
-            )
-            + self.cfg.agentloop.get("worker_format_reward", 0.1) * format_valid
+        format_valid = batch["extra:worker_format_valid"].to(device=device)[
+            worker_agent_indices
+        ]
+        worker_local_credits = compute_worker_local_credits(
+            quality_scores=quality_scores,
+            quality_valid=quality_valid,
+            format_valid=format_valid,
+            format_reward=self.cfg.agentloop.get("worker_format_reward", 0.1),
         )
         metrics.update(
             self._distributed_credit_summary(
@@ -680,9 +657,9 @@ class MAMegatronActor(MegatronActor):
         )
         metrics.update(
             self._distributed_credit_summary(
-                worker_local_rewards,
+                worker_local_credits,
                 data_parallel_group,
-                "worker_local_reward",
+                "worker_local_credit",
             )
         )
 
@@ -690,7 +667,7 @@ class MAMegatronActor(MegatronActor):
             [
                 torch.tensor(float(worker_agent_indices.numel()), device=device),
                 quality_valid.float().sum(),
-                format_valid.sum(),
+                format_valid.float().sum(),
             ]
         )
         torch.distributed.all_reduce(
@@ -716,7 +693,7 @@ class MAMegatronActor(MegatronActor):
         outcome_values = torch.stack(list(trajectory_rewards.values()))
         metrics.update(
             self._distributed_credit_summary(
-                outcome_values, data_parallel_group, "outcome_reward"
+                outcome_values, data_parallel_group, "trajectory_reward"
             )
         )
         if "extra:llm_reward" in batch:
@@ -803,8 +780,8 @@ class MAMegatronActor(MegatronActor):
             if batch.get("advantages", None) is None:
                 mask = batch["response_mask"]  # [num_sequence, seq_len]
                 planner_turn_idx_list = batch.get("extra:planner_turn_idx", None)
-                hierarchical_credit = self.cfg.agentloop.get(
-                    "hierarchical_credit_assignment", False
+                agent_level_credit = self.cfg.agentloop.get(
+                    "agent_level_credit_assignment", False
                 )
 
                 def _extra_list(name):
@@ -829,42 +806,27 @@ class MAMegatronActor(MegatronActor):
                     planner_turn_idx=planner_turn_idx_list.tolist()
                     if planner_turn_idx_list is not None
                     else None,
-                    role_ids=_extra_list("role_id") if hierarchical_credit else None,
+                    role_ids=_extra_list("role_id") if agent_level_credit else None,
                     idx_to_sub_traj=_extra_list("idx_to_sub_traj")
-                    if hierarchical_credit
-                    else None,
-                    parent_planner_turn_idx=_extra_list("parent_planner_turn_idx")
-                    if hierarchical_credit
-                    else None,
-                    planner_hindsight_weight=_extra_list("planner_hindsight_weight")
-                    if hierarchical_credit
+                    if agent_level_credit
                     else None,
                     worker_quality_score=_extra_list("worker_quality_score")
-                    if hierarchical_credit
+                    if agent_level_credit
                     else None,
                     worker_quality_valid=_extra_list("worker_quality_valid")
-                    if hierarchical_credit
+                    if agent_level_credit
                     else None,
                     worker_format_valid=_extra_list("worker_format_valid")
-                    if hierarchical_credit
+                    if agent_level_credit
                     else None,
-                    planner_hindsight_gamma=self.cfg.algorithm.get(
-                        "planner_hindsight_gamma", 0.9
+                    worker_local_weight=self.cfg.algorithm.get(
+                        "worker_local_weight", 0.5
                     ),
-                    worker_parent_adv_weight=self.cfg.algorithm.get(
-                        "worker_parent_adv_weight", 0.5
-                    ),
-                    worker_local_adv_weight=self.cfg.algorithm.get(
-                        "worker_local_adv_weight", 0.5
+                    planner_worker_quality_weight=self.cfg.algorithm.get(
+                        "planner_worker_quality_weight", 0.25
                     ),
                     worker_format_reward=self.cfg.agentloop.get(
                         "worker_format_reward", 0.1
-                    ),
-                    worker_quality_baseline=self.cfg.algorithm.get(
-                        "worker_quality_baseline", 0.5
-                    ),
-                    worker_quality_scale=self.cfg.algorithm.get(
-                        "worker_quality_scale", 0.5
                     ),
                     gamma=self.cfg.algorithm.get("gamma", 0.9),
                     omega=self.cfg.algorithm.get("omega", 0.5),

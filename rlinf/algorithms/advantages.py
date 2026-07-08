@@ -345,10 +345,9 @@ def compute_gigpo_advantages(
 
     This function computes advantages PER QUESTION, not globally. ``idx_to_traj``
     maps turn_idx -> global_traj_idx, and each consecutive ``group_size``
-    trajectories belong to one question. When hierarchical role metadata is
-    present, it computes hindsight-weighted planner-turn advantages and one
-    sibling-normalized quality advantage per worker agent. Without that metadata,
-    two legacy modes are supported:
+    trajectories belong to one question. When agent role metadata is present,
+    it computes one advantage for the planner and one advantage per worker agent.
+    Without that metadata, two legacy modes are supported:
 
     1. "trajectory": aggregate turn rewards into per-trajectory rewards, compute
        mean/std over ``group_size`` trajectory rewards per question, and broadcast
@@ -368,25 +367,21 @@ def compute_gigpo_advantages(
     role_ids = kwargs.get("role_ids")
     idx_to_sub_traj = kwargs.get("idx_to_sub_traj")
     if role_ids is not None and idx_to_sub_traj is not None:
-        return _compute_hierarchical_gigpo_advantages(
+        return _compute_agent_level_gigpo_advantages(
             rewards=rewards,
             loss_mask=loss_mask,
             group_size=group_size,
             idx_to_traj=idx_to_traj,
             role_ids=role_ids,
             idx_to_sub_traj=idx_to_sub_traj,
-            planner_turn_idx=kwargs["planner_turn_idx"],
-            parent_planner_turn_idx=kwargs["parent_planner_turn_idx"],
-            planner_hindsight_weight=kwargs["planner_hindsight_weight"],
             worker_quality_score=kwargs["worker_quality_score"],
             worker_quality_valid=kwargs["worker_quality_valid"],
             worker_format_valid=kwargs["worker_format_valid"],
-            gamma=kwargs.get("planner_hindsight_gamma", 0.9),
-            worker_parent_adv_weight=kwargs.get("worker_parent_adv_weight", 0.5),
-            worker_local_adv_weight=kwargs.get("worker_local_adv_weight", 0.5),
+            worker_local_weight=kwargs.get("worker_local_weight", 0.5),
+            planner_worker_quality_weight=kwargs.get(
+                "planner_worker_quality_weight", 0.25
+            ),
             worker_format_reward=kwargs.get("worker_format_reward", 0.1),
-            worker_quality_baseline=kwargs.get("worker_quality_baseline", 0.5),
-            worker_quality_scale=kwargs.get("worker_quality_scale", 0.5),
         )
 
     num_sequence = len(idx_to_traj)
@@ -484,49 +479,54 @@ def compute_gigpo_advantages(
     return advantages, None
 
 
-def _compute_hierarchical_gigpo_advantages(
+def compute_worker_local_credits(
+    quality_scores: torch.Tensor,
+    quality_valid: torch.Tensor,
+    format_valid: torch.Tensor,
+    format_reward: float,
+) -> torch.Tensor:
+    """Convert worker quality and format signals into centered local credits."""
+    quality_credits = torch.where(
+        quality_valid.bool(),
+        2.0 * (quality_scores.clamp(0.0, 1.0) - 0.5),
+        torch.zeros_like(quality_scores),
+    )
+    return quality_credits + format_reward * format_valid.to(quality_scores.dtype)
+
+
+def _compute_agent_level_gigpo_advantages(
     rewards: torch.Tensor,
     loss_mask: torch.Tensor,
     group_size: int,
     idx_to_traj: list[int],
     role_ids: list[int],
     idx_to_sub_traj: list[int],
-    planner_turn_idx: list[int],
-    parent_planner_turn_idx: list[int],
-    planner_hindsight_weight: list[float],
     worker_quality_score: list[float],
     worker_quality_valid: list[bool],
     worker_format_valid: list[bool],
-    gamma: float,
-    worker_parent_adv_weight: float,
-    worker_local_adv_weight: float,
+    worker_local_weight: float,
+    planner_worker_quality_weight: float,
     worker_format_reward: float,
-    worker_quality_baseline: float,
-    worker_quality_scale: float,
 ) -> tuple[torch.Tensor, None]:
-    """Compute planner-turn and worker-agent advantages hierarchically.
+    """Compute one planner advantage and one advantage per worker agent.
 
     Outcome rewards are normalized across the ``group_size`` trajectories for
-    each question. Planner turns receive the trajectory advantage multiplied by
-    a mean-one discounted hindsight weight. Each worker receives one advantage
-    that combines its parent planner advantage with a sibling-normalized local
-    quality score; that value is broadcast to every turn of the worker.
+    each question. Worker quality is centered around 0.5 and augmented with a
+    format reward. Each worker receives the trajectory advantage plus its local
+    credit, while the planner receives the trajectory advantage plus the mean
+    local credit of its workers. Each agent's value is shared by all of its turns.
     """
     num_sequence = len(idx_to_traj)
     metadata = (
         role_ids,
         idx_to_sub_traj,
-        planner_turn_idx,
-        parent_planner_turn_idx,
-        planner_hindsight_weight,
         worker_quality_score,
         worker_quality_valid,
         worker_format_valid,
     )
     assert all(len(values) == num_sequence for values in metadata), (
-        "Hierarchical GiGPO metadata must have one value per sequence"
+        "Agent-level GiGPO metadata must have one value per sequence"
     )
-    assert worker_quality_scale > 0, "worker_quality_scale must be positive"
 
     rewards_flat = rewards.squeeze(-1)
     assert rewards_flat.numel() == num_sequence
@@ -552,38 +552,14 @@ def _compute_hierarchical_gigpo_advantages(
         (grouped_rewards - grouped_mean) / (grouped_std + 1e-6)
     ).view(-1)
 
-    sequence_advantages = torch.zeros(
-        num_sequence, dtype=rewards.dtype, device=rewards.device
+    trajectory_indices = torch.tensor(
+        idx_to_traj, dtype=torch.long, device=rewards.device
     )
+    sequence_advantages = trajectory_advantages[trajectory_indices].clone()
     for trajectory_idx in range(num_trajectories):
         trajectory_sequences = [
             idx for idx, owner in enumerate(idx_to_traj) if owner == trajectory_idx
         ]
-        planner_sequences = sorted(
-            (idx for idx in trajectory_sequences if role_ids[idx] == 0),
-            key=lambda idx: planner_turn_idx[idx],
-        )
-
-        planner_advantages: dict[int, torch.Tensor] = {}
-        if planner_sequences:
-            raw_weights = []
-            last_position = len(planner_sequences) - 1
-            for position, sequence_idx in enumerate(planner_sequences):
-                discount = gamma ** (last_position - position)
-                raw_weights.append(
-                    max(float(planner_hindsight_weight[sequence_idx]), 0.0) * discount
-                )
-            mean_weight = sum(raw_weights) / len(raw_weights)
-            if mean_weight <= 0:
-                raw_weights = [1.0] * len(raw_weights)
-                mean_weight = 1.0
-            for sequence_idx, raw_weight in zip(planner_sequences, raw_weights):
-                advantage = trajectory_advantages[trajectory_idx] * (
-                    raw_weight / mean_weight
-                )
-                sequence_advantages[sequence_idx] = advantage
-                planner_advantages[planner_turn_idx[sequence_idx]] = advantage
-
         workers: dict[int, list[int]] = {}
         for sequence_idx in trajectory_sequences:
             if role_ids[sequence_idx] == 1:
@@ -591,60 +567,40 @@ def _compute_hierarchical_gigpo_advantages(
                     sequence_idx
                 )
 
-        workers_by_parent: dict[int, list[tuple[int, list[int]]]] = {}
-        for sub_traj, worker_sequences in workers.items():
-            parent_idx = parent_planner_turn_idx[worker_sequences[0]]
-            workers_by_parent.setdefault(parent_idx, []).append(
-                (sub_traj, worker_sequences)
+        worker_items = list(workers.values())
+        if worker_items:
+            first_indices = [worker_sequences[0] for worker_sequences in worker_items]
+            local_credits = compute_worker_local_credits(
+                quality_scores=torch.tensor(
+                    [worker_quality_score[idx] for idx in first_indices],
+                    dtype=rewards.dtype,
+                    device=rewards.device,
+                ),
+                quality_valid=torch.tensor(
+                    [worker_quality_valid[idx] for idx in first_indices],
+                    dtype=torch.bool,
+                    device=rewards.device,
+                ),
+                format_valid=torch.tensor(
+                    [worker_format_valid[idx] for idx in first_indices],
+                    dtype=torch.bool,
+                    device=rewards.device,
+                ),
+                format_reward=worker_format_reward,
             )
-
-        for parent_idx, sibling_workers in workers_by_parent.items():
-            local_rewards = []
-            for _, worker_sequences in sibling_workers:
-                first_idx = worker_sequences[0]
-                quality = (
-                    float(worker_quality_score[first_idx])
-                    if bool(worker_quality_valid[first_idx])
-                    else worker_quality_baseline
-                )
-                local_rewards.append(
-                    quality
-                    + worker_format_reward * bool(worker_format_valid[first_idx])
-                )
-
-            local_tensor = torch.tensor(
-                local_rewards, dtype=rewards.dtype, device=rewards.device
+            planner_advantage = trajectory_advantages[trajectory_idx] + (
+                planner_worker_quality_weight * local_credits.mean()
             )
-            if (
-                len(sibling_workers) > 1
-                and float(local_tensor.std(unbiased=False)) > 1e-6
-            ):
-                local_advantages = (local_tensor - local_tensor.mean()) / (
-                    local_tensor.std(unbiased=False) + 1e-6
-                )
-            else:
-                local_advantages = (
-                    local_tensor - worker_quality_baseline
-                ) / worker_quality_scale
+            for sequence_idx in trajectory_sequences:
+                if role_ids[sequence_idx] == 0:
+                    sequence_advantages[sequence_idx] = planner_advantage
 
-            parent_advantage = planner_advantages.get(
-                parent_idx, trajectory_advantages[trajectory_idx]
-            )
-            for sibling_idx, (_, worker_sequences) in enumerate(sibling_workers):
-                worker_advantage = (
-                    worker_parent_adv_weight * parent_advantage
-                    + worker_local_adv_weight * local_advantages[sibling_idx]
+            for worker_idx, worker_sequences in enumerate(worker_items):
+                worker_advantage = trajectory_advantages[trajectory_idx] + (
+                    worker_local_weight * local_credits[worker_idx]
                 )
                 for sequence_idx in worker_sequences:
                     sequence_advantages[sequence_idx] = worker_advantage
-
-        # Single-agent workflows and malformed unclassified turns fall back to
-        # the trajectory advantage rather than silently receiving zero credit.
-        for sequence_idx in trajectory_sequences:
-            if role_ids[sequence_idx] == 2:
-                sequence_advantages[sequence_idx] = trajectory_advantages[
-                    trajectory_idx
-                ]
 
     advantages = torch.zeros_like(
         loss_mask, dtype=rewards.dtype
