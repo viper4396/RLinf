@@ -18,12 +18,13 @@ import hydra
 import torch.multiprocessing as mp
 from omegaconf.omegaconf import OmegaConf
 
+from rlinf.agents.searchr1.reward_worker import SearchR1RewardWorker
+from rlinf.agents.searchr1.runner import Searchr1AgentRunner
 from rlinf.agents.searchr1.search_tool_worker import SearchToolWorker
 from rlinf.agents.searchr1.searchr1_agent_loop import Searchr1AgentLoopWorker
 from rlinf.config import validate_cfg
 from rlinf.data.datasets import create_rl_dataset
 from rlinf.data.tokenizers import hf_tokenizer
-from rlinf.runners.agent_runner import AgentRunner
 from rlinf.scheduler import Cluster, NodePlacementStrategy
 from rlinf.utils.placement import ModelParallelComponentPlacement, PlacementMode
 from rlinf.utils.utils import output_redirector
@@ -88,6 +89,13 @@ def main(cfg) -> None:
             placement_strategy=inference_placement_strategy,
         )
 
+    singleton_worker_placement = NodePlacementStrategy([0])
+    reward_group = SearchR1RewardWorker.create_group(cfg).launch(
+        cluster,
+        name=cfg.reward.group_name,
+        placement_strategy=singleton_worker_placement,
+    )
+
     # GRPO Actor group
     actor_placement_strategy = component_placement.get_strategy("actor")
     actor_group = MAMegatronActor.create_group(cfg, component_placement).launch(
@@ -99,14 +107,13 @@ def main(cfg) -> None:
     train_ds, val_ds = create_rl_dataset(cfg, tokenizer)
 
     # Tool workers group
-    singleton_tool_placement = NodePlacementStrategy([0])
     tool_workers = {
         SearchToolWorker.create_group(cfg).launch(
-            cluster, name="search", placement_strategy=singleton_tool_placement
+            cluster, name="search", placement_strategy=singleton_worker_placement
         ): ToolWorkerInfo(tool_names=["search"], has_session=False),
     }
 
-    runner = AgentRunner(
+    runner = Searchr1AgentRunner(
         cfg=cfg,
         placement=component_placement,
         train_dataset=train_ds,
@@ -114,7 +121,7 @@ def main(cfg) -> None:
         rollout=rollout_group,
         inference=inference_group,
         actor=actor_group,
-        reward=None,
+        reward=reward_group,
         agent_loop=agentloop_group,
         tool_workers=tool_workers,
     )

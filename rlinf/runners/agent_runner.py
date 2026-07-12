@@ -163,6 +163,10 @@ class AgentRunner(ReasoningRunner):
             for handle in onload_handles:
                 handle.wait()
 
+    def _get_reward_compute_kwargs(self, batch: dict) -> dict:
+        """Return task-specific keyword arguments for reward computation."""
+        return {}
+
     def run(self):
         epoch_iter = range(self.epoch, self.cfg.runner.max_epochs)
         if len(epoch_iter) <= 0:
@@ -216,6 +220,7 @@ class AgentRunner(ReasoningRunner):
                             reward_handle: Handle = self.reward.compute_rewards(
                                 input_channel=self.rollout_channel,
                                 output_channel=self.reward_channel,
+                                **self._get_reward_compute_kwargs(batch),
                             )
                             inference_input_channel = self.reward_channel
                         else:

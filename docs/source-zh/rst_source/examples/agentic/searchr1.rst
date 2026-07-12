@@ -13,8 +13,7 @@ Learning <https://arxiv.org/abs/2503.09516>`__\ 中的实验，使用强化学�
 RLinf环境
 ~~~~~~~~~
 
-RLinf 环境配置参照 `RLinf
-Installation <https://rlinf.readthedocs.io/en/latest/rst_source/start/installation.html>`__
+RLinf 环境配置参照 :doc:`RLinf 安装指南 <../../start/installation>`。
 
 Local Wiki Server运行环境
 ~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -162,6 +161,26 @@ Qdrant 默认使用 HNSW 图索引算法。关于 HNSW 图索引的优化,请参
       ……
       recompute_logprobs: True
       shuffle_rollout: False
+
+Reward 与工具响应处理
+~~~~~~~~~~~~~~~~~~~~~
+
+Search-R1 在独立的 reward worker 中计算归一化精确匹配奖励。GT reference
+仅通过 reward 专用 channel 传输，不会发送给 agent loop 或模型 prompt。每条轨迹的
+最终奖励只写入 terminal model turn。
+
+``agentloop.max_tool_response_length`` 表示 token 数上限。当
+``tool_response_truncate_side: right`` 时，删除右侧 token 并保留前缀；``left``
+保留后缀，``middle`` 保留两端。``max_turns: 2`` 允许一次搜索 turn 后接一次回答
+turn。
+
+.. code-block:: yaml
+
+   agentloop:
+     max_turns: 2
+     reward_mode: trajectory
+     max_tool_response_length: 500
+     tool_response_truncate_side: right
 
 运行 `bash examples/agent/searchr1/run_train.sh` 启动训练。
 

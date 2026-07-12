@@ -23,6 +23,7 @@ from omegaconf import OmegaConf
 from omegaconf.dictconfig import DictConfig
 from torch.utils.data import Dataset
 
+from rlinf.agents.searchr1.reference_runner import SearchR1ReferenceRunnerMixin
 from rlinf.data.io_struct import DynamicRolloutResult
 from rlinf.runners.agent_eval_runner import AgentEvalRunner
 from rlinf.utils.placement import ModelParallelComponentPlacement
@@ -38,7 +39,7 @@ if typing.TYPE_CHECKING:
 logging.getLogger().setLevel(logging.INFO)
 
 
-class Searchr1AgentEvalRunner(AgentEvalRunner):
+class Searchr1AgentEvalRunner(SearchR1ReferenceRunnerMixin, AgentEvalRunner):
     """Runner for Search-R1 evaluation."""
 
     def __init__(
@@ -62,6 +63,7 @@ class Searchr1AgentEvalRunner(AgentEvalRunner):
             tool_workers,
             solid_rollouts,
         )
+        self._init_searchr1_reference_channel()
         # Initialize storage for accumulating evaluation results across all batches
         self.accumulated_results = []
 

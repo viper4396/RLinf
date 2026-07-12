@@ -19,6 +19,7 @@ import torch.multiprocessing as mp
 from omegaconf.omegaconf import OmegaConf
 
 from rlinf.agents.searchr1.eval_runner import Searchr1AgentEvalRunner as AgentEvalRunner
+from rlinf.agents.searchr1.reward_worker import SearchR1RewardWorker
 from rlinf.agents.searchr1.search_tool_worker import SearchToolWorker
 from rlinf.agents.searchr1.searchr1_agent_loop import Searchr1AgentLoopWorker
 from rlinf.config import validate_cfg
@@ -79,6 +80,11 @@ def main(cfg) -> None:
 
     # Tool workers group
     singleton_tool_placement = NodePlacementStrategy([0])
+    reward_group = SearchR1RewardWorker.create_group(cfg).launch(
+        cluster,
+        name=cfg.reward.group_name,
+        placement_strategy=singleton_tool_placement,
+    )
     tool_workers = {
         SearchToolWorker.create_group(cfg).launch(
             cluster, name="search", placement_strategy=singleton_tool_placement
@@ -90,7 +96,7 @@ def main(cfg) -> None:
         placement=component_placement,
         val_dataset=val_ds,
         rollout=rollout_group,
-        reward=None,
+        reward=reward_group,
         agent_loop=agentloop_group,
         tool_workers=tool_workers,
     )

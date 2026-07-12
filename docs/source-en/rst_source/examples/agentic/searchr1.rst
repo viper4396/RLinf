@@ -12,8 +12,8 @@ Environment
 RLinf Environment
 ~~~~~~~~~~~~~~~~~
 
-RLinf environment setup follows:  
-`RLinf Installation <https://rlinf.readthedocs.io/en/latest/rst_source/start/installation.html>`__
+RLinf environment setup follows the
+:doc:`RLinf installation guide <../../start/installation>`.
 
 Local Wiki Server Environment
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -137,7 +137,6 @@ and write its path into `examples/agent/searchr1/config/train_qwen2.5.yaml`:
    data:
      ……
      train_data_paths: ["/path/to/train.jsonl"]
-     val_data_paths: ["/path/to/train.jsonl"]
 
 Modify `rollout.model.model_path` in `train_qwen2.5.yaml`:
 
@@ -161,7 +160,7 @@ If you use `sampling_params.stop` to control model stop and save training time, 
       disable_log_stats: False
       detokenize: True  
 
-Since Search-R1 will re-tokenize the model output, `recompute_logprobs`` should be set to True.
+Since Search-R1 will re-tokenize the model output, ``recompute_logprobs`` should be set to True.
 
 .. code-block:: yaml
 
@@ -169,6 +168,27 @@ Since Search-R1 will re-tokenize the model output, `recompute_logprobs`` should 
       ……
       recompute_logprobs: True
       shuffle_rollout: False
+
+Reward and tool-response handling
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Search-R1 computes normalized exact-match reward in a dedicated reward worker.
+Ground-truth references travel through a reward-only channel and are not sent to
+the agent loop or model prompt. The final reward is written only to the terminal
+model turn of each trajectory.
+
+``agentloop.max_tool_response_length`` is a token limit. With
+``tool_response_truncate_side: right``, tokens on the right are removed and the
+prefix is retained; ``left`` retains the suffix, and ``middle`` retains both
+ends. ``max_turns: 2`` allows one search turn followed by one answer turn.
+
+.. code-block:: yaml
+
+   agentloop:
+     max_turns: 2
+     reward_mode: trajectory
+     max_tool_response_length: 500
+     tool_response_truncate_side: right
 
 Run `bash examples/agent/searchr1/run_train.sh` to start training.
 

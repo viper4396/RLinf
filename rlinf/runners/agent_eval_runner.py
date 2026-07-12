@@ -125,6 +125,10 @@ class AgentEvalRunner(ReasoningEvalRunner):
             self.solid_generate_input_channels,
         ).wait()
 
+    def _get_reward_compute_kwargs(self, batch: dict) -> dict:
+        """Return task-specific keyword arguments for reward computation."""
+        return {"total_batch_size": self.total_batch_size}
+
     def run(self):
         """Run evaluation on validation dataset.
 
@@ -177,7 +181,7 @@ class AgentEvalRunner(ReasoningEvalRunner):
                         reward_handle: Handle = self.reward.compute_rewards(
                             input_channel=self.rollout_channel,
                             output_channel=self.reward_channel,
-                            total_batch_size=self.total_batch_size,
+                            **self._get_reward_compute_kwargs(batch),
                         )
                         eval_input_channel = self.reward_channel
                     else:

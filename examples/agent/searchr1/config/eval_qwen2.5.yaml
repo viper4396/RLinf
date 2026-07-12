@@ -132,3 +132,10 @@ rollout:
   validate_weight: False        # whether to send all weights at first for weight comparison.
   validate_save_dir: null       # the directory to save the weights for comparison. If validate_weight is True, this will be used to save the weights for comparison.
   print_outputs: False          # whether to print the outputs (token ids, texts, etc.) of rollout engine.
+
+
+reward:
+  group_name: "RewardGroup"
+  use_reward_model: False
+  reward_type: "searchr1"
+  reward_scale: 1.0
