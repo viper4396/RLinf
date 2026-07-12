@@ -79,6 +79,9 @@ class SGLangClient:
         data = {
             "model": self.llm_type,
             "messages": messages,
+            "chat_template_kwargs": {
+                "enable_thinking": True,
+            },
         }
 
         max_retries = 10
