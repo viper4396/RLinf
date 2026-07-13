@@ -149,7 +149,7 @@ class WideSeekR2AgentLoopWorker(MultiAgentLoopWorker):
             A tuple of `(tool_requests, tool_call_info)` where `tool_call_info`
             summarizes subtask/search/access counts for metrics.
         """
-        max_workers_per_planner = self.cfg.agentloop.get("max_workers_per_planner", 10)
+        max_workers_per_planner = self.cfg.agentloop.get("max_workers_per_planner", -1)
         max_toolcall_per_worker = self.cfg.agentloop.get("max_toolcall_per_worker", 5)
         assert self.toolcall_parser is not None
         _, tool_requests = await self.toolcall_parser(
@@ -250,7 +250,7 @@ class WideSeekR2AgentLoopWorker(MultiAgentLoopWorker):
         total_turn_list = []
 
         add_few_shot = self.cfg.agentloop.get("add_few_shot", True)
-        max_workers_per_planner = self.cfg.agentloop.get("max_workers_per_planner", 10)
+        max_workers_per_planner = self.cfg.agentloop.get("max_workers_per_planner", -1)
         max_toolcall_per_worker = self.cfg.agentloop.get("max_toolcall_per_worker", 5)
 
         message_history, tools = build_message_history_and_tools(

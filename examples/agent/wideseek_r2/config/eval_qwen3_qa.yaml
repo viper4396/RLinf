@@ -8,7 +8,7 @@ cluster:
     rollout: all
 
 runner:
-  experiment_name: qa_offline
+  experiment_name: lrm_mas_flow_infinite_subagent
   output_dir: ./logs/eval
   seq_length: 32000  
 
@@ -20,12 +20,13 @@ algorithm:
 
 agentloop:
   workflow: mas # or sa, mas refers to multi-agent, sa refers to single-agent
-  llm_ip: 172.27.22.116 # TODO:(USER) Replace with the actual IP address of the LLM judge server
+  llm_ip: 172.27.214.151 # TODO:(USER) Replace with the actual IP address of the LLM judge server
   llm_port: 30000 # TODO:(USER) Replace with the actual port of the LLM judge server
+  max_workers_per_planner: -1
 
 rollout:
   model:
-    model_path: /mnt/public/xzxuan/models/Qwen3-4B # TODO:(USER) Replace with the actual path to the model checkpoint
+    model_path: /mnt/project_rlinf/xzxuan/model/Qwen3-4B # TODO:(USER) Replace with the actual path to the model checkpoint
 
 tools:
   online: False
@@ -33,10 +34,10 @@ tools:
 data:
   type: wideseek_r2
   max_prompt_length: 4096
-  val_rollout_batch_size: 64
+  val_rollout_batch_size: 128
   prompt_key: question
   answer_key: answer
   answer_mode: boxed
-  val_data_paths: /mnt/public/xzxuan/data/Asearcher-test-data/NQ_rand1000/test.jsonl # TODO:(USER) Replace with the actual path to the evaluation dataset
-  validation_shuffle: True
-  data_size: 64
+  val_data_paths: /mnt/project_rlinf/xzxuan/data/Asearch_train/ASearcher-LRM-35k.jsonl # TODO:(USER) Replace with the actual path to the evaluation dataset
+  validation_shuffle: False
+  data_size: 128

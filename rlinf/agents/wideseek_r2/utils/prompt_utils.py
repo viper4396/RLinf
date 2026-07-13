@@ -17,6 +17,7 @@ from rlinf.agents.wideseek_r2.utils.prompt import (
     MARKDOWN_FORMAT_EN,
     SYSTEM_PROMPT_PLANNER,
     SYSTEM_PROMPT_PLANNER_NOSHOT,
+    SYSTEM_PROMPT_PLANNER_UNLIMITED,
     SYSTEM_PROMPT_SINGLE_AGENT,
     SYSTEM_PROMPT_SINGLE_AGENT_NOSHOT,
     SYSTEM_PROMPT_WORKER,
@@ -48,20 +49,52 @@ def _format_instruction(answer_mode: str) -> str:
     )
 
 
+def _fanout_guidance(max_workers_per_planner: int) -> str:
+    """Return the per-turn fan-out guidance sentence for the planner prompt.
+
+    Mirrors the ``create_sub_agents`` tool description: a negative value means
+    unlimited parallel sub-agents, a non-negative value caps the count.
+    """
+    if max_workers_per_planner < 0:
+        return (
+            "There is NO limit on the number of sub-agents you may launch in a "
+            "single call: whenever a turn requires researching many independent "
+            "items, create one sub-agent per item and launch them all in parallel "
+            "in the same turn."
+        )
+    return (
+        "You may launch at most "
+        f"{max_workers_per_planner} sub-agents in a single call, so when a turn "
+        "requires more independent items than that, delegate as many as allowed "
+        "now and handle the remaining ones in the following turns."
+    )
+
+
 def get_prompt_planner(
     question: str,
     answer_mode: str,
     add_few_shot: bool,
     max_workers_per_planner: int,
 ) -> list:
-    """Build the planner prompt with optional few-shot examples."""
+    """Build the planner prompt with optional few-shot examples.
+
+    When ``max_workers_per_planner`` is negative the planner is uncapped and the
+    unlimited-mode few-shot is used; otherwise the capped few-shot injects the
+    limit so the narrative matches the parser's enforcement.
+    """
     format_instruction = _format_instruction(answer_mode)
     if add_few_shot:
-        system = SYSTEM_PROMPT_PLANNER.format(
-            format_instruction, max_workers_per_planner=max_workers_per_planner
-        )
+        if max_workers_per_planner < 0:
+            system = SYSTEM_PROMPT_PLANNER_UNLIMITED.format(format_instruction)
+        else:
+            system = SYSTEM_PROMPT_PLANNER.format(
+                format_instruction, max_workers_per_planner=max_workers_per_planner
+            )
     else:
-        system = SYSTEM_PROMPT_PLANNER_NOSHOT.format(format_instruction)
+        system = SYSTEM_PROMPT_PLANNER_NOSHOT.format(
+            format_instruction,
+            fanout_guidance=_fanout_guidance(max_workers_per_planner),
+        )
     return [
         {"role": "system", "content": system},
         {"role": "user", "content": USER_PROMPT_PLANNER.format(question)},
@@ -112,7 +145,8 @@ def build_message_history_and_tools(
         role: Current role (`planner`, `worker`, or `single`).
         answer_mode: Answer mode for this sample (``markdown`` or ``boxed``).
         add_few_shot: Whether to include few-shot examples in the system prompt.
-        max_workers_per_planner: Sub-agent per-call limit for tool descriptions.
+        max_workers_per_planner: Sub-agent per-call limit for prompt/tool
+            descriptions; negative means unlimited.
         max_toolcall_per_worker: Search/access per-call limit for tool descriptions.
         main_task: Parent task text required for worker prompts.
 
