@@ -83,6 +83,7 @@ def assign_searchr1_rewards(
 
     rollout_result.rewards = rewards
     extra_fields_traj["llm_reward"] = final_scores
+    extra_fields_traj["R_final"] = final_scores
     rollout_result.extra_fields_traj = extra_fields_traj
     rollout_result.extra_fields_group = rollout_result.extra_fields_group or {}
     if expose_reference:

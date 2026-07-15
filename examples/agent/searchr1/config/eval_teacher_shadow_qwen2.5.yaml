@@ -1,0 +1,87 @@
+defaults:
+  - eval_qwen2.5
+  - _self_
+
+
+cluster:
+  # Eight policy GPUs plus one dedicated frozen-teacher GPU. Adjust the
+  # hardware ranks when plans are pre-generated or more teacher TP is needed.
+  num_nodes: 2
+  component_placement:
+    rollout,reward: 0-7
+    teacher_planner: 8
+
+
+runner:
+  experiment_name: searchr1-qwen2.5-3b-teacher-shadow
+
+
+algorithm:
+  group_size: 4
+
+
+data:
+  # Shuffled controls require at least two questions in every split sent to an
+  # agent-loop worker. The default paired A/B run itself has no such constraint.
+  val_rollout_batch_size: null
+
+
+agentloop:
+  policy_version: qwen2.5-3b-searchr1-baseline
+
+
+teacher_planner:
+  enabled: true
+  group_name: TeacherPlannerGroup
+  version: qwen2.5-7b-instruct-frozen-v1
+  seed: 1234
+  cache_dir: ${runner.output_dir}/${runner.experiment_name}/teacher_plan_cache
+  max_new_tokens: 256
+  max_plan_chars: 2048
+  max_field_chars: 512
+  bootstrap_samples: 2000
+
+  # Main paired shadow evaluation. For placebo runs override with either:
+  # [shuffled, shuffled, unguided, unguided] or
+  # [generic, generic, unguided, unguided].
+  guidance_modes: [guided, guided, unguided, unguided]
+
+  gpu_memory_utilization: 0.8
+  model:
+    model_path: /path/to/model/Qwen2.5-7B-Instruct
+    model_type: qwen2.5
+    precision: fp16
+  enforce_eager: false
+  distributed_executor_backend: mp
+  disable_log_stats: false
+  detokenize: true
+  padding: null
+  eos: null
+  return_logprobs: false
+
+  rollout_backend: sglang
+  sampling_params:
+    do_sample: false
+    temperature: 0.0
+    max_new_tokens: ${teacher_planner.max_new_tokens}
+  sglang:
+    attention_backend: triton
+    decode_log_interval: 500000
+    use_torch_compile: false
+    torch_compile_max_bs: 128
+  vllm:
+    attention_backend: FLASH_ATTN
+    enable_chunked_prefill: true
+    enable_prefix_caching: true
+    enable_flash_infer_sampler: true
+    max_num_batched_tokens: null
+    torch_profiler_dir: null
+
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  max_running_requests: 128
+  cuda_graph_max_bs: 128
+  validate_weight_first_sync: false
+  validate_weight: false
+  validate_save_dir: null
+  print_outputs: false

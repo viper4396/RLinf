@@ -64,6 +64,8 @@ class RolloutRequest:
     image_data: Union[list[list[bytes]], list[list[str]]]
     answers: list[Union[list[str], dict]]
     multi_modal_inputs: list[Optional[dict]]
+    prompt_texts: Optional[list[Optional[str]]] = None
+    sample_ids: Optional[list[Union[str, int]]] = None
 
     def to_seq_group_infos(self) -> list["SeqGroupInfo"]:
         """Convert the RolloutRequest into a list of SeqGroupInfo objects.

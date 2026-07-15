@@ -116,8 +116,11 @@ agentloop:
 # Tools configuration for AgentLoop
 tools:
   search:
-    server_addr: 0.0.0.0:8000
+    server_addr: 127.0.0.1:8000
     topk: 3
+    max_concurrency: 128
+    max_retries: 3
+    retry_delay: 5
 
 
 rollout:

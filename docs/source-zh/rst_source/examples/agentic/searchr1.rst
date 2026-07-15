@@ -238,6 +238,53 @@ model路径填入 `examples/agent/searchr1/config/eval_qwen2.5.yaml`
 
 运行 `bash examples/agent/searchr1/run_eval.sh` 启动测试。
 
+冻结 Teacher Planner 的 Shadow A/B
+----------------------------------
+
+阶段 2 的 shadow 评估保持 policy 冻结，并使用 Qwen2.5-7B-Instruct 启动独立的
+``teacher_planner`` rollout。Teacher 只接收问题，不会接收 GT。严格的四字段 JSON
+plan 按问题、teacher 版本和 seed 缓存，并且仅作为低权限 guidance 影响 policy 的
+第一次搜索。
+
+在 ``examples/agent/searchr1/config/eval_teacher_shadow_qwen2.5.yaml`` 中设置
+policy 和 teacher 模型路径。默认布局使用硬件 rank 0--7 运行 policy 评估，rank 8
+运行冻结 teacher；如果每个节点有 8 张 GPU，则需要两个 Ray 节点。使用预生成 plan
+或不同 teacher tensor parallel size 时，应相应调整
+``cluster.component_placement``。
+
+主 paired 实验为每个问题保留四条轨迹：
+
+.. code-block:: yaml
+
+   algorithm:
+     group_size: 4
+
+   teacher_planner:
+     enabled: true
+     guidance_modes: [guided, guided, unguided, unguided]
+
+运行 paired 评估：
+
+.. code-block:: bash
+
+   bash examples/agent/searchr1/run_eval.sh eval_teacher_shadow_qwen2.5
+
+通过覆盖 ``guidance_modes`` 分别运行两个 placebo 对照：
+
+.. code-block:: bash
+
+   bash examples/agent/searchr1/run_eval.sh eval_teacher_shadow_qwen2.5 \
+     teacher_planner.guidance_modes='[shuffled,shuffled,unguided,unguided]'
+   bash examples/agent/searchr1/run_eval.sh eval_teacher_shadow_qwen2.5 \
+     teacher_planner.guidance_modes='[generic,generic,unguided,unguided]'
+
+结果摘要包含 ``planner/guided_EM``、``planner/unguided_EM``、
+``planner/guided_minus_unguided``、``planner/plan_valid_rate``、
+``planner/query_change_rate`` 和 ``planner/answer_hit_delta``。Shuffled 和 generic
+实验会输出相应的 mode-specific 指标。摘要还会通过
+``planner/<mode>_uplift_ci_low`` 和 ``planner/<mode>_uplift_ci_high`` 输出可复现的
+paired-bootstrap 95% CI。Shuffled 对照要求每个 agent-loop request 至少包含两个问题。
+
 训练曲线
 --------
 

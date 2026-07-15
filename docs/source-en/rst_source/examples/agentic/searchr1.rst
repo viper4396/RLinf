@@ -247,6 +247,57 @@ Modify the evaluation dataset path:
 
 Run `bash examples/agent/searchr1/run_eval.sh` to start evaluation.
 
+Frozen Teacher-Planner Shadow A/B
+---------------------------------
+
+The phase-2 shadow evaluation keeps the policy frozen and launches an
+independent ``teacher_planner`` rollout using Qwen2.5-7B-Instruct. The teacher
+receives the question but never the ground-truth answer. Its strict four-field
+JSON plan is cached by question, teacher version, and seed, and is injected as
+low-trust guidance only for the policy's first search.
+
+Set the policy and teacher model paths in
+``examples/agent/searchr1/config/eval_teacher_shadow_qwen2.5.yaml``. The default
+layout uses hardware ranks 0--7 for policy evaluation and rank 8 for the frozen
+teacher, so it requires two Ray nodes when each node has eight GPUs. Adjust
+``cluster.component_placement`` when using pre-generated plans or a different
+teacher tensor-parallel size.
+
+The main paired run keeps four trajectories per question:
+
+.. code-block:: yaml
+
+   algorithm:
+     group_size: 4
+
+   teacher_planner:
+     enabled: true
+     guidance_modes: [guided, guided, unguided, unguided]
+
+Run the paired evaluation with:
+
+.. code-block:: bash
+
+   bash examples/agent/searchr1/run_eval.sh eval_teacher_shadow_qwen2.5
+
+Run the two placebo controls separately by overriding ``guidance_modes``:
+
+.. code-block:: bash
+
+   bash examples/agent/searchr1/run_eval.sh eval_teacher_shadow_qwen2.5 \
+     teacher_planner.guidance_modes='[shuffled,shuffled,unguided,unguided]'
+   bash examples/agent/searchr1/run_eval.sh eval_teacher_shadow_qwen2.5 \
+     teacher_planner.guidance_modes='[generic,generic,unguided,unguided]'
+
+The result summary contains ``planner/guided_EM``,
+``planner/unguided_EM``, ``planner/guided_minus_unguided``,
+``planner/plan_valid_rate``, ``planner/query_change_rate``, and
+``planner/answer_hit_delta``. Shuffled and generic runs emit the corresponding
+mode-specific metrics. The summary also reports deterministic paired-bootstrap
+95% CI bounds as ``planner/<mode>_uplift_ci_low`` and
+``planner/<mode>_uplift_ci_high``. Use at least two questions per agent-loop
+request for the shuffled control.
+
 Training Curves
 ---------------
 

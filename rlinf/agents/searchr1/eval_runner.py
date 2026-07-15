@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import typing
+from collections import defaultdict
 from typing import Optional, Union
 
 from omegaconf import OmegaConf
@@ -24,6 +25,8 @@ from omegaconf.dictconfig import DictConfig
 from torch.utils.data import Dataset
 
 from rlinf.agents.searchr1.reference_runner import SearchR1ReferenceRunnerMixin
+from rlinf.agents.searchr1.teacher_planner import build_shadow_metrics
+from rlinf.algorithms.searchr1_scoring import subem_check
 from rlinf.data.io_struct import DynamicRolloutResult
 from rlinf.runners.agent_eval_runner import AgentEvalRunner
 from rlinf.utils.placement import ModelParallelComponentPlacement
@@ -67,7 +70,9 @@ class Searchr1AgentEvalRunner(SearchR1ReferenceRunnerMixin, AgentEvalRunner):
         # Initialize storage for accumulating evaluation results across all batches
         self.accumulated_results = []
 
-    def _save_eval_results(self, all_results, accuracy, total_count):
+    def _save_eval_results(
+        self, all_results, accuracy, total_count, question_count, metrics
+    ):
         """Save evaluation results to JSON file.
 
         Args:
@@ -90,10 +95,12 @@ class Searchr1AgentEvalRunner(SearchR1ReferenceRunnerMixin, AgentEvalRunner):
         results_data = {
             "summary": {
                 "dataset_size": total_count,
+                "question_count": question_count,
                 "correct_count": sum(1 for r in all_results if r["is_correct"]),
                 "accuracy": accuracy,
                 "experiment_name": self.cfg.runner.experiment_name,
                 "timestamp": timestamp,
+                "metrics": metrics,
                 "config": {
                     "data_paths": OmegaConf.to_container(
                         self.cfg.data.val_data_paths, resolve=True
@@ -129,7 +136,6 @@ class Searchr1AgentEvalRunner(SearchR1ReferenceRunnerMixin, AgentEvalRunner):
         group_size = self.cfg.algorithm.get("group_size", 1)
         assert group_size == 1, f"searchr1 eval requires group_size=1, got {group_size}"
 
-        batch_results = []
         correct_count = 0
         total_count = 0
 
@@ -138,7 +144,7 @@ class Searchr1AgentEvalRunner(SearchR1ReferenceRunnerMixin, AgentEvalRunner):
             eval_pbar.update(group_size)
             recv_batch_size += group_size
 
-            # Extract per-trajectory results from DynamicRolloutResult
+            context["total_questions"] += 1
             extra_fields_traj = rollout_result.extra_fields_traj or {}
             extra_fields_group = rollout_result.extra_fields_group or {}
 
@@ -147,33 +153,123 @@ class Searchr1AgentEvalRunner(SearchR1ReferenceRunnerMixin, AgentEvalRunner):
             response_texts = extra_fields_traj.get("response_text", [None])
             prompt_texts = extra_fields_traj.get("prompt_text", [None])
             turns_list = extra_fields_traj.get("turns", [[]])
+            guidance_modes = extra_fields_traj.get(
+                "guidance_mode", ["unguided"] * rollout_result.group_size
+            )
+            if len(guidance_modes) != rollout_result.group_size:
+                raise ValueError(
+                    "Search-R1 guidance_mode must align with trajectory group"
+                )
 
-            # group_size=1, so only one trajectory per question
-            reward = llm_rewards[0]
-            if hasattr(reward, "item"):
-                reward = reward.item()
-            reward = float(reward)
+            metadata_keys = (
+                "sample_id",
+                "trajectory_id",
+                "conditioning_group_id",
+                "teacher_version",
+                "teacher_plan_id",
+                "teacher_plan_node_id",
+                "teacher_plan_valid",
+                "teacher_plan",
+                "teacher_plan_error",
+                "teacher_cache_hit",
+                "guidance_applied",
+                "policy_version",
+            )
+            group_mode_rewards: dict[str, list[float]] = defaultdict(list)
+            group_mode_queries: dict[str, list[str | None]] = defaultdict(list)
+            group_mode_answer_hits: dict[str, list[float]] = defaultdict(list)
 
-            is_correct = reward > 0
-            if is_correct:
-                correct_count += 1
-            total_count += 1
+            for trajectory_idx in range(rollout_result.group_size):
+                reward = llm_rewards[trajectory_idx]
+                if hasattr(reward, "item"):
+                    reward = reward.item()
+                reward = float(reward)
+                mode = str(guidance_modes[trajectory_idx])
+                turns = turns_list[trajectory_idx]
+                first_query = next(
+                    (
+                        turn.get("search_query")
+                        for turn in turns
+                        if turn.get("is_search")
+                    ),
+                    None,
+                )
+                visible_evidence = "\n".join(
+                    str(turn.get("visible_evidence") or "") for turn in turns
+                )
+                answer_hit = (
+                    float(subem_check(visible_evidence, answer))
+                    if answer is not None and visible_evidence
+                    else 0.0
+                )
 
-            # Create result entry with per-turn details
-            result_entry = {
-                "index": len(self.accumulated_results),
-                "prompt_text": prompt_texts[0],
-                "turns": turns_list[
-                    0
-                ],  # list of {"input": ..., "output": ...} per turn
-                "response_text": response_texts[0],
-                "answer": answer,
-                "reward": reward,
-                "is_correct": is_correct,
-            }
+                group_mode_rewards[mode].append(reward)
+                group_mode_queries[mode].append(first_query)
+                group_mode_answer_hits[mode].append(answer_hit)
+                context["mode_reward_sums"][mode] += reward
+                context["mode_counts"][mode] += 1
+                context["mode_answer_hit_sums"][mode] += answer_hit
 
-            batch_results.append(result_entry)
-            self.accumulated_results.append(result_entry)
+                is_correct = reward > 0
+                correct_count += int(is_correct)
+                total_count += 1
+                result_entry = {
+                    "index": len(self.accumulated_results),
+                    "trajectory_index": trajectory_idx,
+                    "prompt_text": prompt_texts[trajectory_idx],
+                    "turns": turns,
+                    "response_text": response_texts[trajectory_idx],
+                    "answer": answer,
+                    "guidance_mode": mode,
+                    "reward": reward,
+                    "is_correct": is_correct,
+                    "answer_hit": bool(answer_hit),
+                }
+                for key in metadata_keys:
+                    values = extra_fields_traj.get(key)
+                    result_entry[key] = (
+                        values[trajectory_idx] if values is not None else None
+                    )
+                self.accumulated_results.append(result_entry)
+
+                plan_id = result_entry["teacher_plan_id"]
+                if plan_id is not None:
+                    context["plan_valid_by_id"][plan_id] = bool(
+                        result_entry["teacher_plan_valid"]
+                    )
+                    context["plan_cache_hit_by_id"][plan_id] = bool(
+                        result_entry["teacher_cache_hit"]
+                    )
+
+            if "unguided" in group_mode_rewards:
+                unguided_mean = sum(group_mode_rewards["unguided"]) / len(
+                    group_mode_rewards["unguided"]
+                )
+                unguided_hit_mean = sum(group_mode_answer_hits["unguided"]) / len(
+                    group_mode_answer_hits["unguided"]
+                )
+                for mode, mode_rewards in group_mode_rewards.items():
+                    if mode == "unguided":
+                        continue
+                    mode_mean = sum(mode_rewards) / len(mode_rewards)
+                    mode_hit_mean = sum(group_mode_answer_hits[mode]) / len(
+                        group_mode_answer_hits[mode]
+                    )
+                    context["paired_uplift_sums"][mode] += mode_mean - unguided_mean
+                    context["paired_uplifts"][mode].append(mode_mean - unguided_mean)
+                    context["paired_answer_hit_sums"][mode] += (
+                        mode_hit_mean - unguided_hit_mean
+                    )
+                    context["paired_counts"][mode] += 1
+
+                    mode_queries = group_mode_queries[mode]
+                    unguided_queries = group_mode_queries["unguided"]
+                    query_pairs = zip(mode_queries, unguided_queries)
+                    for mode_query, unguided_query in query_pairs:
+                        context["query_change_sums"][mode] += float(
+                            mode_query != unguided_query
+                        )
+                        context["query_change_counts"][mode] += 1
 
         # Compute batch accuracy
         accuracy = correct_count / total_count if total_count > 0 else 0.0
@@ -203,6 +299,18 @@ class Searchr1AgentEvalRunner(SearchR1ReferenceRunnerMixin, AgentEvalRunner):
         context = {
             "total_correct": 0,
             "total_samples": 0,
+            "total_questions": 0,
+            "mode_reward_sums": defaultdict(float),
+            "mode_answer_hit_sums": defaultdict(float),
+            "mode_counts": defaultdict(int),
+            "paired_uplift_sums": defaultdict(float),
+            "paired_uplifts": defaultdict(list),
+            "paired_answer_hit_sums": defaultdict(float),
+            "paired_counts": defaultdict(int),
+            "query_change_sums": defaultdict(float),
+            "query_change_counts": defaultdict(int),
+            "plan_valid_by_id": {},
+            "plan_cache_hit_by_id": {},
         }
         return context
 
@@ -212,6 +320,13 @@ class Searchr1AgentEvalRunner(SearchR1ReferenceRunnerMixin, AgentEvalRunner):
     ) -> dict:
         total_correct = context["total_correct"]
         total_samples = context["total_samples"]
+        question_count = context["total_questions"]
+        teacher_cfg = self.cfg.get("teacher_planner", {})
+        shadow_metrics = build_shadow_metrics(
+            context,
+            bootstrap_seed=int(teacher_cfg.get("seed", self.cfg.data.get("seed", 0))),
+            bootstrap_samples=int(teacher_cfg.get("bootstrap_samples", 2000)),
+        )
         # Final summary
         final_accuracy = total_correct / total_samples if total_samples > 0 else 0.0
         logging.info("\n" + "=" * 80)
@@ -222,11 +337,21 @@ class Searchr1AgentEvalRunner(SearchR1ReferenceRunnerMixin, AgentEvalRunner):
         logging.info(
             f"Final accuracy: {final_accuracy:.4f} ({final_accuracy * 100:.2f}%)"
         )
+        for metric_name, metric_value in sorted(shadow_metrics.items()):
+            logging.info(f"{metric_name}: {metric_value:.4f}")
         logging.info("=" * 80)
+
+        self.metric_logger.log(shadow_metrics, step=self.global_steps)
 
         # Save all accumulated results to JSON file
         logging.info(f"Saving {len(self.accumulated_results)} results to JSON file...")
-        self._save_eval_results(self.accumulated_results, final_accuracy, total_samples)
+        self._save_eval_results(
+            self.accumulated_results,
+            final_accuracy,
+            total_samples,
+            question_count,
+            shadow_metrics,
+        )
 
     def update_batch(
         self,

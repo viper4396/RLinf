@@ -4,6 +4,21 @@ Brief for AI coding agents working on RLinf. For full contribution flow, code st
 
 **Quick orientation:** RLinf is a distributed RL stack (embodied + reasoning + agent). It uses **Ray** for process management and **Hydra** for config. Single-machine runs use `cluster.num_nodes: 1`; multi-node needs Ray started on every node with `RLINF_NODE_RANK` set *before* `ray start`. Pre-commit runs Ruff (lint + format) and commit-check; use Google-style docstrings and type hints. All user-facing changes need tests and docs. If something is unclear, add a `TODO(agent)` and note the limitation.
 
+## Experimental machines
+
+Use these SSH aliases as the default remote experiment machines. Check active jobs
+before launching anything; the last observed snapshot showed both machines in use.
+
+- `WS-R2` (`172.27.2.37`): primary RL/Ray machine with 8x H100 80GB. The last
+  snapshot showed an active WideSeek-R2 evaluation, Ray and SGLang workers,
+  Qdrant, and retrieval services on ports `18001` and `8003`.
+- `judge_machine` (`172.27.195.196`): judge/inference machine with 8x H100
+  80GB. The last snapshot showed a Qwen3.6-27B SGLang DP8 service, Qdrant, and
+  a retrieval service on port `8000`; no Ray cluster was detected.
+
+The snapshot was taken on 2026-07-12 around 14:55 (Asia/Shanghai). Runtime
+details are expected to change, so use SSH diagnostics before allocating GPUs.
+
 ---
 
 ## Code structure

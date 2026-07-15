@@ -34,8 +34,18 @@ class SearchR1ReferenceRunnerMixin:
         answers = batch["answer"]
         image_data = batch["image_data"]
         multi_modal_inputs = batch["multi_modal_inputs"]
+        prompt_texts = batch.get("prompt_text", [None] * len(prompt_ids))
+        sample_ids = batch.get("idx")
+        if sample_ids is None:
+            sample_ids = [None] * len(prompt_ids)
+        elif hasattr(sample_ids, "tolist"):
+            sample_ids = sample_ids.tolist()
         prompt_ids = [ids[-prompt_len:] for ids, prompt_len in zip(prompt_ids, lengths)]
         reference_ids = [uuid4().hex for _ in prompt_ids]
+        sample_ids = [
+            reference_id if sample_id is None else sample_id
+            for sample_id, reference_id in zip(sample_ids, reference_ids)
+        ]
 
         if split_size is None:
             split_size = self.component_placement.rollout_dp_size
@@ -46,6 +56,8 @@ class SearchR1ReferenceRunnerMixin:
             split_list(image_data, split_size, enforce_divisible_batch=False),
             split_list(multi_modal_inputs, split_size, enforce_divisible_batch=False),
             split_list(reference_ids, split_size, enforce_divisible_batch=False),
+            split_list(prompt_texts, split_size, enforce_divisible_batch=False),
+            split_list(sample_ids, split_size, enforce_divisible_batch=False),
         )
         for (
             input_ids,
@@ -53,6 +65,8 @@ class SearchR1ReferenceRunnerMixin:
             image_batch,
             multi_modal_batch,
             reference_id_batch,
+            prompt_text_batch,
+            sample_id_batch,
         ) in split_inputs:
             self.reward_reference_channel.put(
                 {
@@ -70,6 +84,8 @@ class SearchR1ReferenceRunnerMixin:
                 answers=reference_id_batch,
                 image_data=image_batch,
                 multi_modal_inputs=multi_modal_batch,
+                prompt_texts=prompt_text_batch,
+                sample_ids=sample_id_batch,
             )
             self.dataloader_channel.put(request, async_op=True)
 

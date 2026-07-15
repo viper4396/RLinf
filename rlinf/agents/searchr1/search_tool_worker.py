@@ -27,17 +27,48 @@ from rlinf.workers.agent.tool_worker import ToolWorker
 class AsyncSearchClient:
     def __init__(self, cfg: DictConfig):
         self.cfg = cfg
-        self.session = None
+        self.session: aiohttp.ClientSession | None = None
+        self.semaphore: asyncio.Semaphore | None = None
         self.server_addr = self.cfg.tools.search.server_addr
+        self.max_concurrency = max(
+            1, int(self.cfg.tools.search.get("max_concurrency", 16))
+        )
+        self.max_retries = max(1, int(self.cfg.tools.search.get("max_retries", 3)))
+        self.retry_delay = max(
+            0.0, float(self.cfg.tools.search.get("retry_delay", 5))
+        )
         print(self.server_addr)
 
+    async def start(self):
+        """Create the bounded shared HTTP client for this tool worker."""
+        if self.session is not None and not self.session.closed:
+            return
+
+        connector = aiohttp.TCPConnector(
+            limit=self.max_concurrency,
+            limit_per_host=self.max_concurrency,
+            enable_cleanup_closed=True,
+        )
+        self.session = aiohttp.ClientSession(connector=connector)
+        self.semaphore = asyncio.Semaphore(self.max_concurrency)
+
+    async def close(self):
+        """Close the shared HTTP client and release its connections."""
+        if self.session is not None and not self.session.closed:
+            await self.session.close()
+        self.session = None
+        self.semaphore = None
+
     async def query_async(self, req_meta: dict[str, Any]) -> list[dict]:
-        cnt = 0
+        await self.start()
+        assert self.session is not None
+        assert self.semaphore is not None
+
         last_exception = None
-        while cnt < 10:
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(
+        async with self.semaphore:
+            for attempt in range(self.max_retries):
+                try:
+                    async with self.session.post(
                         f"http://{self.server_addr}/retrieve",
                         json=req_meta,
                         timeout=aiohttp.ClientTimeout(total=120, sock_connect=120),
@@ -52,11 +83,17 @@ class AsyncSearchClient:
                             }
                             for result in res["result"]
                         ]
-            except Exception as e:
-                last_exception = e
-                print(f"Search Engine error {e}. Retry for {cnt} times.")
-                cnt += 1
-                await asyncio.sleep(10)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    last_exception = e
+                    if attempt + 1 >= self.max_retries:
+                        break
+                    print(
+                        f"Search Engine error {e}. "
+                        f"Retry {attempt + 1}/{self.max_retries}."
+                    )
+                    await asyncio.sleep(self.retry_delay)
 
         raise RuntimeError(
             "Fail to post search query to RAG server"
@@ -70,6 +107,7 @@ class SearchToolWorker(ToolWorker):
         self.topk = self.cfg.tools.search.topk
         self.dummy_mode = self.cfg.tools.search.get("dummy_mode", False)
         self.request_processor_task = None
+        self.active_tasks: set[asyncio.Task[Any]] = set()
         self.search_client = AsyncSearchClient(cfg=self.cfg)
 
     def init_worker(self, input_channel: Channel, output_channel: Channel):
@@ -81,11 +119,29 @@ class SearchToolWorker(ToolWorker):
         self.request_processor_task = loop.create_task(self._process_requests())
 
     def stop_server(self):
-        # Cancel request processor task
+        """Cancel active requests and close the shared HTTP client."""
         if self.request_processor_task and not self.request_processor_task.done():
             self.request_processor_task.cancel()
+        for task in list(self.active_tasks):
+            task.cancel()
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(self._shutdown())
+
+    async def _shutdown(self):
+        """Wait for cancelled requests and release HTTP resources."""
+        tasks = list(self.active_tasks)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        await self.search_client.close()
 
     async def _process_requests(self):
+        if not self.dummy_mode:
+            await self.search_client.start()
+
         def process_tool_result(response):
             res = {}
             res["documents"] = response[0]["documents"]
@@ -152,6 +208,8 @@ class SearchToolWorker(ToolWorker):
             assert request.tool_name == "search", (
                 "SearchToolWorker only execute tool_name 'search'"
             )
-            asyncio.create_task(
+            task = asyncio.create_task(
                 generate_and_send(request.session_id, request.tool_args)
             )
+            self.active_tasks.add(task)
+            task.add_done_callback(self.active_tasks.discard)

@@ -246,5 +246,6 @@ class ReasoningDataset(Dataset):
             answer=answer,
             idx=idx,
             image_data=[],
+            prompt_text=prompt,
         )
         return output

@@ -13,7 +13,10 @@
 # limitations under the License.
 
 import asyncio
+import json
+from collections import defaultdict
 
+import pytest
 import torch
 from omegaconf import OmegaConf
 
@@ -22,6 +25,17 @@ from rlinf.agents.searchr1.reward_worker import assign_searchr1_rewards
 from rlinf.agents.searchr1.searchr1_agent_loop import (
     Searchr1AgentLoopWorker,
     truncate_token_ids,
+)
+from rlinf.agents.searchr1.teacher_planner import (
+    FrozenTeacherPlanner,
+    TeacherPlan,
+    TeacherPlanResult,
+    build_guidance_token_ids,
+    build_shadow_metrics,
+    paired_bootstrap_ci,
+    parse_teacher_plan,
+    shuffled_teacher_plans,
+    teacher_plan_cache_key,
 )
 from rlinf.algorithms.advantages import compute_grpo_dynamic_advantages
 from rlinf.data.io_struct import DynamicRolloutResult
@@ -129,7 +143,8 @@ def test_gen_extra_fields_emits_turn_and_terminal_training_metadata():
     assert train_fields["planner_turn_idx"] == [0, 1]
     assert train_fields["is_terminal"] == [False, True]
     assert trajectory_fields["response_text"] == ["full response"]
-    assert group_fields == {"reference_id": "opaque-reference-id"}
+    assert group_fields["reference_id"] == "opaque-reference-id"
+    assert "answer" not in group_fields
 
 
 def test_assign_reward_only_to_each_trajectory_terminal_turn():
@@ -279,7 +294,8 @@ def test_one_search_then_answer_runs_end_to_end_with_terminal_reward():
     assign_searchr1_rewards(rollout_result, ["Paris"])
 
     assert rollout_result.rewards == [0.0, 1.0]
-    assert rollout_result.extra_fields_group == {"reference_id": "opaque-id"}
+    assert rollout_result.extra_fields_group["reference_id"] == "opaque-id"
+    assert "answer" not in rollout_result.extra_fields_group
 
 
 def test_max_turns_three_allows_two_searches_then_an_answer():
@@ -306,3 +322,230 @@ def test_max_turns_three_allows_two_searches_then_an_answer():
     assign_searchr1_rewards(rollout_result, ["Paris"])
 
     assert rollout_result.rewards == [0.0, 0.0, 1.0]
+
+
+def test_teacher_plan_parser_enforces_exact_compact_schema():
+    response = json.dumps(
+        {
+            "goal": "identify the relevant entity",
+            "query_intent": "find a primary source",
+            "expected_evidence": "an explicit entity-relation statement",
+            "fallback": "search the related organization",
+        }
+    )
+
+    plan = parse_teacher_plan(response)
+
+    assert plan.goal == "identify the relevant entity"
+    with pytest.raises(ValueError, match="only one JSON object"):
+        parse_teacher_plan(f"Here is the plan: {response}")
+    with pytest.raises(ValueError, match="fields must be exactly"):
+        parse_teacher_plan(response[:-1] + ', "answer": "secret"}')
+    with pytest.raises(ValueError, match="empty or too long"):
+        parse_teacher_plan(response.replace("find a primary source", ""))
+
+
+def test_teacher_plan_cache_key_is_versioned_and_deterministic():
+    first = teacher_plan_cache_key("question", "teacher-v1", 1234)
+
+    assert first == teacher_plan_cache_key("question", "teacher-v1", 1234)
+    assert first != teacher_plan_cache_key("question", "teacher-v2", 1234)
+    assert first != teacher_plan_cache_key("question", "teacher-v1", 2025)
+
+
+class _TeacherTokenizer(_CharacterTokenizer):
+    def __init__(self):
+        self.last_messages = None
+
+    def apply_chat_template(self, messages, tokenize, add_generation_prompt):
+        assert tokenize is True
+        assert add_generation_prompt is True
+        self.last_messages = messages
+        return self.encode(json.dumps(messages))
+
+    def decode(self, token_ids, skip_special_tokens=False):
+        del skip_special_tokens
+        return super().decode(token_ids)
+
+
+def test_frozen_teacher_receives_no_gt_and_reuses_cache(tmp_path):
+    tokenizer = _TeacherTokenizer()
+    cfg = OmegaConf.create(
+        {
+            "data": {"seed": 1234},
+            "teacher_planner": {
+                "version": "teacher-v1",
+                "seed": 1234,
+                "cache_dir": str(tmp_path),
+                "max_new_tokens": 64,
+            },
+        }
+    )
+    planner = FrozenTeacherPlanner(cfg, tokenizer)
+    response = json.dumps(
+        {
+            "goal": "locate evidence",
+            "query_intent": "search the named subject",
+            "expected_evidence": "a direct statement",
+            "fallback": "search a related source",
+        }
+    )
+    generate_calls = []
+
+    async def generate(prompt_ids, sampling_params, rollout_name):
+        generate_calls.append((prompt_ids, sampling_params, rollout_name))
+        assert "secret-ground-truth" not in tokenizer.decode(prompt_ids)
+        return {"output_ids": tokenizer.encode(response)}
+
+    first = asyncio.run(planner.get_plan("public question", generate))
+    second = asyncio.run(planner.get_plan("public question", generate))
+
+    assert first.valid is True
+    assert first.cache_hit is False
+    assert second.cache_hit is True
+    assert len(generate_calls) == 1
+    assert tokenizer.last_messages[-1] == {
+        "role": "user",
+        "content": "public question",
+    }
+
+
+def test_generic_guidance_matches_real_guidance_token_length():
+    tokenizer = _CharacterTokenizer()
+    plan = TeacherPlan(
+        goal="specific goal",
+        query_intent="specific query",
+        expected_evidence="specific evidence",
+        fallback="specific fallback",
+    )
+
+    guided_ids = build_guidance_token_ids(tokenizer, plan, "guided")
+    generic_ids = build_guidance_token_ids(tokenizer, plan, "generic")
+
+    assert len(generic_ids) == len(guided_ids)
+    assert generic_ids != guided_ids
+
+
+def test_shuffled_teacher_control_is_reproducible_derangement():
+    plans = [
+        TeacherPlanResult(
+            plan_id=str(index),
+            valid=True,
+            plan=TeacherPlan("goal", "intent", "evidence", "fallback"),
+            raw_response="{}",
+        )
+        for index in range(5)
+    ]
+
+    shuffled = shuffled_teacher_plans(plans, list(range(5)), seed=1234)
+
+    assert shuffled == shuffled_teacher_plans(plans, list(range(5)), seed=1234)
+    assert all(
+        original.plan_id != control.plan_id
+        for original, control in zip(plans, shuffled)
+    )
+
+
+def test_paired_bootstrap_ci_is_deterministic_and_positive():
+    first = paired_bootstrap_ci([0.2, 0.4, 0.3, 0.5], seed=1234, num_samples=200)
+    second = paired_bootstrap_ci([0.2, 0.4, 0.3, 0.5], seed=1234, num_samples=200)
+
+    assert first == second
+    assert first[0] > 0
+    assert first[1] >= first[0]
+
+
+def test_teacher_guidance_is_removed_after_first_search():
+    worker = Searchr1AgentLoopWorker.__new__(Searchr1AgentLoopWorker)
+    worker.cfg = OmegaConf.create(
+        {
+            "agentloop": {"max_turns": 2},
+            "rollout": {"model": {"model_path": "policy"}},
+        }
+    )
+    worker.max_prompt_len = 32
+    worker.max_resp_len = 64
+    worker.max_total_len = 128
+    worker.max_tool_response_length = 8
+    worker.tool_response_truncate_side = "right"
+    worker.print_outputs = False
+    worker.tokenizer = _CharacterTokenizer()
+    worker.teacher_planner = type("Teacher", (), {"teacher_version": "teacher-v1"})()
+    plan_result = TeacherPlanResult(
+        plan_id="plan-id",
+        valid=True,
+        plan=TeacherPlan("goal", "intent", "evidence", "fallback"),
+        raw_response="{}",
+    )
+    original_prompt = worker.tokenizer.encode("question")
+    guided_prompt, context = asyncio.run(
+        worker.pre_process_query(
+            original_prompt,
+            "opaque-id",
+            question_text="question",
+            sample_id=7,
+            guidance_mode="guided",
+            teacher_plan_result=plan_result,
+        )
+    )
+
+    async def parse_tool_call(_text):
+        return "", [ToolRequest(name="search", arguments={"keyword": "query"})]
+
+    async def call_tool(_request):
+        return ToolResponse(text="evidence")
+
+    worker.toolcall_parser = parse_tool_call
+    worker.tool_call = call_tool
+    llm_output = _turn(0, is_search=False, is_terminal=True)
+    context["last_llm_output"] = llm_output
+    context["next_turn_id"] = 1
+    is_continue, next_prompt = asyncio.run(
+        worker.generate_tool_response(
+            context,
+            [],
+            guided_prompt,
+            guided_prompt,
+            worker.tokenizer.encode("<search>query</search>"),
+            "<search>query</search>",
+        )
+    )
+
+    assert is_continue is True
+    assert guided_prompt != original_prompt
+    assert next_prompt[: len(original_prompt)] == original_prompt
+    assert "teacher_guidance" not in worker.tokenizer.decode(next_prompt)
+
+
+def test_shadow_metric_names_include_paired_uplift_and_controls():
+    context = {
+        "mode_reward_sums": defaultdict(
+            float, {"guided": 3.0, "unguided": 1.0, "generic": 1.0}
+        ),
+        "mode_answer_hit_sums": defaultdict(
+            float, {"guided": 4.0, "unguided": 2.0, "generic": 2.0}
+        ),
+        "mode_counts": defaultdict(int, {"guided": 4, "unguided": 4, "generic": 4}),
+        "paired_uplift_sums": defaultdict(float, {"guided": 1.0, "generic": 0.0}),
+        "paired_uplifts": defaultdict(
+            list, {"guided": [0.5, 0.5], "generic": [0.0, 0.0]}
+        ),
+        "paired_answer_hit_sums": defaultdict(float, {"guided": 1.0, "generic": 0.0}),
+        "paired_counts": defaultdict(int, {"guided": 2, "generic": 2}),
+        "query_change_sums": defaultdict(float, {"guided": 2.0, "generic": 1.0}),
+        "query_change_counts": defaultdict(int, {"guided": 2, "generic": 2}),
+        "plan_valid_by_id": {"a": True, "b": False},
+        "plan_cache_hit_by_id": {"a": True, "b": False},
+    }
+
+    metrics = build_shadow_metrics(context, bootstrap_samples=200)
+
+    assert metrics["eval/unguided_EM"] == 0.25
+    assert metrics["planner/guided_EM"] == 0.75
+    assert metrics["planner/guided_minus_unguided"] == 0.5
+    assert metrics["planner/plan_valid_rate"] == 0.5
+    assert metrics["planner/query_change_rate"] == 1.0
+    assert metrics["planner/answer_hit_delta"] == 0.5
+    assert metrics["planner/generic_minus_unguided"] == 0.0
+    assert metrics["planner/guided_uplift_ci_low"] == 0.5
+    assert metrics["planner/guided_uplift_ci_high"] == 0.5

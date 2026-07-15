@@ -25,7 +25,7 @@ from rlinf.agents.searchr1.searchr1_agent_loop import Searchr1AgentLoopWorker
 from rlinf.config import validate_cfg
 from rlinf.data.datasets import create_rl_dataset
 from rlinf.data.tokenizers import hf_tokenizer
-from rlinf.scheduler import Cluster, NodePlacementStrategy
+from rlinf.scheduler import Cluster, NodePlacementStrategy, PackedPlacementStrategy
 from rlinf.utils.placement import ModelParallelEvalComponentPlacement
 from rlinf.utils.utils import output_redirector
 from rlinf.workers.agent.tool_worker import ToolWorkerInfo
@@ -41,7 +41,7 @@ def main(cfg) -> None:
     cfg = validate_cfg(cfg)
     print(json.dumps(OmegaConf.to_container(cfg, resolve=True), indent=2))
 
-    cluster = Cluster(num_nodes=cfg.cluster.num_nodes)
+    cluster = Cluster(cluster_cfg=cfg.cluster)
     component_placement = ModelParallelEvalComponentPlacement(cfg, cluster)
 
     # Generator group
@@ -54,6 +54,44 @@ def main(cfg) -> None:
         name=cfg.rollout.group_name,
         placement_strategy=rollout_placement_strategy,
     )
+
+    solid_rollouts = {}
+    teacher_cfg = cfg.get("teacher_planner", {})
+    if teacher_cfg.get("enabled", False):
+        if teacher_cfg.rollout_backend != "sglang":
+            raise ValueError(
+                "Search-R1 teacher_planner currently requires the SGLang "
+                "serverless rollout backend"
+            )
+        if teacher_cfg.rollout_backend != cfg.rollout.rollout_backend:
+            raise ValueError(
+                "teacher_planner and policy rollout must use the same backend"
+            )
+        teacher_hardware = sorted(
+            component_placement.get_hardware_ranks("teacher_planner")
+        )
+        if teacher_hardware != list(
+            range(teacher_hardware[0], teacher_hardware[-1] + 1)
+        ):
+            raise ValueError("teacher_planner hardware ranks must be contiguous")
+        teacher_parallel_size = int(teacher_cfg.get("tensor_parallel_size", 1)) * int(
+            teacher_cfg.get("pipeline_parallel_size", 1)
+        )
+        teacher_placement = PackedPlacementStrategy(
+            teacher_hardware[0],
+            teacher_hardware[-1],
+            num_hardware_per_process=teacher_parallel_size,
+        )
+        solid_rollouts["teacher_planner"] = rollout_worker_cls.create_group(
+            cfg,
+            component_placement,
+            weight_reload=None,
+            config_rollout=teacher_cfg,
+        ).launch(
+            cluster,
+            name=teacher_cfg.group_name,
+            placement_strategy=teacher_placement,
+        )
 
     # AgentLoop group.
     agentloop_placement_strategy = NodePlacementStrategy(
@@ -99,6 +137,7 @@ def main(cfg) -> None:
         reward=reward_group,
         agent_loop=agentloop_group,
         tool_workers=tool_workers,
+        solid_rollouts=solid_rollouts,
     )
 
     runner.init_workers()
