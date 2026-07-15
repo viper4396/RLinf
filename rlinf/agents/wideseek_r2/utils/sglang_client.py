@@ -80,7 +80,7 @@ class SGLangClient:
             "model": self.llm_type,
             "messages": messages,
             "chat_template_kwargs": {
-                "enable_thinking": True,
+                "enable_thinking": False,
             },
         }
 
