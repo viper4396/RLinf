@@ -498,9 +498,22 @@ class SGLangWorker(Worker):
             result_dict, key=channel_key, async_op=True
         ).async_wait()
 
-    async def rollout_serverless(self, input_channel: Channel, output_channel: Channel):
+    async def rollout_serverless(
+        self,
+        input_channel: Channel,
+        output_channel: Channel,
+        use_affinity: bool = False,
+    ):
         while True:
-            rollout_request = await input_channel.get(async_op=True).async_wait()
+            # When affinity is on, consume only this worker's rank-specific
+            # queue so conversations consistently hashed to self._rank land
+            # here (KV cache reuse). Otherwise pull from the shared FIFO.
+            if use_affinity:
+                rollout_request = await input_channel.get(
+                    key=self._rank, async_op=True
+                ).async_wait()
+            else:
+                rollout_request = await input_channel.get(async_op=True).async_wait()
             asyncio.create_task(
                 self.generate_and_send(
                     output_channel=output_channel,

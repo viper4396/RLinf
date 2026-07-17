@@ -15,6 +15,7 @@
 import asyncio
 import copy
 from typing import Optional
+from uuid import uuid4
 
 from omegaconf import DictConfig
 
@@ -249,6 +250,10 @@ class WideSeekR2AgentLoopWorker(MultiAgentLoopWorker):
         output_buffer = []
         total_turn_list = []
 
+        # Stable per-conversation id: every turn of this role loop reuses it so
+        # they are consistently hashed to the same SGLang worker (KV cache reuse).
+        conv_id = uuid4().hex
+
         add_few_shot = self.cfg.agentloop.get("add_few_shot", True)
         max_workers_per_planner = self.cfg.agentloop.get("max_workers_per_planner", -1)
         max_toolcall_per_worker = self.cfg.agentloop.get("max_toolcall_per_worker", 5)
@@ -287,12 +292,14 @@ class WideSeekR2AgentLoopWorker(MultiAgentLoopWorker):
                     prompt_ids,
                     sampling_params={"max_new_tokens": max_resp_len},
                     rollout_name="subworker",
+                    session_id=conv_id,
                 )
                 generate_result["logprobs"] = [0.0] * len(generate_result["output_ids"])
             else:
                 generate_result = await self.generate(
                     prompt_ids,
                     sampling_params={"max_new_tokens": max_resp_len},
+                    session_id=conv_id,
                 )
 
             response_ids = generate_result["output_ids"]
@@ -476,6 +483,11 @@ class WideSeekR2AgentLoopWorker(MultiAgentLoopWorker):
             answer_text = response_text.split("<|im_end|>")[0]
 
         total_turn_list.append(turn_idx + 1)
+        # Release this conversation's load from the affinity router (no-op unless
+        # the load-aware policy is active). Per-query exceptions abort the whole
+        # rollout (asyncio.gather without return_exceptions), so a leak on the
+        # error path is moot; the normal return path always releases here.
+        self.release_affinity(conv_id)
         return output_buffer, answer_text, total_turn_list
 
     async def run_one_query(self, prompt_ids: list[int], *, answer) -> AgentLoopOutput:

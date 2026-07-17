@@ -28,6 +28,7 @@ from rlinf.utils.placement import ModelParallelComponentPlacement
 from rlinf.utils.runner_utils import check_progress
 from rlinf.workers.actor.megatron_actor_worker import MegatronActor
 from rlinf.workers.agent.agent_loop import AgentLoopWorker
+from rlinf.workers.agent.rollout_affinity_router import maybe_create_affinity_router
 from rlinf.workers.agent.tool_worker import ToolChannelInfo, ToolWorker, ToolWorkerInfo
 from rlinf.workers.inference.megatron_inference_worker import MegatronInference
 from rlinf.workers.reward.reward_worker import RewardWorker
@@ -152,6 +153,9 @@ class AgentRunner(ReasoningRunner):
             self.tool_name_map,
             self.tool_output_channel,
             self.solid_generate_input_channels,
+            affinity_router=maybe_create_affinity_router(
+                self.cfg, self.component_placement.rollout_dp_size
+            ),
         ).wait()
 
     def _sync_weights(self):
@@ -177,8 +181,11 @@ class AgentRunner(ReasoningRunner):
         )
 
         self.run_timer.start_time()
+        use_affinity = self.cfg.rollout.get("enable_rollout_kv_affinity", False)
         self.rollout.rollout_serverless(
-            self.generate_input_channel, self.generate_output_channel
+            self.generate_input_channel,
+            self.generate_output_channel,
+            use_affinity=use_affinity,
         )
         for solid_rollout_name, solid_rollout in self.solid_rollouts.items():
             solid_rollout.rollout_serverless(
@@ -258,17 +265,10 @@ class AgentRunner(ReasoningRunner):
                         if save_model:
                             self._save_checkpoint()
 
-                        if is_train_end:
-                            logging.info(
-                                f"Step limit given by max_steps={self.max_steps} reached. Stopping run"
-                            )
-                            return
-
-                        if run_time_exceeded:
-                            logging.info(
-                                f"Time limit given by run_timer={self.run_timer} reached. Stopping run"
-                            )
-                            return
+                        # Do not return here: the metric logging below (time/rollout,
+                        # train/*, etc.) lives outside the `with timer("step")` block,
+                        # so returning on the final step would drop that step's
+                        # metrics. Defer the stop until after logging (end of loop).
 
                     time_metrics = self.timer.consume_durations()
                     time_metrics["training"] = actor_handle.consume_duration()
@@ -312,6 +312,18 @@ class AgentRunner(ReasoningRunner):
 
                     global_pbar.set_postfix(logging_metrics, refresh=False)
                     global_pbar.update(1)
+
+                    # Stop AFTER this step's metrics are logged (see note above).
+                    if is_train_end:
+                        logging.info(
+                            f"Step limit given by max_steps={self.max_steps} reached. Stopping run"
+                        )
+                        return
+                    if run_time_exceeded:
+                        logging.info(
+                            f"Time limit given by run_timer={self.run_timer} reached. Stopping run"
+                        )
+                        return
         finally:
             for tool_worker in self.tool_workers:
                 tool_worker.stop_server()
