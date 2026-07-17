@@ -26,6 +26,7 @@ from rlinf.scheduler import Channel
 from rlinf.scheduler import WorkerGroupFuncResult as Handle
 from rlinf.utils.placement import ModelParallelComponentPlacement
 from rlinf.workers.agent.agent_loop import AgentLoopWorker
+from rlinf.workers.agent.rollout_affinity_router import maybe_create_affinity_router
 from rlinf.workers.agent.tool_worker import ToolChannelInfo, ToolWorker, ToolWorkerInfo
 from rlinf.workers.reward.reward_worker import RewardWorker
 
@@ -123,6 +124,9 @@ class AgentEvalRunner(ReasoningEvalRunner):
             self.tool_name_map,
             self.tool_output_channel,
             self.solid_generate_input_channels,
+            affinity_router=maybe_create_affinity_router(
+                self.cfg, self.component_placement.rollout_dp_size
+            ),
         ).wait()
 
     def _get_reward_compute_kwargs(self, batch: dict) -> dict:
@@ -148,8 +152,11 @@ class AgentEvalRunner(ReasoningEvalRunner):
 
         # Start rollout server and tool workers
         self.run_timer.start_time()
+        use_affinity = self.cfg.rollout.get("enable_rollout_kv_affinity", False)
         self.rollout.rollout_serverless(
-            self.generate_input_channel, self.generate_output_channel
+            self.generate_input_channel,
+            self.generate_output_channel,
+            use_affinity=use_affinity,
         )
         for solid_rollout_name, solid_rollout in self.solid_rollouts.items():
             solid_rollout.rollout_serverless(

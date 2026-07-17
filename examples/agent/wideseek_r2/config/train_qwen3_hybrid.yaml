@@ -8,8 +8,8 @@ cluster:
     rollout: all
 
 runner:
-  experiment_name: test_minibatch_2
-  output_dir: ../logs/train
+  experiment_name: base_grpo
+  output_dir: ./logs/train
   seq_length: 32768
   max_tokens_per_mbs: 32768
 
@@ -22,7 +22,7 @@ runner:
 algorithm:
   training_batch_size_per_gpu: 1
   group_size: 8
-  n_minibatches: 2
+  n_minibatches: 4
 
   clip_ratio_low: 0.2
   clip_ratio_high: 0.28
@@ -33,15 +33,19 @@ algorithm:
 
 agentloop:
   workflow: mas # or sa, mas refers to multi-agent, sa refers to single-agent
-  llm_ip: 172.26.0.148 # TODO:(USER) Replace with the actual IP address of the LLM judge server
+  llm_ip: 172.27.15.76 # TODO:(USER) Replace with the actual IP address of the LLM judge server
   llm_port: 30000 # TODO:(USER) Replace with the actual port of the LLM judge server
   use_local_judge: False # Whether to use the RLinf internal judge llm. If set to true, the judge llm will be run within RLinf framwork. Otherwise, the judge llm will be run on the external server.
   format_reward: 0.05
+  max_workers_per_planner: -1
 
 rollout:
-  gpu_memory_utilization: 0.7
+  gpu_memory_utilization: 0.8
   model:
-    model_path: /mnt/project_rlinf/xzxuan/model/Qwen3-4B # TODO:(USER) Replace with the actual path to the model checkpoint
+    model_path: /mnt/public/xzxuan/models/Qwen3-4B # TODO:(USER) Replace with the actual path to the model checkpoint
+  enable_rollout_kv_affinity: True  
+  rollout_kv_affinity_load_aware: True
+  rollout_kv_affinity_long_tail_beta: 1.0  
 
 tools:
   online: False
@@ -53,14 +57,14 @@ data:
   answer_key: answer
   answer_mode: markdown
   unique_columns: unique_columns 
-  train_data_paths: /mnt/project_rlinf/xzxuan/wideseek-train_data/hybrid_20k.jsonl # TODO:(USER) Replace with the actual path to the training dataset
+  train_data_paths: /mnt/public/xzxuan/data/WideSeek-R1-train-data/hybrid_20k.jsonl # TODO:(USER) Replace with the actual path to the training dataset
   shuffle: False
   is_hybrid: True
   data_size: -1
 
 actor:
   model:
-    megatron_checkpoint: '/mnt/project_rlinf/xzxuan/WideSeek-R2/xzxuan/converted_ckpts/qwen3_4b_tp2'
+    megatron_checkpoint: null
     recompute_num_layers: 36
 
     tensor_model_parallel_size: 2
@@ -68,7 +72,7 @@ actor:
     sequence_parallel: True
 
   megatron:
-    use_hf_ckpt: False
+    use_hf_ckpt: True
     ckpt_convertor:
       model: Qwen3-4B
 

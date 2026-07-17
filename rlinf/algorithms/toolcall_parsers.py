@@ -301,7 +301,40 @@ class WideSeekQwenToolCallParser:
 class WideSeekR2QwenToolCallParser(WideSeekQwenToolCallParser):
     """Tool-call parser for WideSeek-R2 planner/worker/single-agent roles.
 
-    WideSeek-R2 parses tool calls identically to WideSeek-R1; this subclass
-    exists so the ``wideseek_r2-qwen`` parser can diverge independently later
-    without affecting ``wideseek_r1-qwen``.
+    WideSeek-R2 makes the per-turn sub-agent cap optional: a negative
+    ``max_workers_per_planner`` means a planner may create an unlimited number
+    of sub-agents in a single ``create_sub_agents`` call, while a non-negative
+    value caps the count exactly like ``wideseek_r1-qwen``. Only
+    ``_parse_planner_calls`` is overridden so the shared base ``__call__`` (and
+    ``wideseek_r1-qwen``) stay untouched.
     """
+
+    @staticmethod
+    def _parse_planner_calls(
+        tool_name: str,
+        tool_arguments: dict,
+        max_workers_per_planner: int,
+    ) -> list[ToolRequest]:
+        if tool_name != "create_sub_agents":
+            return []
+        sub_agents = tool_arguments.get("sub_agents", [])
+        if not isinstance(sub_agents, list):
+            return []
+
+        # Negative -> unlimited; non-negative -> cap at that many sub-agents.
+        # (Note: `sub_agents[:max_workers_per_planner]` cannot express "no cap"
+        # since a negative index would drop trailing items, so branch instead.)
+        if max_workers_per_planner >= 0:
+            sub_agents = sub_agents[:max_workers_per_planner]
+
+        function_calls = []
+        for sub_agent in sub_agents:
+            if not isinstance(sub_agent, dict):
+                continue
+            prompt = sub_agent.get("prompt", "")
+            if not isinstance(prompt, str) or not prompt:
+                continue
+            function_calls.append(
+                ToolRequest(name="subtask", arguments={"subtask": prompt})
+            )
+        return function_calls

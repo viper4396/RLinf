@@ -115,9 +115,9 @@ agentloop:
   max_worker_turns: 20
   max_sa_turns: 50
   print_outputs: False # whether to print the outputs (token ids, texts, tool calls, etc.) of agent loop worker.
-  max_workers_per_planner: 10
+  max_workers_per_planner: -1  # max sub-agents a planner may spawn per turn; -1 means unlimited
   max_toolcall_per_worker: 5
-  add_few_shot: True  # include few-shot examples in planner/single-agent prompts
+  add_few_shot: False  # include few-shot examples in planner/single-agent prompts
   is_dynamic_rollout_batch: True
 
   format_reward: 0.1
@@ -156,7 +156,21 @@ tools:
 rollout:
   group_name: "RolloutGroup"
   gpu_memory_utilization: 0.5
-  use_fixed_worker: False 
+  use_fixed_worker: False
+  # When True, all turns of one agent conversation are consistently hashed to
+  # the same SGLang worker (via the keyed rollout Channel) so its KV/prefix
+  # cache stays warm across turns. When False, requests use the shared FIFO
+  # (arbitrary worker per turn) exactly as before.
+  enable_rollout_kv_affinity: True
+  # When True (and affinity is on), use the upgraded load-aware sticky router:
+  # new conversations are placed on the least-loaded worker instead of a plain
+  # crc32 hash. Load is turn-weighted (see rollout_kv_affinity_long_tail_beta)
+  # so long/many-turn conversations repel new work and the straggler tail shrinks.
+  # When False, use the simple crc32(session_id) % num_workers hashing.
+  rollout_kv_affinity_load_aware: True
+  # Extra load weight each additional turn of a conversation contributes.
+  # 1.0 = balance total in-flight turns; 0.0 = balance active-conversation count.
+  rollout_kv_affinity_long_tail_beta: 1.0
   model:
     model_type: qwen3
     model_path: /path/to/Qwen3-4B # https://huggingface.co/Qwen/Qwen3-4B

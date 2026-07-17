@@ -25,25 +25,37 @@ def get_tools_description(
 
     Args:
         max_workers_per_planner: Maximum number of sub-agents a planner may create
-            in a single ``create_sub_agents`` call.
+            in a single ``create_sub_agents`` call. A negative value means no
+            limit, and the description emphasizes the unlimited parallelism.
         max_toolcall_per_worker: Maximum number of ``search`` / ``access`` tool
             instances a worker may issue in a single call.
 
     Returns:
         Mapping from tool key to its OpenAI-style tool schema.
     """
+    create_sub_agents_description = (
+        "Creates sub-agents that can perform specific tasks based on "
+        "the input prompt. You can create multiple sub-agents "
+        "concurrently within a single call."
+    )
+    if max_workers_per_planner >= 0:
+        create_sub_agents_description += (
+            " However, you are limited to creating a maximum of "
+            f"{max_workers_per_planner} sub-agents in any given call."
+        )
+    else:
+        create_sub_agents_description += (
+            " There is NO limit on the number of sub-agents: you can launch "
+            "an unlimited number of sub-agents in parallel within a single "
+            "call, so feel free to fan out as many parallel subtasks as the "
+            "problem requires."
+        )
     return {
         "create_sub_agents": {
             "type": "function",
             "function": {
                 "name": "create_sub_agents",
-                "description": (
-                    "Creates sub-agents that can perform specific tasks based on "
-                    "the input prompt. You can create multiple sub-agents "
-                    "concurrently within a single call, but you are limited to "
-                    f"creating a maximum of {max_workers_per_planner} sub-agents "
-                    "in any given call."
-                ),
+                "description": create_sub_agents_description,
                 "parameters": {
                     "type": "object",
                     "properties": {

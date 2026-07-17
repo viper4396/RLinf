@@ -15,6 +15,7 @@
 import asyncio
 import copy
 import json
+import zlib
 from dataclasses import dataclass, field
 from typing import Any, Optional
 from uuid import uuid4
@@ -109,6 +110,17 @@ class AgentLoopWorker(Worker):
     ):
         super().__init__()
         self.cfg = cfg
+        # Number of main SGLang rollout DP workers and whether to consistently
+        # hash each conversation to a fixed worker for KV/prefix cache reuse.
+        self.rollout_dp_size = placement.rollout_dp_size
+        self._kv_affinity = cfg.rollout.get("enable_rollout_kv_affinity", False)
+        # Upgraded policy: load-aware sticky placement via a shared router actor
+        # (set in init_worker). Falls back to plain crc32 hashing when False.
+        self._kv_affinity_load_aware = cfg.rollout.get(
+            "rollout_kv_affinity_load_aware", False
+        )
+        self._affinity_router = None
+        self._conv_rank: dict[str, int] = {}  # local memo: session_id -> rank
         self.print_outputs = cfg.agentloop.print_outputs
         if cfg.runner.task_type == "reasoning_eval":
             self.return_logprobs = False
@@ -135,6 +147,7 @@ class AgentLoopWorker(Worker):
         tool_name_map: dict[str, str],
         tool_worker_output_channel: Channel,
         solid_generate_input_channels: dict[str, Channel] = {},
+        affinity_router=None,
     ):
         self.generate_input_channel = generate_input_channel
         self.generate_output_channel = generate_output_channel
@@ -145,30 +158,79 @@ class AgentLoopWorker(Worker):
         self.tool_worker_output_channel = tool_worker_output_channel
         # for calling another llm without training.
         self.solid_generate_input_channels = solid_generate_input_channels
+        # shared load-aware router actor (None unless load-aware affinity is on).
+        self._affinity_router = affinity_router
 
     async def generate(
         self,
         prompt_ids: list[int],
         sampling_params: Optional[dict] = None,
         rollout_name: Optional[str] = None,
+        session_id: Optional[str] = None,
     ):
         channel_key = uuid4().hex
         if rollout_name is None:
             input_channel = self.generate_input_channel
         else:
             input_channel = self.solid_generate_input_channels[rollout_name]
+        # For the main rollout channel, consistently route the conversation to a
+        # fixed worker rank so all its turns reuse that worker's KV cache. Two
+        # policies:
+        #   - load-aware (upgraded): a shared router actor picks the least-loaded
+        #     worker for a new conversation and pins it there (sticky). Requires a
+        #     real session_id (a per-turn channel_key cannot be tracked/released).
+        #   - simple hash: crc32(session_id) % num_workers, no coordination.
+        # Fall back to hashing channel_key when no session_id is given so the
+        # request still lands on a valid rank rather than the unconsumed
+        # DEFAULT_KEY queue. The solid/judge path keeps the shared FIFO.
+        routing_key = None
+        if self._kv_affinity and rollout_name is None:
+            if (
+                self._kv_affinity_load_aware
+                and self._affinity_router is not None
+                and session_id is not None
+            ):
+                if session_id not in self._conv_rank:
+                    # first turn of this conversation -> load-aware placement
+                    self._conv_rank[session_id] = await self._affinity_router.assign.remote(
+                        session_id
+                    )
+                else:
+                    # a subsequent turn -> grow this conversation's load weight
+                    self._affinity_router.bump.remote(session_id)
+                routing_key = self._conv_rank[session_id]
+            else:
+                routing_id = session_id if session_id is not None else channel_key
+                routing_key = zlib.crc32(routing_id.encode()) % self.rollout_dp_size
+        put_kwargs = {"async_op": True}
+        if routing_key is not None:
+            put_kwargs["key"] = routing_key
         await input_channel.put(
             {
                 "channel_key": channel_key,
                 "prompt_ids": prompt_ids,
                 "sampling_params": sampling_params,
             },
-            async_op=True,
+            **put_kwargs,
         ).async_wait()
         result = await self.generate_output_channel.get(
             channel_key, async_op=True
         ).async_wait()
         return result
+
+    def release_affinity(self, session_id: Optional[str]) -> None:
+        """Free a finished conversation from the load-aware router.
+
+        No-op unless the load-aware policy is active and the conversation was
+        actually assigned (main-channel turns with a real session_id).
+        """
+        if (
+            self._kv_affinity_load_aware
+            and self._affinity_router is not None
+            and session_id is not None
+        ):
+            if self._conv_rank.pop(session_id, None) is not None:
+                self._affinity_router.release.remote(session_id)
 
     async def state_less_tool_call_with_channel(
         self,
