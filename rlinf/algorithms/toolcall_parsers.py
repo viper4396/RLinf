@@ -70,23 +70,30 @@ class Searchr1QwenToolCallParser:
         self.tool_call_start_token: str = "<search>"
         self.tool_call_end_token: str = "</search>"
         self.tool_call_regex = re.compile(r"<search>(.*?)</search>", re.DOTALL)
+        self.repairable_tool_call_regex = re.compile(
+            r"<search(?:\s+[^>]*)?>(.*?)(?:</search>|(?=<answer>)|$)",
+            re.DOTALL,
+        )
 
     async def __call__(self, response_text: str) -> tuple[str, list[ToolRequest]]:
-        if (
-            self.tool_call_start_token not in response_text
-            or self.tool_call_end_token not in response_text
-        ):
-            return response_text, []
         matches = self.tool_call_regex.findall(response_text)
+        parser = self.tool_call_regex
+        if not matches:
+            # Recover common model slips such as ``<search query>...`` and a
+            # missing closing tag. The agent loop still records these calls as
+            # format-invalid so training/evaluation can distinguish repairs.
+            matches = self.repairable_tool_call_regex.findall(response_text)
+            parser = self.repairable_tool_call_regex
         function_calls = []
         if matches:
             match = matches[-1].strip()
-            function_calls.append(
-                ToolRequest(name="search", arguments={"keyword": match})
-            )
+            if match and "<" not in match and ">" not in match:
+                function_calls.append(
+                    ToolRequest(name="search", arguments={"keyword": match})
+                )
 
         # remaining text exclude tool call tokens
-        content = self.tool_call_regex.sub("", response_text)
+        content = parser.sub("", response_text)
 
         return content, function_calls
 

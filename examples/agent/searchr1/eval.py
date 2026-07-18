@@ -57,7 +57,7 @@ def main(cfg) -> None:
 
     solid_rollouts = {}
     teacher_cfg = cfg.get("teacher_planner", {})
-    if teacher_cfg.get("enabled", False):
+    if teacher_cfg.get("enabled", False) and not teacher_cfg.get("cache_only", False):
         if teacher_cfg.rollout_backend != "sglang":
             raise ValueError(
                 "Search-R1 teacher_planner currently requires the SGLang "

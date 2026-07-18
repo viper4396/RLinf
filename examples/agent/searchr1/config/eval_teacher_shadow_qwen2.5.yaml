@@ -13,7 +13,10 @@ cluster:
 
 
 runner:
-  experiment_name: searchr1-qwen2.5-3b-teacher-shadow
+  experiment_name: searchr1-qwen2.5-3b-teacher-shadow-controller-v3
+  # Leave enough context for a long multi-hop trace (plan + up to nine model
+  # turns with retrieval evidence).
+  seq_length: 12288
 
 
 algorithm:
@@ -28,18 +31,48 @@ data:
 
 agentloop:
   policy_version: qwen2.5-3b-searchr1-baseline
+  max_turns: 10
+  force_search_on_first_turn: true
+
+
+tools:
+  search:
+    index_manifest:
+      collection: wiki_collection_m32_cef512
+      points_count: 26134257
+      indexed_vectors_count: 26134257
+      vector_size: 768
+      distance: Cosine
+      hnsw_m: 32
+      hnsw_ef_construct: 512
+      query_hnsw_ef: 256
+      retriever: e5
+      manifest_sha256: 575198687c3ed841d6311afa61d8a88eab315d1a2ed4aab73256e18848e68a42
 
 
 teacher_planner:
   enabled: true
   group_name: TeacherPlannerGroup
-  version: qwen2.5-7b-instruct-frozen-v1
+  version: qwen2.5-7b-instruct-multihop-v5
   seed: 1234
   cache_dir: ${runner.output_dir}/${runner.experiment_name}/teacher_plan_cache
-  max_new_tokens: 256
-  max_plan_chars: 2048
+  max_new_tokens: 768
+  max_plan_chars: 6144
   max_field_chars: 512
+  max_steps: 8
+  max_attempts: 3
+  # 2WikiMultihopQA contains only multi-hop items; retry any accidental KEEP.
+  require_plan: true
   bootstrap_samples: 2000
+  # The controller exposes and executes one hop at a time, then rebuilds a
+  # plan-free synthesis prompt from the original question and collected evidence.
+  execution_mode: controller
+  controller_max_evidence_length: 6000
+  controller_min_synthesis_tokens: 256
+  controller_bind_max_attempts: 3
+  # Legacy prompt-mode query expansion remains disabled.
+  dual_query_retrieval: false
+  use_fallback_query: false
 
   # Main paired shadow evaluation. For placebo runs override with either:
   # [shuffled, shuffled, unguided, unguided] or

@@ -13,20 +13,27 @@
 # limitations under the License.
 
 import datetime
+import hashlib
 import json
 import logging
 import os
+import re
 import typing
 from collections import defaultdict
-from typing import Optional, Union
+from pathlib import Path
+from typing import Any, Optional, Union
 
 from omegaconf import OmegaConf
 from omegaconf.dictconfig import DictConfig
 from torch.utils.data import Dataset
 
+from rlinf.agents.searchr1.eval_diagnostics import (
+    build_abc_acceptance_metrics,
+    build_label_only_diagnostics,
+)
 from rlinf.agents.searchr1.reference_runner import SearchR1ReferenceRunnerMixin
 from rlinf.agents.searchr1.teacher_planner import build_shadow_metrics
-from rlinf.algorithms.searchr1_scoring import subem_check
+from rlinf.algorithms.searchr1_scoring import extract_solution, subem_check
 from rlinf.data.io_struct import DynamicRolloutResult
 from rlinf.runners.agent_eval_runner import AgentEvalRunner
 from rlinf.utils.placement import ModelParallelComponentPlacement
@@ -40,6 +47,57 @@ if typing.TYPE_CHECKING:
     from rlinf.workers.rollout.vllm.vllm_worker import VLLMWorker
 
 logging.getLogger().setLevel(logging.INFO)
+
+
+def _sha256_json(value: Any) -> str:
+    """Hash a JSON-compatible value using one canonical representation."""
+    payload = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _content_tree_hash(paths: list[str]) -> str:
+    """Hash file names and bytes for small, evaluation-critical artifacts."""
+    digest = hashlib.sha256()
+    for raw_path in sorted(set(paths)):
+        path = Path(raw_path).expanduser()
+        candidates = (
+            sorted(item for item in path.rglob("*") if item.is_file())
+            if path.is_dir()
+            else [path]
+        )
+        for candidate in candidates:
+            relative_name = (
+                str(candidate.relative_to(path)) if path.is_dir() else candidate.name
+            )
+            digest.update(str(path).encode("utf-8"))
+            digest.update(relative_name.encode("utf-8"))
+            if not candidate.is_file():
+                digest.update(b"<missing>")
+                continue
+            with candidate.open("rb") as file:
+                for chunk in iter(lambda: file.read(1024 * 1024), b""):
+                    digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _model_manifest_hash(model_path: str) -> str:
+    """Hash checkpoint layout plus small model/tokenizer metadata files."""
+    root = Path(model_path).expanduser()
+    if not root.is_dir():
+        return _sha256_json({"model_path": str(root), "status": "missing"})
+    entries: list[dict[str, Any]] = []
+    metadata_suffixes = {".json", ".txt", ".model", ".py", ".tiktoken"}
+    for path in sorted(item for item in root.rglob("*") if item.is_file()):
+        entry: dict[str, Any] = {
+            "path": str(path.relative_to(root)),
+            "size": path.stat().st_size,
+        }
+        if path.suffix.casefold() in metadata_suffixes:
+            entry["content_sha256"] = _content_tree_hash([str(path)])
+        entries.append(entry)
+    return _sha256_json(entries)
 
 
 class Searchr1AgentEvalRunner(SearchR1ReferenceRunnerMixin, AgentEvalRunner):
@@ -69,6 +127,93 @@ class Searchr1AgentEvalRunner(SearchR1ReferenceRunnerMixin, AgentEvalRunner):
         self._init_searchr1_reference_channel()
         # Initialize storage for accumulating evaluation results across all batches
         self.accumulated_results = []
+
+    def _validate_complete_shadow_results(self) -> None:
+        """Reject incomplete, duplicated, or unbalanced paired A/B output."""
+        teacher_cfg = self.cfg.get("teacher_planner", {})
+        if not teacher_cfg.get("enabled", False):
+            return
+        expected_modes = sorted(str(mode) for mode in teacher_cfg.guidance_modes)
+        expected_question_count = len(self.val_dataset)
+        expected_result_count = expected_question_count * len(expected_modes)
+        if len(self.accumulated_results) != expected_result_count:
+            raise RuntimeError(
+                "incomplete Search-R1 shadow output: expected "
+                f"{expected_result_count}, got {len(self.accumulated_results)}"
+            )
+
+        by_sample: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        trajectory_ids: list[str] = []
+        for result in self.accumulated_results:
+            by_sample[str(result.get("sample_id"))].append(result)
+            trajectory_id = str(result.get("trajectory_id") or "")
+            if not trajectory_id:
+                raise RuntimeError(
+                    "Search-R1 shadow output has a missing trajectory ID"
+                )
+            trajectory_ids.append(trajectory_id)
+        if len(by_sample) != expected_question_count:
+            raise RuntimeError(
+                "Search-R1 shadow output contains missing or duplicate sample IDs: "
+                f"expected {expected_question_count}, got {len(by_sample)}"
+            )
+        if len(set(trajectory_ids)) != len(trajectory_ids):
+            raise RuntimeError(
+                "Search-R1 shadow output contains duplicate trajectories"
+            )
+        for sample_id, sample_results in by_sample.items():
+            actual_modes = sorted(
+                str(result.get("guidance_mode")) for result in sample_results
+            )
+            if actual_modes != expected_modes:
+                raise RuntimeError(
+                    f"unbalanced A/B modes for sample {sample_id}: "
+                    f"expected {expected_modes}, got {actual_modes}"
+                )
+
+    def _reproducibility_manifest(self) -> dict[str, Any]:
+        """Build immutable identifiers for every A/B-critical input."""
+        resolved_cfg = OmegaConf.to_container(self.cfg, resolve=True)
+        data_paths = [str(path) for path in self.cfg.data.val_data_paths]
+        teacher_cfg = self.cfg.get("teacher_planner", {})
+        cache_dir = str(teacher_cfg.get("cache_dir") or "")
+        policy_model_path = str(self.cfg.rollout.model.model_path)
+        teacher_model_path = str(teacher_cfg.get("model", {}).get("model_path") or "")
+        source_root = Path(__file__).parent
+        controller_sources = [
+            str(source_root / "eval_runner.py"),
+            str(source_root / "searchr1_agent_loop.py"),
+            str(source_root / "teacher_planner.py"),
+            str(source_root / "eval_diagnostics.py"),
+        ]
+        retrieval_config = OmegaConf.to_container(self.cfg.tools.search, resolve=True)
+        return {
+            "resolved_config_sha256": _sha256_json(resolved_cfg),
+            "dataset_sha256": _content_tree_hash(data_paths),
+            "data_paths": data_paths,
+            "policy_version": str(
+                self.cfg.agentloop.get("policy_version", policy_model_path)
+            ),
+            "policy_model_path": policy_model_path,
+            "policy_model_manifest_sha256": _model_manifest_hash(policy_model_path),
+            "teacher_version": str(teacher_cfg.get("version") or ""),
+            "teacher_model_path": teacher_model_path,
+            "teacher_model_manifest_sha256": (
+                _model_manifest_hash(teacher_model_path) if teacher_model_path else None
+            ),
+            "teacher_plan_cache_dir": cache_dir,
+            "teacher_plan_cache_sha256": (
+                _content_tree_hash([cache_dir]) if cache_dir else None
+            ),
+            "controller_source_sha256": _content_tree_hash(controller_sources),
+            "retrieval_config": retrieval_config,
+            "retrieval_config_sha256": _sha256_json(retrieval_config),
+            "data_seed": int(self.cfg.data.get("seed", 0)),
+            "teacher_seed": int(teacher_cfg.get("seed", 0)),
+            "policy_sampling_params": OmegaConf.to_container(
+                self.cfg.algorithm.sampling_params, resolve=True
+            ),
+        }
 
     def _save_eval_results(
         self, all_results, accuracy, total_count, question_count, metrics
@@ -101,6 +246,7 @@ class Searchr1AgentEvalRunner(SearchR1ReferenceRunnerMixin, AgentEvalRunner):
                 "experiment_name": self.cfg.runner.experiment_name,
                 "timestamp": timestamp,
                 "metrics": metrics,
+                "reproducibility": self._reproducibility_manifest(),
                 "config": {
                     "data_paths": OmegaConf.to_container(
                         self.cfg.data.val_data_paths, resolve=True
@@ -134,7 +280,6 @@ class Searchr1AgentEvalRunner(SearchR1ReferenceRunnerMixin, AgentEvalRunner):
         """
         recv_batch_size = 0
         group_size = self.cfg.algorithm.get("group_size", 1)
-        assert group_size == 1, f"searchr1 eval requires group_size=1, got {group_size}"
 
         correct_count = 0
         total_count = 0
@@ -172,7 +317,28 @@ class Searchr1AgentEvalRunner(SearchR1ReferenceRunnerMixin, AgentEvalRunner):
                 "teacher_plan",
                 "teacher_plan_error",
                 "teacher_cache_hit",
+                "teacher_decision",
+                "teacher_plan_type",
+                "teacher_plan_step_count",
+                "teacher_execution_mode",
+                "teacher_controller_applied",
+                "teacher_rewrite_applied",
                 "guidance_applied",
+                "controller_completed_step_ids",
+                "controller_template_query_count",
+                "controller_policy_query_count",
+                "controller_fallback_query_count",
+                "controller_dependent_query_count",
+                "controller_binding_valid_count",
+                "controller_binding_attempt_count",
+                "controller_binding_alias_count",
+                "controller_binding_failure_reasons",
+                "controller_resolved_values_by_step",
+                "controller_synthesis_generated",
+                "controller_synthesis_answer_source",
+                "controller_synthesis_format_repaired",
+                "controller_synthesis_format_valid",
+                "controller_completed",
                 "policy_version",
             )
             group_mode_rewards: dict[str, list[float]] = defaultdict(list)
@@ -202,6 +368,27 @@ class Searchr1AgentEvalRunner(SearchR1ReferenceRunnerMixin, AgentEvalRunner):
                     if answer is not None and visible_evidence
                     else 0.0
                 )
+                final_answer = extract_solution(response_texts[trajectory_idx] or "")
+                diagnostic_subem = (
+                    float(subem_check(final_answer, answer))
+                    if answer is not None and final_answer is not None
+                    else 0.0
+                )
+                first_search_turn = next(
+                    (turn for turn in turns if turn.get("is_search")), None
+                )
+                tool_call_repaired = float(
+                    bool(
+                        first_search_turn
+                        and first_search_turn.get("tool_call_repaired", False)
+                    )
+                )
+                dual_query_applied = float(
+                    bool(
+                        first_search_turn
+                        and first_search_turn.get("dual_query_applied", False)
+                    )
+                )
 
                 group_mode_rewards[mode].append(reward)
                 group_mode_queries[mode].append(first_query)
@@ -209,6 +396,131 @@ class Searchr1AgentEvalRunner(SearchR1ReferenceRunnerMixin, AgentEvalRunner):
                 context["mode_reward_sums"][mode] += reward
                 context["mode_counts"][mode] += 1
                 context["mode_answer_hit_sums"][mode] += answer_hit
+                context["mode_subem_sums"][mode] += diagnostic_subem
+                context["mode_tool_call_repair_sums"][mode] += tool_call_repaired
+                context["mode_dual_query_sums"][mode] += dual_query_applied
+                controller_completed_values = extra_fields_traj.get(
+                    "controller_completed"
+                )
+                controller_applied_values = extra_fields_traj.get(
+                    "teacher_controller_applied"
+                )
+                controller_fallback_values = extra_fields_traj.get(
+                    "controller_fallback_query_count"
+                )
+                controller_step_values = extra_fields_traj.get(
+                    "controller_completed_step_ids"
+                )
+                controller_dependent_values = extra_fields_traj.get(
+                    "controller_dependent_query_count"
+                )
+                controller_binding_valid_values = extra_fields_traj.get(
+                    "controller_binding_valid_count"
+                )
+                controller_binding_attempt_values = extra_fields_traj.get(
+                    "controller_binding_attempt_count"
+                )
+                controller_binding_alias_values = extra_fields_traj.get(
+                    "controller_binding_alias_count"
+                )
+                synthesis_repaired_values = extra_fields_traj.get(
+                    "controller_synthesis_format_repaired"
+                )
+                synthesis_valid_values = extra_fields_traj.get(
+                    "controller_synthesis_format_valid"
+                )
+                context["mode_controller_completion_sums"][mode] += float(
+                    bool(
+                        controller_completed_values
+                        and controller_completed_values[trajectory_idx]
+                    )
+                )
+                context["mode_controller_applied_sums"][mode] += float(
+                    bool(
+                        controller_applied_values
+                        and controller_applied_values[trajectory_idx]
+                    )
+                )
+                context["mode_controller_fallback_query_sums"][mode] += float(
+                    controller_fallback_values[trajectory_idx]
+                    if controller_fallback_values
+                    else 0
+                )
+                context["mode_controller_step_sums"][mode] += float(
+                    len(controller_step_values[trajectory_idx])
+                    if controller_step_values
+                    else 0
+                )
+                context["mode_controller_dependent_step_sums"][mode] += float(
+                    controller_dependent_values[trajectory_idx]
+                    if controller_dependent_values
+                    else 0
+                )
+                context["mode_controller_binding_valid_sums"][mode] += float(
+                    controller_binding_valid_values[trajectory_idx]
+                    if controller_binding_valid_values
+                    else 0
+                )
+                context["mode_controller_binding_attempt_sums"][mode] += float(
+                    controller_binding_attempt_values[trajectory_idx]
+                    if controller_binding_attempt_values
+                    else 0
+                )
+                context["mode_controller_binding_alias_sums"][mode] += float(
+                    controller_binding_alias_values[trajectory_idx]
+                    if controller_binding_alias_values
+                    else 0
+                )
+                context["mode_synthesis_format_repair_sums"][mode] += float(
+                    bool(
+                        synthesis_repaired_values
+                        and synthesis_repaired_values[trajectory_idx]
+                    )
+                )
+                context["mode_synthesis_format_valid_sums"][mode] += float(
+                    bool(
+                        synthesis_valid_values
+                        and synthesis_valid_values[trajectory_idx]
+                    )
+                )
+                turn_count = len(turns)
+                search_count = sum(
+                    int(bool(turn.get("is_search", False))) for turn in turns
+                )
+                generated_token_count = sum(
+                    int(turn.get("generated_token_count", 0) or 0) for turn in turns
+                )
+                context["mode_turn_sums"][mode] += turn_count
+                context["mode_search_sums"][mode] += search_count
+                context["mode_generated_token_sums"][mode] += generated_token_count
+                failure_reason_values = extra_fields_traj.get(
+                    "controller_binding_failure_reasons"
+                )
+                failure_reasons = (
+                    failure_reason_values[trajectory_idx]
+                    if failure_reason_values
+                    else {}
+                )
+                for reason, reason_count in (failure_reasons or {}).items():
+                    context["mode_binding_failure_reason_sums"][mode][reason] += int(
+                        reason_count
+                    )
+                unresolved_placeholders = sum(
+                    int(
+                        bool(
+                            re.search(
+                                r"\{?step[_ ]?\d+(?:[_ ]result)?\}?",
+                                str(query),
+                                re.IGNORECASE,
+                            )
+                        )
+                    )
+                    for turn in turns
+                    for query in (turn.get("executed_search_queries") or [])
+                )
+                context["mode_unresolved_placeholder_sums"][mode] += (
+                    unresolved_placeholders
+                )
 
                 is_correct = reward > 0
                 correct_count += int(is_correct)
@@ -224,6 +536,10 @@ class Searchr1AgentEvalRunner(SearchR1ReferenceRunnerMixin, AgentEvalRunner):
                     "reward": reward,
                     "is_correct": is_correct,
                     "answer_hit": bool(answer_hit),
+                    "diagnostic_subem": bool(diagnostic_subem),
+                    "turn_count": turn_count,
+                    "search_count": search_count,
+                    "generated_token_count": generated_token_count,
                 }
                 for key in metadata_keys:
                     values = extra_fields_traj.get(key)
@@ -240,6 +556,9 @@ class Searchr1AgentEvalRunner(SearchR1ReferenceRunnerMixin, AgentEvalRunner):
                     context["plan_cache_hit_by_id"][plan_id] = bool(
                         result_entry["teacher_cache_hit"]
                     )
+                    context["plan_decision_by_id"][plan_id] = result_entry[
+                        "teacher_decision"
+                    ]
 
             if "unguided" in group_mode_rewards:
                 unguided_mean = sum(group_mode_rewards["unguided"]) / len(
@@ -296,12 +615,41 @@ class Searchr1AgentEvalRunner(SearchR1ReferenceRunnerMixin, AgentEvalRunner):
         logging.info(f"Max turns: {self.cfg.agentloop.get('max_turns', 5)}")
         logging.info("=" * 80)
 
+        teacher_cfg = self.cfg.get("teacher_planner", {})
+        if teacher_cfg.get("enabled", False):
+            index_manifest = self.cfg.tools.search.get("index_manifest", {})
+            index_hash = str(index_manifest.get("manifest_sha256") or "")
+            if not re.fullmatch(r"[0-9a-f]{64}", index_hash):
+                raise ValueError(
+                    "teacher shadow evaluation requires tools.search.index_manifest."
+                    "manifest_sha256"
+                )
+
         context = {
             "total_correct": 0,
             "total_samples": 0,
             "total_questions": 0,
             "mode_reward_sums": defaultdict(float),
             "mode_answer_hit_sums": defaultdict(float),
+            "mode_subem_sums": defaultdict(float),
+            "mode_tool_call_repair_sums": defaultdict(float),
+            "mode_dual_query_sums": defaultdict(float),
+            "mode_controller_completion_sums": defaultdict(float),
+            "mode_controller_applied_sums": defaultdict(float),
+            "mode_controller_fallback_query_sums": defaultdict(float),
+            "mode_controller_step_sums": defaultdict(float),
+            "mode_controller_dependent_step_sums": defaultdict(float),
+            "mode_controller_binding_valid_sums": defaultdict(float),
+            "mode_controller_binding_attempt_sums": defaultdict(float),
+            "mode_controller_binding_alias_sums": defaultdict(float),
+            "mode_synthesis_format_repair_sums": defaultdict(float),
+            "mode_synthesis_format_valid_sums": defaultdict(float),
+            "mode_turn_sums": defaultdict(float),
+            "mode_search_sums": defaultdict(float),
+            "mode_generated_token_sums": defaultdict(float),
+            "mode_binding_failure_reason_sums": defaultdict(lambda: defaultdict(float)),
+            "mode_unresolved_placeholder_sums": defaultdict(float),
+            "time_metric_sums": defaultdict(float),
             "mode_counts": defaultdict(int),
             "paired_uplift_sums": defaultdict(float),
             "paired_uplifts": defaultdict(list),
@@ -311,6 +659,7 @@ class Searchr1AgentEvalRunner(SearchR1ReferenceRunnerMixin, AgentEvalRunner):
             "query_change_counts": defaultdict(int),
             "plan_valid_by_id": {},
             "plan_cache_hit_by_id": {},
+            "plan_decision_by_id": {},
         }
         return context
 
@@ -321,12 +670,28 @@ class Searchr1AgentEvalRunner(SearchR1ReferenceRunnerMixin, AgentEvalRunner):
         total_correct = context["total_correct"]
         total_samples = context["total_samples"]
         question_count = context["total_questions"]
+        self._validate_complete_shadow_results()
         teacher_cfg = self.cfg.get("teacher_planner", {})
         shadow_metrics = build_shadow_metrics(
             context,
             bootstrap_seed=int(teacher_cfg.get("seed", self.cfg.data.get("seed", 0))),
             bootstrap_samples=int(teacher_cfg.get("bootstrap_samples", 2000)),
         )
+        dataset_records = getattr(self.val_dataset, "data", [])
+        if isinstance(dataset_records, list):
+            shadow_metrics.update(
+                build_label_only_diagnostics(
+                    self.accumulated_results,
+                    dataset_records,
+                    bootstrap_seed=int(
+                        teacher_cfg.get("seed", self.cfg.data.get("seed", 0))
+                    ),
+                    bootstrap_samples=int(teacher_cfg.get("bootstrap_samples", 2000)),
+                )
+            )
+        for metric_name, metric_value in context["time_metric_sums"].items():
+            shadow_metrics[f"time/{metric_name}_seconds"] = float(metric_value)
+        shadow_metrics.update(build_abc_acceptance_metrics(shadow_metrics))
         # Final summary
         final_accuracy = total_correct / total_samples if total_samples > 0 else 0.0
         logging.info("\n" + "=" * 80)
@@ -360,6 +725,8 @@ class Searchr1AgentEvalRunner(SearchR1ReferenceRunnerMixin, AgentEvalRunner):
         time_metrics,
     ):
         # Update progress bar with current metrics
+        for metric_name, metric_value in time_metrics.items():
+            context["time_metric_sums"][metric_name] += float(metric_value)
         total_correct = context["total_correct"]
         total_samples = context["total_samples"]
         batch_accuracy = context["batch_accuracy"]

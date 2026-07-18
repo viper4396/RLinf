@@ -242,9 +242,42 @@ model路径填入 `examples/agent/searchr1/config/eval_qwen2.5.yaml`
 ----------------------------------
 
 阶段 2 的 shadow 评估保持 policy 冻结，并使用 Qwen2.5-7B-Instruct 启动独立的
-``teacher_planner`` rollout。Teacher 只接收问题，不会接收 GT。严格的四字段 JSON
-plan 按问题、teacher 版本和 seed 缓存，并且仅作为低权限 guidance 影响 policy 的
-第一次搜索。
+``teacher_planner`` rollout。Teacher 只接收问题，不会接收 GT。严格 JSON 输出包含
+``decision``、``plan_type`` 和有序 ``steps``。每一步记录 ``step_id``、``goal``、
+``query_template``、``expected_evidence`` 和 ``depends_on``。依赖前序结果的查询使用
+``{step_1_result}`` 形式的占位符，policy 必须根据真实检索证据替换，不能使用 teacher
+猜测的中间实体。Plan 按问题、teacher 版本和 seed 缓存。``KEEP`` 表示直接 single-hop
+问题，不改变 policy prompt；``PLAN`` 必须包含 2 到 8 个通过校验的 sequential 或
+comparison hop。Planner 会使用只含问题的 repair prompt 重试被拒绝的输出，最多执行
+``teacher_planner.max_attempts`` 次。对于 2WikiMultihopQA 这类全 multihop benchmark，
+设置 ``require_plan: true`` 后，意外生成的 ``KEEP`` 也会被重试。最终仍无效的 plan
+会安全退化为不加 guidance。
+
+旧的 ``execution_mode: prompt`` 会将完整 plan 作为独立的低权限 ChatML user message
+插入，再恢复 assistant generation prefix。Controller mode 会使用相同的边界校验来
+插入 current-hop 和 synthesis message，但不会向 policy 暴露完整 plan。
+
+设置 ``execution_mode: controller`` 后，通过门控的 ``PLAN`` 会成为强制执行的状态机，
+而不是跨 turn 持续保留的 prompt 文本。Controller 会直接按照通过校验的 query template
+执行每个无依赖 root hop。对于 dependent hop，只向 policy 展示当前 hop 及其声明依赖的
+证据；controller 要求 policy 返回包含 ``resolved_values`` 和完整 ``query`` 的严格 JSON
+binding。每个 ``step_N_result`` 必须由对应 dependency 的证据支持，query 必须包含该值或
+有记录的规范化 alias。无效 binding 最多重试 ``controller_bind_max_attempts`` 次。提前
+回答、错误 JSON、跨 dependency 取值或未替换占位符都不能结束计划。可追踪的
+fallback 不再重复完整原问题，而是组合当前 goal、依赖 step 的 goal、template、预期证据
+和检索文档标题，形成候选特定的查询。所有 hop 完成后，RLinf 会移除 plan，使用原问题和
+有长度上限的汇总证据构建独立 synthesis prompt。Controller 会将开头的 ``<think>``
+放入 generation prompt，要求先输出简短且有证据支撑的推导，再输出唯一 ``<answer>``，
+随后规范化最终 answer tag，并且只允许隔离后的 synthesis
+response 进入 reward 评估；被拒绝的中间 answer tag 不会再成为最终答案。Comparison
+synthesis 会明确要求返回候选实体或 yes/no，而不是日期、数字、导演名等中间属性。
+
+``agentloop.max_turns`` 必须不小于 ``teacher_planner.max_steps + 1``，确保所有 hop 后仍有
+一次最终 synthesis。示例使用 ``max_turns: 10``，并将 ``runner.seq_length`` 提高到
+12288。Controller 生成的 root-hop 输出只作为元数据，不会进入 policy 训练 tensor。
+结果 JSON 会记录 controller phase、query source（``template``、``policy`` 或
+``fallback``）、已完成 step ID、resolved value、binding 尝试次数和稳定失败原因、
+synthesis format repair，以及 synthesis 是否完成。
 
 在 ``examples/agent/searchr1/config/eval_teacher_shadow_qwen2.5.yaml`` 中设置
 policy 和 teacher 模型路径。默认布局使用硬件 rank 0--7 运行 policy 评估，rank 8
@@ -259,8 +292,20 @@ policy 和 teacher 模型路径。默认布局使用硬件 rank 0--7 运行 poli
    algorithm:
      group_size: 4
 
+   agentloop:
+     max_turns: 10
+     force_search_on_first_turn: true
+
    teacher_planner:
      enabled: true
+     execution_mode: controller
+     max_attempts: 3
+     require_plan: true
+     controller_max_evidence_length: 6000
+     controller_min_synthesis_tokens: 256
+     controller_bind_max_attempts: 3
+     dual_query_retrieval: false
+     use_fallback_query: false
      guidance_modes: [guided, guided, unguided, unguided]
 
 运行 paired 评估：
@@ -268,6 +313,25 @@ policy 和 teacher 模型路径。默认布局使用硬件 rank 0--7 运行 poli
 .. code-block:: bash
 
    bash examples/agent/searchr1/run_eval.sh eval_teacher_shadow_qwen2.5
+
+在单台 8 GPU 节点上，先用 1 张 GPU 生成 plan 并释放该 GPU，再使用
+8 张 GPU 运行 policy。Cache-only 配置遇到 plan 缺失时会立即报错，
+不会隐式启动 teacher 模型：
+
+.. code-block:: bash
+
+   CUDA_VISIBLE_DEVICES=0 python examples/agent/searchr1/precompute_teacher_plans.py \
+     --model-path /path/to/Qwen2.5-7B-Instruct \
+     --data-path /path/to/eval.jsonl \
+     --cache-dir ../results/teacher_plan_cache/qwen2.5-7b-instruct-multihop-v5-seed1234 \
+     --teacher-version qwen2.5-7b-instruct-multihop-v5 --seed 1234 \
+     --max-attempts 3 --require-plan --retry-invalid
+
+   bash examples/agent/searchr1/run_eval.sh \
+     eval_teacher_shadow_qwen2.5_8gpu \
+     rollout.model.model_path=/path/to/policy \
+     teacher_planner.model.model_path=/path/to/Qwen2.5-7B-Instruct \
+     data.val_data_paths='[/path/to/eval.jsonl]'
 
 通过覆盖 ``guidance_modes`` 分别运行两个 placebo 对照：
 
@@ -278,12 +342,39 @@ policy 和 teacher 模型路径。默认布局使用硬件 rank 0--7 运行 poli
    bash examples/agent/searchr1/run_eval.sh eval_teacher_shadow_qwen2.5 \
      teacher_planner.guidance_modes='[generic,generic,unguided,unguided]'
 
+在 controller execution 下，``shuffled`` 会通过相同状态机执行一条无关但通过校验的
+plan；``generic`` 仍是长度匹配的 prompt 扰动对照，不会执行语义 plan。
+
 结果摘要包含 ``planner/guided_EM``、``planner/unguided_EM``、
 ``planner/guided_minus_unguided``、``planner/plan_valid_rate``、
 ``planner/query_change_rate`` 和 ``planner/answer_hit_delta``。Shuffled 和 generic
 实验会输出相应的 mode-specific 指标。摘要还会通过
 ``planner/<mode>_uplift_ci_low`` 和 ``planner/<mode>_uplift_ci_high`` 输出可复现的
 paired-bootstrap 95% CI。Shuffled 对照要求每个 agent-loop request 至少包含两个问题。
+``planner/rewrite_rate``、``search/<mode>_dual_query_rate`` 和
+``search/<mode>_tool_call_repair_rate`` 用于观测新门控和检索路径。
+``planner/<mode>_diagnostic_SubEM`` 仅用于诊断答案列表和 alias 类评测误差，
+不会改变主 exact-match reward。``planner/<mode>_controller_completion_rate``
+表示所有 hop 是否都进入 synthesis，
+``search/<mode>_controller_fallback_query_rate`` 表示已完成 hop 中需要 controller
+修复查询的比例。``search/<mode>_controller_dependent_fallback_rate`` 只使用 dependent
+hop 作为分母。``search/<mode>_dependent_query_binding_valid_rate``、
+``search/<mode>_binding_attempts_per_dependent_hop``、binding failure-reason rate 和
+``search/<mode>_unresolved_placeholder_rate`` 会直接呈现 dependent binding 协议质量。
+``planner/<mode>_synthesis_format_valid_rate`` 和
+``planner/<mode>_synthesis_format_repair_rate`` 分别表示最终答案协议有效率和确定性
+answer-tag 规范化比例。Label-only 后处理还会增加
+``planner/plan_semantic_coverage_rate``，并在
+``planner/type/<question_type>/...`` 和 ``search/type/<question_type>/...`` 下输出各题型
+EM、answer-hit、gold evidence-object coverage、paired uplift 和置信区间。数据集标签只在
+rollout 完成后 join，不会进入 teacher、retrieval 或 synthesis 输入。
+
+保存结果前，runner 会拒绝缺失问题、重复 trajectory 或不平衡的 A/B 臂。结果摘要会保存
+dataset、plan cache、controller、resolved config、model manifest 和 retrieval config
+的 hash，同时报告搜索次数、turn 数、生成 token 预算和 wall time。
+``acceptance/A_pass``、``acceptance/B_pass``、``acceptance/C_pass`` 和
+``acceptance/ABC_pass`` 会按冻结的阶段 2 阈值自动判定。因此 teacher shadow 配置必须提供
+``tools.search.index_manifest.manifest_sha256``。
 
 训练曲线
 --------

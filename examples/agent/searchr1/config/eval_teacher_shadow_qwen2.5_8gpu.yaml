@@ -1,0 +1,78 @@
+defaults:
+  - eval_qwen2.5
+  - _self_
+
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    rollout,reward: all
+
+
+runner:
+  experiment_name: searchr1-qwen2.5-3b-teacher-shadow-controller-v3-8gpu
+  seq_length: 12288
+
+
+algorithm:
+  group_size: 4
+
+
+data:
+  # The full Search-R1 test set is divisible by 24. Each of the eight policy
+  # workers receives three questions (12 trajectories) per request.
+  val_rollout_batch_size: 24
+
+
+agentloop:
+  policy_version: qwen2.5-3b-searchr1-baseline
+  # Up to nine searches plus one final answer. If the first policy turn
+  # contains a malformed call or a direct answer, execute the original
+  # question once so both A/B arms receive retrieval evidence.
+  max_turns: 10
+  force_search_on_first_turn: true
+
+
+tools:
+  search:
+    server_addr: 172.27.236.206:8000
+    index_manifest:
+      collection: wiki_collection_m32_cef512
+      points_count: 26134257
+      indexed_vectors_count: 26134257
+      vector_size: 768
+      distance: Cosine
+      hnsw_m: 32
+      hnsw_ef_construct: 512
+      query_hnsw_ef: 256
+      retriever: e5
+      manifest_sha256: 575198687c3ed841d6311afa61d8a88eab315d1a2ed4aab73256e18848e68a42
+
+
+teacher_planner:
+  enabled: true
+  # Populate this cache first with precompute_teacher_plans.py. Cache misses are
+  # fatal so the eight policy GPUs never silently start a teacher rollout.
+  cache_only: true
+  version: qwen2.5-7b-instruct-multihop-v5
+  seed: 1234
+  cache_dir: ${runner.output_dir}/teacher_plan_cache/qwen2.5-7b-instruct-multihop-v5-seed1234
+  max_new_tokens: 768
+  max_plan_chars: 6144
+  max_field_chars: 512
+  max_steps: 8
+  max_attempts: 3
+  # 2WikiMultihopQA contains only multi-hop items; retry any accidental KEEP.
+  require_plan: true
+  bootstrap_samples: 2000
+  # Execute one controlled hop at a time and synthesize only after every hop.
+  execution_mode: controller
+  controller_max_evidence_length: 6000
+  controller_min_synthesis_tokens: 256
+  controller_bind_max_attempts: 3
+  # Legacy prompt-mode query expansion remains disabled.
+  dual_query_retrieval: false
+  use_fallback_query: false
+  guidance_modes: [guided, guided, unguided, unguided]
+  model:
+    model_path: /path/to/model/Qwen2.5-7B-Instruct

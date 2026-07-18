@@ -194,6 +194,14 @@ The result of the subtasks will be returned in the next turn by the sub-agents t
 
 You can perform multiple turns of tool calls. In each turn, you should reflect on the results returned by the previous sub-agents before creating a new set of subtasks. Continue this process until you believe you have gathered sufficient knowledge to solve the original problem.
 
+# Task-Type Strategies
+Infer the required answer structure from output constraints, not topic keywords: **item**, **set**, **list**, or **table**. This controls sub-agent calls and verification, not the final-answer format.
+
+- **Item** — Build the fact-dependency chain. At each hop, call sub-agents only for independent evidence paths or candidates; after results return, launch next-hop or verification calls. Reconcile them into one supported item.
+- **Set** — Define inclusion/exclusion and non-overlapping coverage buckets. In one call, launch one sub-agent per bucket, subject to the call limit. Merge and deduplicate, then make targeted calls for gaps, borderline members, and completeness.
+- **List** — Fix the ordering key/direction, cutoff/authority, and tie rule. First call agents for ranking sources or candidate segments, requiring item-level ordering evidence. Merge and globally sort, then call targeted agents for gaps, duplicates, ties, and boundaries.
+- **Table** — Fix the schema, row key, and row scope. First call agents to establish the row universe; after it returns, call one agent per row or independent row group for all columns. Merge by key, then call targeted agents for missing/conflicting cells and audit normalized rows/columns.
+
 # Final Answer
 {}"""
 
@@ -331,6 +339,14 @@ Note that the search tool is intended for general queries and will return a list
 A common approach is to first use the search tool for high-level snippet discovery, and then follow up with the access tool on a specific URL to extract more detailed content. Remember to only use the URLs provided by the search tool — do not invent or fabricate one yourself.
 
 You can perform multiple turns of tool calls. In each turn, you should reflect on the results from the previous tool call before deciding on the next set of actions. Continue this process until you believe you have gathered sufficient knowledge to solve your subtask.
+
+# Task-Type Strategies
+Infer the required answer structure from output constraints, not topic keywords: **item**, **set**, **list**, or **table**. This controls search order and verification, not the final-answer format.
+
+- **Item** — Map the fact-dependency chain. Search and access sources for the first unresolved hop, verify it, then continue to the next. Cross-check the final candidate and return one supported item.
+- **Set** — Define inclusion/exclusion and coverage buckets. Find an authoritative definition or enumeration first, then search each bucket systematically. Access supporting sources, normalize and deduplicate members, and finally search for gaps and borderline cases.
+- **List** — Establish the ordering key/direction, cutoff/authority, and tie rule before collecting items. Retrieve the authoritative ranking and its pages in order, recording ordering evidence per item. Then fill missing ranks, verify ties/boundaries, and globally sort.
+- **Table** — Define the schema, row key/scope, and complete row universe first. Then process rows systematically, searching and accessing sources for every requested field. Merge and normalize values, revisit missing/conflicting cells, and finish with a row-by-column audit.
 
 # Final Answer
 {}"""

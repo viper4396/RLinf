@@ -252,9 +252,54 @@ Frozen Teacher-Planner Shadow A/B
 
 The phase-2 shadow evaluation keeps the policy frozen and launches an
 independent ``teacher_planner`` rollout using Qwen2.5-7B-Instruct. The teacher
-receives the question but never the ground-truth answer. Its strict four-field
-JSON plan is cached by question, teacher version, and seed, and is injected as
-low-trust guidance only for the policy's first search.
+receives the question but never the ground-truth answer. Its strict JSON output
+contains ``decision``, ``plan_type``, and an ordered ``steps`` list. Every step
+records ``step_id``, ``goal``, ``query_template``, ``expected_evidence``, and
+``depends_on``. A dependent query uses placeholders such as
+``{step_1_result}``, which the policy must instantiate from actual retrieval
+evidence instead of a teacher guess. Plans are cached by question, teacher
+version, and seed. ``KEEP`` represents a direct single-hop question and leaves
+the policy prompt unchanged. ``PLAN`` requires two to eight validated sequential
+or comparison hops. The planner retries rejected outputs with a question-only
+repair prompt up to ``teacher_planner.max_attempts``. Set ``require_plan: true``
+for an all-multihop benchmark such as 2WikiMultihopQA so an accidental ``KEEP``
+is retried as well. A plan that remains invalid safely falls back to no guidance.
+
+The legacy ``execution_mode: prompt`` inserts the complete plan as a separate
+low-trust ChatML user message before restoring the assistant-generation prefix.
+Controller mode uses the same validated ChatML boundary for current-hop and
+synthesis messages but never exposes the complete plan to the policy.
+
+With ``execution_mode: controller``, an accepted ``PLAN`` becomes an enforced
+state machine instead of persistent prompt text. The controller executes every
+independent root hop exactly from its validated query template. For a dependent
+hop, it exposes only that hop and the evidence from its declared dependencies;
+the controller requests a strict JSON binding with ``resolved_values`` and a
+fully bound ``query``. Each ``step_N_result`` value must be grounded in that
+specific dependency's evidence, and the query must contain the value or a
+recorded normalized alias. Invalid bindings are retried up to
+``controller_bind_max_attempts``. A premature answer, malformed JSON,
+cross-dependency value, or unresolved placeholder cannot terminate the plan.
+The recorded fallback is candidate-specific: it combines the current
+goal with dependency-step goals, templates, expected evidence, and retrieved
+document titles instead of repeating the complete original question. After
+every hop completes, RLinf removes the plan and builds a separate synthesis
+prompt from the original question and bounded collected evidence. The
+controller places the opening ``<think>`` in the generation prompt, requires a
+short evidence-grounded derivation followed by one ``<answer>`` tag, normalizes
+the final tag, and makes only that isolated synthesis response visible to reward
+evaluation. Rejected intermediate answer tags can therefore never become the
+final answer. Comparison synthesis
+explicitly asks for the requested candidate or yes/no decision instead of an
+intermediate date, number, or name.
+
+``agentloop.max_turns`` must be at least ``teacher_planner.max_steps + 1`` so
+each configured hop still leaves one final synthesis turn. The example uses
+``max_turns: 10`` and raises ``runner.seq_length`` to 12288. Root-hop controller
+outputs are metadata-only and excluded from policy training tensors. The result
+JSON records controller phase, query source (``template``, ``policy``, or
+``fallback``), completed step IDs, resolved values, binding attempts and stable
+failure reasons, synthesis format repair, and whether synthesis completed.
 
 Set the policy and teacher model paths in
 ``examples/agent/searchr1/config/eval_teacher_shadow_qwen2.5.yaml``. The default
@@ -270,8 +315,20 @@ The main paired run keeps four trajectories per question:
    algorithm:
      group_size: 4
 
+   agentloop:
+     max_turns: 10
+     force_search_on_first_turn: true
+
    teacher_planner:
      enabled: true
+     execution_mode: controller
+     max_attempts: 3
+     require_plan: true
+     controller_max_evidence_length: 6000
+     controller_min_synthesis_tokens: 256
+     controller_bind_max_attempts: 3
+     dual_query_retrieval: false
+     use_fallback_query: false
      guidance_modes: [guided, guided, unguided, unguided]
 
 Run the paired evaluation with:
@@ -279,6 +336,25 @@ Run the paired evaluation with:
 .. code-block:: bash
 
    bash examples/agent/searchr1/run_eval.sh eval_teacher_shadow_qwen2.5
+
+On a single eight-GPU node, generate the plans on one GPU first, release that
+GPU, and then run the policy on all eight GPUs. The cache-only configuration
+fails immediately if a plan is missing instead of launching a teacher model:
+
+.. code-block:: bash
+
+   CUDA_VISIBLE_DEVICES=0 python examples/agent/searchr1/precompute_teacher_plans.py \
+     --model-path /path/to/Qwen2.5-7B-Instruct \
+     --data-path /path/to/eval.jsonl \
+     --cache-dir ../results/teacher_plan_cache/qwen2.5-7b-instruct-multihop-v5-seed1234 \
+     --teacher-version qwen2.5-7b-instruct-multihop-v5 --seed 1234 \
+     --max-attempts 3 --require-plan --retry-invalid
+
+   bash examples/agent/searchr1/run_eval.sh \
+     eval_teacher_shadow_qwen2.5_8gpu \
+     rollout.model.model_path=/path/to/policy \
+     teacher_planner.model.model_path=/path/to/Qwen2.5-7B-Instruct \
+     data.val_data_paths='[/path/to/eval.jsonl]'
 
 Run the two placebo controls separately by overriding ``guidance_modes``:
 
@@ -289,6 +365,10 @@ Run the two placebo controls separately by overriding ``guidance_modes``:
    bash examples/agent/searchr1/run_eval.sh eval_teacher_shadow_qwen2.5 \
      teacher_planner.guidance_modes='[generic,generic,unguided,unguided]'
 
+With controller execution, ``shuffled`` runs an unrelated validated plan through
+the same state machine. ``generic`` remains a length-matched prompt-perturbation
+control and does not execute the semantic plan.
+
 The result summary contains ``planner/guided_EM``,
 ``planner/unguided_EM``, ``planner/guided_minus_unguided``,
 ``planner/plan_valid_rate``, ``planner/query_change_rate``, and
@@ -296,7 +376,34 @@ The result summary contains ``planner/guided_EM``,
 mode-specific metrics. The summary also reports deterministic paired-bootstrap
 95% CI bounds as ``planner/<mode>_uplift_ci_low`` and
 ``planner/<mode>_uplift_ci_high``. Use at least two questions per agent-loop
-request for the shuffled control.
+request for the shuffled control. ``planner/rewrite_rate``,
+``search/<mode>_dual_query_rate``, and
+``search/<mode>_tool_call_repair_rate`` expose the new gate and retrieval path.
+``planner/<mode>_diagnostic_SubEM`` is a secondary diagnostic for answer-list
+and alias artifacts; it does not change the primary exact-match reward.
+``planner/<mode>_controller_completion_rate`` reports whether all hops reached
+synthesis, while ``search/<mode>_controller_fallback_query_rate`` reports the
+fraction of all completed hops that required controller repair.
+``search/<mode>_controller_dependent_fallback_rate`` uses only dependent hops as
+the denominator. ``search/<mode>_dependent_query_binding_valid_rate``,
+``search/<mode>_binding_attempts_per_dependent_hop``, binding failure-reason
+rates, and ``search/<mode>_unresolved_placeholder_rate`` expose the dependent
+binding protocol directly. ``planner/<mode>_synthesis_format_valid_rate`` and
+``planner/<mode>_synthesis_format_repair_rate`` report final answer protocol
+validity and deterministic answer-tag normalization. Label-only post-processing
+adds ``planner/plan_semantic_coverage_rate`` and per-type EM, answer-hit, gold
+evidence-object coverage, paired uplift, and confidence intervals under
+``planner/type/<question_type>/...`` and ``search/type/<question_type>/...``.
+The dataset labels are joined only after rollout and never enter teacher,
+retrieval, or synthesis inputs.
+
+Before saving, the runner rejects missing questions, duplicate trajectories, or
+unbalanced A/B arms. The result summary stores dataset, plan-cache, controller,
+resolved-config, model-manifest, and retrieval-config hashes, plus search/turn/
+generated-token budgets and wall times. ``acceptance/A_pass``,
+``acceptance/B_pass``, ``acceptance/C_pass``, and ``acceptance/ABC_pass`` apply
+the frozen phase-2 thresholds to these metrics. Teacher shadow configs must
+therefore provide ``tools.search.index_manifest.manifest_sha256``.
 
 Training Curves
 ---------------
