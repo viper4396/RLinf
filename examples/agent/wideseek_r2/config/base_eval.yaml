@@ -72,6 +72,7 @@ data:
   num_workers: 2
   prompt_key: question
   answer_key: answer
+  is_gisa: False
   apply_chat_template: False
   shuffle: True
   validation_shuffle: False

@@ -155,6 +155,25 @@ data
 
 ``data.val_data_paths``：验证 JSONL 文件列表。
 
+对于 WideSeek-R2 GISA 数据，可按如下方式启用 GISA 专用 Markdown 评估：
+
+.. code:: yaml
+
+  data:
+    type: wideseek_r2
+    answer_mode: markdown
+    is_hybrid: True
+    is_gisa: True
+
+``data.is_gisa`` 默认为 ``False``。启用后，所有 GISA 答案均使用本地、
+确定性的精确匹配（EM），不会调用 judge model。boxed ``item`` 记录直接比较
+答案字符串。Markdown 记录必须将 ``answer_type`` 设置为 ``table``、``set``
+或 ``list``。表格严格比较列名、行顺序和单元格内容；集合和列表会丢弃
+Markdown 表头及 ``unique_columns`` 元数据，从第一行正式内容开始比较，其中
+集合忽略顺序和重复项，列表严格比较顺序和重复项。设置
+``data.is_hybrid: True`` 后，每条记录的 ``is_markdown`` 或 ``answer_mode``
+决定其输出模式。
+
 actor
 ~~~~~~~~~~~~~~~
 

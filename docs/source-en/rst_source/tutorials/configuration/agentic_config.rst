@@ -163,6 +163,26 @@ data
 
 ``data.val_data_paths``: List of validation JSONL file paths.
 
+For WideSeek-R2 GISA data, enable the GISA-specific Markdown evaluator as follows:
+
+.. code:: yaml
+
+  data:
+    type: wideseek_r2
+    answer_mode: markdown
+    is_hybrid: True
+    is_gisa: True
+
+``data.is_gisa`` defaults to ``False``. When enabled, all GISA answers use local,
+deterministic exact match (EM) and never call the judge model. Boxed ``item``
+records compare the direct answer string. Markdown records must provide
+``answer_type`` as ``table``, ``set``, or ``list``. Tables compare column names,
+row order, and cell contents exactly. Sets and lists discard the Markdown header
+and ``unique_columns`` metadata and compare from the first content row; set order
+and duplicate occurrences are ignored, while list order and duplicates are
+strict. With ``data.is_hybrid: True``, a per-record ``is_markdown`` or
+``answer_mode`` selects the output mode.
+
 actor
 ~~~~~~~~~~~~~~~
 

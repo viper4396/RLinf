@@ -69,6 +69,7 @@ class WideSeekR2Dataset(ReasoningDataset):
         self.answer_mode = self._config_answer_mode(config.data)
         self.unique_columns_key = config.data.get("unique_columns", "unique_columns")
         self.is_hybrid = config.data.get("is_hybrid", False)
+        self.is_gisa = config.data.get("is_gisa", False)
 
     @staticmethod
     def _config_answer_mode(data_cfg) -> str:
@@ -103,6 +104,20 @@ class WideSeekR2Dataset(ReasoningDataset):
             if self.is_hybrid
             else self.answer_mode
         )
+        answer_type = None
+        if self.is_gisa:
+            answer_type = str(record.get("answer_type", "")).strip().lower()
+            supported_types = (
+                {"table", "set", "list"} if answer_mode == "markdown" else {"item"}
+            )
+            if answer_type not in supported_types:
+                expected = (
+                    "table, set, or list" if answer_mode == "markdown" else "item"
+                )
+                raise ValueError(
+                    f"GISA {answer_mode} records require answer_type to be "
+                    f"one of {expected}; got {answer_type!r} at index {idx}."
+                )
 
         if answer_mode == "markdown":
             answer_dict = {
@@ -111,6 +126,9 @@ class WideSeekR2Dataset(ReasoningDataset):
                 "answer_mode": answer_mode,
                 "instance_id": record.get("instance_id", idx),
             }
+            if self.is_gisa:
+                answer_dict["is_gisa"] = True
+                answer_dict["answer_type"] = answer_type
             # Try to get evaluation info if available
             evaluation = record.get("evaluation", None)
             if evaluation:
@@ -128,6 +146,9 @@ class WideSeekR2Dataset(ReasoningDataset):
                 "answer_mode": answer_mode,
                 "instance_id": record.get("instance_id", idx),
             }
+            if self.is_gisa:
+                answer["is_gisa"] = True
+                answer["answer_type"] = answer_type
 
         prompt_tokens, prompt_length = self.encode(prompt)
         prompt_tokens_tensor = torch.as_tensor(prompt_tokens, dtype=torch.int64)

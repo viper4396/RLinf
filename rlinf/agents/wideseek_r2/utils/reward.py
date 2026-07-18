@@ -107,10 +107,8 @@ def credit_assignment(
 ):
     """Compute the trajectory reward from the answer score and format reward.
 
-    The reward is intentionally simple: the answer score (item-level F1 for
-    markdown answers or the LLM-judge score for boxed answers) plus a format
-    bonus that is granted only when the final answer was extracted with a valid
-    format.
+    The reward is intentionally simple: the answer score plus a format bonus
+    that is granted only when the final answer was extracted with a valid format.
 
     Args:
         agentloop_config: Agent-loop config containing the ``format_reward`` weight.
@@ -141,10 +139,17 @@ async def get_final_reward_score(
         answer_mode: Answer mode for this sample (``markdown`` or ``boxed``).
         norm_column: Whether to normalize markdown column names aggressively.
         judge_llm_generator: Shared LLM judge generator function backed by SGLang.
+            GISA exact-match evaluation does not use it.
 
     Returns:
         Tuple of `(reward_score, format_ok)`.
     """
+    if isinstance(label_answer, dict) and label_answer.get("is_gisa", False):
+        return evaluate_gisa_exact_match(
+            extract_answer=extract_answer,
+            label_answer=label_answer,
+        )
+
     if judge_llm_generator is None:
         return 0.0, False
 
@@ -210,6 +215,114 @@ async def verify_answer_with_llm_judge(
         return 1.0
     else:
         return 0.0
+
+
+def _markdown_dataframe(answer) -> pd.DataFrame | None:
+    """Return a parsed Markdown DataFrame, accepting reference strings."""
+    if isinstance(answer, str):
+        answer = extract_final_answer(answer, mode="markdown", strict=False)
+    if not isinstance(answer, pd.DataFrame) or answer.empty:
+        return None
+    return answer
+
+
+def _normalize_em_value(value) -> str:
+    """Normalize surrounding whitespace while preserving exact text."""
+    return "" if pd.isna(value) else str(value).strip()
+
+
+def _markdown_contents(answer) -> list | None:
+    """Return Markdown-table row contents without exposing column names."""
+    answer_df = _markdown_dataframe(answer)
+    if answer_df is None:
+        return None
+
+    contents = []
+    for row in answer_df.itertuples(index=False, name=None):
+        normalized_row = [_normalize_em_value(value) for value in row]
+        contents.append(
+            normalized_row[0] if len(normalized_row) == 1 else normalized_row
+        )
+    return contents
+
+
+def _markdown_table_signature(answer) -> tuple | None:
+    """Return exact ordered headers and rows for a Markdown table."""
+    answer_df = _markdown_dataframe(answer)
+    if answer_df is None:
+        return None
+    columns = tuple(_normalize_em_value(column) for column in answer_df.columns)
+    rows = tuple(
+        tuple(_normalize_em_value(value) for value in row)
+        for row in answer_df.itertuples(index=False, name=None)
+    )
+    return columns, rows
+
+
+def _freeze_content(value):
+    """Convert nested row content into a hashable exact-match value."""
+    if isinstance(value, list):
+        return tuple(_freeze_content(item) for item in value)
+    return value
+
+
+def evaluate_gisa_exact_match(
+    extract_answer,
+    label_answer: dict,
+) -> tuple[float, bool]:
+    """Evaluate every GISA answer locally with deterministic exact match.
+
+    Item answers use direct string EM. Markdown tables compare ordered headers
+    and rows. Sets and lists discard headers and compare only content rows;
+    sets ignore order while lists preserve it.
+
+    Args:
+        extract_answer: Parsed prediction DataFrame.
+        label_answer: Ground-truth answer payload.
+
+    Returns:
+        ``(score, format_ok)`` with a deterministic binary EM score.
+    """
+    answer_type = label_answer.get("answer_type")
+    answer_mode = label_answer.get("answer_mode")
+
+    if answer_mode == "boxed" and answer_type == "item":
+        if extract_answer is None:
+            return 0.0, False
+        references = label_answer.get("answer", [])
+        if not isinstance(references, list):
+            references = [references]
+        prediction = _normalize_em_value(extract_answer)
+        score = any(
+            prediction == _normalize_em_value(reference) for reference in references
+        )
+        return float(score), True
+
+    if answer_mode != "markdown":
+        return 0.0, False
+
+    correct_answer = label_answer.get("answer", "")
+    if answer_type == "table":
+        correct_table = _markdown_table_signature(correct_answer)
+        predicted_table = _markdown_table_signature(extract_answer)
+        if correct_table is None or predicted_table is None:
+            return 0.0, False
+        return float(predicted_table == correct_table), True
+
+    if answer_type not in {"set", "list"}:
+        return 0.0, False
+
+    correct_contents = _markdown_contents(correct_answer)
+    predicted_contents = _markdown_contents(extract_answer)
+    if correct_contents is None or predicted_contents is None:
+        return 0.0, False
+
+    if answer_type == "set":
+        correct_values = {_freeze_content(value) for value in correct_contents}
+        predicted_values = {_freeze_content(value) for value in predicted_contents}
+        return float(predicted_values == correct_values), True
+
+    return float(predicted_contents == correct_contents), True
 
 
 async def evaluate_markdown(
