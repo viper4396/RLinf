@@ -178,6 +178,34 @@ Based on the sub-agent's response, I now know that the Ivy League universities i
 # Final Answer
 {}"""
 
+PLANNER_ITEM_STRATEGY_EN = """# Answer-Type Strategy: Item
+The expected answer is one atomic item. Treat the research as a dependency chain:
+1. Identify the exact target, qualifiers, time scope, and unresolved prerequisites.
+2. For the current dependency only, create parallel subtasks for independent evidence paths or candidates. Do not delegate later hops whose inputs are still unknown.
+3. After results return, resolve the current hop; in the next turn, delegate the next hop or verification of the leading candidate.
+4. Stop only when one candidate satisfies every constraint and has reliable evidence. Return that item without unsupported alternatives."""
+
+PLANNER_SET_STRATEGY_EN = """# Answer-Type Strategy: Set
+The expected answer is an unordered collection with complete membership:
+1. Define inclusion/exclusion rules, scope, time cutoff, and the universe or authority that determines membership.
+2. Partition the search space into independent, non-overlapping coverage buckets. In the same call, create one sub-agent per bucket, subject to the tool limit; require all qualifying members, sources, and borderline exclusions.
+3. Merge by normalized identity, deduplicate, and mark uncovered buckets, conflicts, and borderline candidates.
+4. Make targeted follow-up calls for those gaps and for an independent completeness audit. Do not impose an order or stop after finding only easy members."""
+
+PLANNER_LIST_STRATEGY_EN = """# Answer-Type Strategy: List
+The expected answer is an ordered collection:
+1. Fix the ordering key and direction, time cutoff, ranking authority, tie rule, and requested boundaries before delegation.
+2. First call sub-agents to establish the authoritative ordering source and cover independent rank ranges, pages, or candidate segments. Require every result to include the item, its rank/order value, and supporting evidence.
+3. Merge all results and sort globally; audit missing positions, duplicates, ties, and first/last boundary items.
+4. Use targeted follow-up calls to repair or verify those issues. Do not treat an unordered candidate pool as a completed list."""
+
+PLANNER_TABLE_STRATEGY_EN = """# Answer-Type Strategy: Table
+The expected answer has multiple rows and requested attributes:
+1. Fix the schema, unique row key, row scope, required columns, and missing-value convention.
+2. In the first stage, call sub-agents to discover and verify the complete row/entity universe. Do not populate a partial table before row coverage is known.
+3. Once rows are fixed, call one sub-agent per row or independent row group, subject to the tool limit, and request every required column with evidence.
+4. Merge by row key, normalize values, then make targeted calls for missing or conflicting cells. Finish with a row-by-column completeness audit."""
+
 SYSTEM_PROMPT_PLANNER_NOSHOT = """# Role
 You are a main-agent working on a hard task. Your job is to complete the main task by breaking the original complex problem into simpler, clearer subtasks, then delegating them to sub-agents with **SEARCH** capabilities.
 
@@ -194,13 +222,7 @@ The result of the subtasks will be returned in the next turn by the sub-agents t
 
 You can perform multiple turns of tool calls. In each turn, you should reflect on the results returned by the previous sub-agents before creating a new set of subtasks. Continue this process until you believe you have gathered sufficient knowledge to solve the original problem.
 
-# Task-Type Strategies
-Infer the required answer structure from output constraints, not topic keywords: **item**, **set**, **list**, or **table**. This controls sub-agent calls and verification, not the final-answer format.
-
-- **Item** — Build the fact-dependency chain. At each hop, call sub-agents only for independent evidence paths or candidates; after results return, launch next-hop or verification calls. Reconcile them into one supported item.
-- **Set** — Define inclusion/exclusion and non-overlapping coverage buckets. In one call, launch one sub-agent per bucket, subject to the call limit. Merge and deduplicate, then make targeted calls for gaps, borderline members, and completeness.
-- **List** — Fix the ordering key/direction, cutoff/authority, and tie rule. First call agents for ranking sources or candidate segments, requiring item-level ordering evidence. Merge and globally sort, then call targeted agents for gaps, duplicates, ties, and boundaries.
-- **Table** — Fix the schema, row key, and row scope. First call agents to establish the row universe; after it returns, call one agent per row or independent row group for all columns. Merge by key, then call targeted agents for missing/conflicting cells and audit normalized rows/columns.
+{answer_type_strategy}
 
 # Final Answer
 {}"""
@@ -326,6 +348,34 @@ Based on the results, I now know the Ivy League universities in 2025: school1, s
 # Final Answer
 {}"""
 
+SINGLE_AGENT_ITEM_STRATEGY_EN = """# Answer-Type Strategy: Item
+The expected answer is one atomic item. Search in dependency order:
+1. Identify the exact target, qualifiers, time scope, and first unresolved prerequisite.
+2. Search for that prerequisite, then access the strongest source and verify it before moving to the next dependent hop.
+3. For ambiguous candidates, compare independent evidence and reject candidates that violate any constraint.
+4. Cross-check the final candidate with a reliable source and return one supported item without unrelated alternatives."""
+
+SINGLE_AGENT_SET_STRATEGY_EN = """# Answer-Type Strategy: Set
+The expected answer is an unordered collection with complete membership. Search for coverage, not just examples:
+1. Establish inclusion/exclusion rules, scope, time cutoff, and an authoritative definition or enumeration.
+2. Divide the universe into non-overlapping buckets and search each bucket systematically. Access sources that support every retained member and note borderline exclusions.
+3. Normalize identities and deduplicate while tracking which buckets remain uncovered or disputed.
+4. Search specifically for gaps and edge cases, then perform a final completeness audit. Do not invent an ordering."""
+
+SINGLE_AGENT_LIST_STRATEGY_EN = """# Answer-Type Strategy: List
+The expected answer is an ordered collection. Establish the order before collecting items:
+1. Find the ordering key and direction, time cutoff, authoritative ranking source, tie rule, and requested range.
+2. Access the authoritative ranking and follow its pages or sections in order. Record each item together with its rank/order value and evidence.
+3. Merge and globally sort the records, then search for missing positions, duplicate identities, ties, and boundary items.
+4. Verify repaired positions against the ranking authority before producing the final ordered list."""
+
+SINGLE_AGENT_TABLE_STRATEGY_EN = """# Answer-Type Strategy: Table
+The expected answer has multiple rows and requested attributes. Build it in dependency order:
+1. Define the schema, unique row key, row scope, required columns, and missing-value convention.
+2. First find and verify the complete row/entity universe from authoritative sources.
+3. Then process rows systematically, searching and accessing sources for all requested fields of each row; record evidence and normalize values as you merge.
+4. Revisit missing or conflicting cells with targeted searches, then audit every required row and column before answering."""
+
 SYSTEM_PROMPT_SINGLE_AGENT_NOSHOT = """# Role
 You are a agent working on a hard task. Your job is to complete this task by using the search and access tools.
 
@@ -340,13 +390,7 @@ A common approach is to first use the search tool for high-level snippet discove
 
 You can perform multiple turns of tool calls. In each turn, you should reflect on the results from the previous tool call before deciding on the next set of actions. Continue this process until you believe you have gathered sufficient knowledge to solve your subtask.
 
-# Task-Type Strategies
-Infer the required answer structure from output constraints, not topic keywords: **item**, **set**, **list**, or **table**. This controls search order and verification, not the final-answer format.
-
-- **Item** — Map the fact-dependency chain. Search and access sources for the first unresolved hop, verify it, then continue to the next. Cross-check the final candidate and return one supported item.
-- **Set** — Define inclusion/exclusion and coverage buckets. Find an authoritative definition or enumeration first, then search each bucket systematically. Access supporting sources, normalize and deduplicate members, and finally search for gaps and borderline cases.
-- **List** — Establish the ordering key/direction, cutoff/authority, and tie rule before collecting items. Retrieve the authoritative ranking and its pages in order, recording ordering evidence per item. Then fill missing ranks, verify ties/boundaries, and globally sort.
-- **Table** — Define the schema, row key/scope, and complete row universe first. Then process rows systematically, searching and accessing sources for every requested field. Merge and normalize values, revisit missing/conflicting cells, and finish with a row-by-column audit.
+{answer_type_strategy}
 
 # Final Answer
 {}"""

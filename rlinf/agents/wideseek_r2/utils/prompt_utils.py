@@ -15,6 +15,14 @@
 from rlinf.agents.wideseek_r2.utils.prompt import (
     BOXED_FORMAT_EN,
     MARKDOWN_FORMAT_EN,
+    PLANNER_ITEM_STRATEGY_EN,
+    PLANNER_LIST_STRATEGY_EN,
+    PLANNER_SET_STRATEGY_EN,
+    PLANNER_TABLE_STRATEGY_EN,
+    SINGLE_AGENT_ITEM_STRATEGY_EN,
+    SINGLE_AGENT_LIST_STRATEGY_EN,
+    SINGLE_AGENT_SET_STRATEGY_EN,
+    SINGLE_AGENT_TABLE_STRATEGY_EN,
     SYSTEM_PROMPT_PLANNER,
     SYSTEM_PROMPT_PLANNER_NOSHOT,
     SYSTEM_PROMPT_PLANNER_UNLIMITED,
@@ -26,6 +34,19 @@ from rlinf.agents.wideseek_r2.utils.prompt import (
     USER_PROMPT_WORKER,
 )
 from rlinf.agents.wideseek_r2.utils.tool_description import get_tools_description
+
+_PLANNER_STRATEGIES = {
+    "item": PLANNER_ITEM_STRATEGY_EN,
+    "set": PLANNER_SET_STRATEGY_EN,
+    "list": PLANNER_LIST_STRATEGY_EN,
+    "table": PLANNER_TABLE_STRATEGY_EN,
+}
+_SINGLE_AGENT_STRATEGIES = {
+    "item": SINGLE_AGENT_ITEM_STRATEGY_EN,
+    "set": SINGLE_AGENT_SET_STRATEGY_EN,
+    "list": SINGLE_AGENT_LIST_STRATEGY_EN,
+    "table": SINGLE_AGENT_TABLE_STRATEGY_EN,
+}
 
 
 def _format_instruction(answer_mode: str) -> str:
@@ -47,6 +68,47 @@ def _format_instruction(answer_mode: str) -> str:
     raise ValueError(
         f"Unsupported answer_mode {answer_mode!r}; expected 'markdown' or 'boxed'."
     )
+
+
+def _answer_type_strategy(
+    answer_type: str | None,
+    answer_mode: str,
+    role: str,
+) -> str:
+    """Return the role-specific strategy injected into a no-shot prompt.
+
+    ``answer_type`` normally comes from the dataset. The fallback mirrors the
+    dataset contract for direct callers of this prompt utility: boxed answers
+    are items, while Markdown answers are tables.
+
+    Args:
+        answer_type: One of ``item``, ``set``, ``list``, or ``table``.
+        answer_mode: Final-answer wrapper mode used when ``answer_type`` is None.
+        role: Either ``planner`` or ``single``.
+
+    Returns:
+        The strategy text for the selected role and answer type.
+
+    Raises:
+        ValueError: If the role or answer type is unsupported.
+    """
+    if role == "planner":
+        strategies = _PLANNER_STRATEGIES
+    elif role == "single":
+        strategies = _SINGLE_AGENT_STRATEGIES
+    else:
+        raise ValueError(f"Unsupported strategy role {role!r}.")
+
+    if answer_type is None:
+        normalized_type = "item" if answer_mode == "boxed" else "table"
+    else:
+        normalized_type = str(answer_type).strip().lower()
+    if normalized_type not in strategies:
+        supported = ", ".join(strategies)
+        raise ValueError(
+            f"Unsupported answer_type {answer_type!r}; expected one of {supported}."
+        )
+    return strategies[normalized_type]
 
 
 def _fanout_guidance(max_workers_per_planner: int) -> str:
@@ -75,6 +137,7 @@ def get_prompt_planner(
     answer_mode: str,
     add_few_shot: bool,
     max_workers_per_planner: int,
+    answer_type: str | None = None,
 ) -> list:
     """Build the planner prompt with optional few-shot examples.
 
@@ -94,6 +157,9 @@ def get_prompt_planner(
         system = SYSTEM_PROMPT_PLANNER_NOSHOT.format(
             format_instruction,
             fanout_guidance=_fanout_guidance(max_workers_per_planner),
+            answer_type_strategy=_answer_type_strategy(
+                answer_type, answer_mode, role="planner"
+            ),
         )
     return [
         {"role": "system", "content": system},
@@ -116,13 +182,19 @@ def get_prompt_single_agent(
     question: str,
     answer_mode: str,
     add_few_shot: bool,
+    answer_type: str | None = None,
 ) -> list:
     """Build the single-agent prompt with optional few-shot examples."""
     format_instruction = _format_instruction(answer_mode)
     if add_few_shot:
         system = SYSTEM_PROMPT_SINGLE_AGENT.format(format_instruction)
     else:
-        system = SYSTEM_PROMPT_SINGLE_AGENT_NOSHOT.format(format_instruction)
+        system = SYSTEM_PROMPT_SINGLE_AGENT_NOSHOT.format(
+            format_instruction,
+            answer_type_strategy=_answer_type_strategy(
+                answer_type, answer_mode, role="single"
+            ),
+        )
     return [
         {"role": "system", "content": system},
         {"role": "user", "content": USER_PROMPT_SINGLE_AGENT.format(question)},
@@ -137,6 +209,7 @@ def build_message_history_and_tools(
     max_workers_per_planner: int,
     max_toolcall_per_worker: int,
     main_task: str | None = None,
+    answer_type: str | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """Build role-specific prompt history and exposed tool descriptions.
 
@@ -149,6 +222,7 @@ def build_message_history_and_tools(
             descriptions; negative means unlimited.
         max_toolcall_per_worker: Search/access per-call limit for tool descriptions.
         main_task: Parent task text required for worker prompts.
+        answer_type: Dataset-provided answer structure for no-shot main roles.
 
     Returns:
         A tuple of `(message_history, tools)` for chat-template rendering.
@@ -163,6 +237,7 @@ def build_message_history_and_tools(
             answer_mode=answer_mode,
             add_few_shot=add_few_shot,
             max_workers_per_planner=max_workers_per_planner,
+            answer_type=answer_type,
         )
         tools = [tools_description["create_sub_agents"]]
     elif role == "worker":
@@ -171,7 +246,10 @@ def build_message_history_and_tools(
         tools = [tools_description["search"], tools_description["access"]]
     elif role == "single":
         message_history = get_prompt_single_agent(
-            origin_question, answer_mode=answer_mode, add_few_shot=add_few_shot
+            origin_question,
+            answer_mode=answer_mode,
+            add_few_shot=add_few_shot,
+            answer_type=answer_type,
         )
         tools = [
             tools_description["search_single_agent"],

@@ -155,6 +155,19 @@ data
 
 ``data.val_data_paths``：验证 JSONL 文件列表。
 
+对于 WideSeek-R2 no-shot 工作流（``agentloop.add_few_shot: False``），每条
+JSONL 记录可以将 ``answer_type`` 设置为 ``item``、``set``、``list`` 或
+``table``。主角色只会收到对应类型的策略：planner prompt 说明如何分阶段并行
+调用 sub-agent，single-agent prompt 说明 search/access 的先后顺序，模型不再
+自行判断类型。
+
+如果记录缺少 ``answer_type``，数据集依次根据记录级 ``answer_mode``、旧字段
+``is_markdown``、最终解析出的数据集级 ``answer_mode`` 推断。``boxed`` 或
+``is_markdown: false`` 等同于 ``item``；``markdown`` 或
+``is_markdown: true`` 等同于 ``table``。显式 ``answer_type`` 始终优先，并且
+只选择检索策略；最终使用 boxed 还是 Markdown 包装仍由 ``answer_mode``
+独立决定。
+
 对于 WideSeek-R2 GISA 数据，可按如下方式启用 GISA 专用 Markdown 评估：
 
 .. code:: yaml
@@ -167,10 +180,11 @@ data
 
 ``data.is_gisa`` 默认为 ``False``。启用后，所有 GISA 答案均使用本地、
 确定性的精确匹配（EM），不会调用 judge model。boxed ``item`` 记录直接比较
-答案字符串。Markdown 记录必须将 ``answer_type`` 设置为 ``table``、``set``
-或 ``list``。表格严格比较列名、行顺序和单元格内容；集合和列表会丢弃
-Markdown 表头及 ``unique_columns`` 元数据，从第一行正式内容开始比较，其中
-集合忽略顺序和重复项，列表严格比较顺序和重复项。设置
+答案字符串。Markdown 记录支持 ``table``、``set`` 或 ``list``；缺少
+``answer_type`` 时默认按 ``table`` 处理，因此 ``set`` 和 ``list`` 记录必须
+显式标注类型。表格严格比较列名、行顺序和单元格内容；集合和列表会丢弃
+Markdown 表头及 ``unique_columns`` 元数据，从第一行正式内容开始比较，
+其中集合忽略顺序和重复项，列表严格比较顺序和重复项。设置
 ``data.is_hybrid: True`` 后，每条记录的 ``is_markdown`` 或 ``answer_mode``
 决定其输出模式。
 

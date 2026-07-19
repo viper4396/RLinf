@@ -257,6 +257,7 @@ class WideSeekR2AgentLoopWorker(MultiAgentLoopWorker):
         sub_traj_id: int,
         main_task: str | None = None,
         answer_mode: str = "boxed",
+        answer_type: str | None = None,
     ) -> tuple[list[AgentLoopOutput], Optional[str], list]:
         """Run one query under a specific role until stop or turn budget.
 
@@ -266,6 +267,7 @@ class WideSeekR2AgentLoopWorker(MultiAgentLoopWorker):
             sub_traj_id: Sub-trajectory id for downstream regrouping.
             main_task: Original task text required when `role == "worker"`.
             answer_mode: Answer mode for this sample (``markdown`` or ``boxed``).
+            answer_type: Dataset-provided answer structure for no-shot main roles.
 
         Returns:
             Tuple of `(output_buffer, answer_text, total_turn_list)`. For workers,
@@ -293,6 +295,7 @@ class WideSeekR2AgentLoopWorker(MultiAgentLoopWorker):
             max_workers_per_planner=max_workers_per_planner,
             max_toolcall_per_worker=max_toolcall_per_worker,
             main_task=main_task,
+            answer_type=answer_type,
         )
         max_turns = _set_max_turns(self.cfg.agentloop, role)
 
@@ -538,6 +541,7 @@ class WideSeekR2AgentLoopWorker(MultiAgentLoopWorker):
             role = "planner"
 
         answer_mode = answer["answer_mode"]
+        answer_type = answer.get("answer_type")
 
         (
             output_buffer,
@@ -548,6 +552,7 @@ class WideSeekR2AgentLoopWorker(MultiAgentLoopWorker):
             role=role,
             sub_traj_id=sub_traj_id,
             answer_mode=answer_mode,
+            answer_type=answer_type,
         )
 
         final_answer_extract = extract_final_answer(answer_text, mode=answer_mode)

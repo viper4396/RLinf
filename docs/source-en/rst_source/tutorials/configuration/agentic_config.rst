@@ -163,6 +163,20 @@ data
 
 ``data.val_data_paths``: List of validation JSONL file paths.
 
+For WideSeek-R2 no-shot workflows (``agentloop.add_few_shot: False``), each
+JSONL record may set ``answer_type`` to ``item``, ``set``, ``list``, or
+``table``. The main role receives only the matching strategy: planner prompts
+describe how to stage and fan out sub-agents, while single-agent prompts
+describe the search/access order. The model does not infer the type itself.
+
+If ``answer_type`` is absent, the dataset infers it from record metadata in
+this order: ``answer_mode``, legacy ``is_markdown``, then the resolved
+dataset-level ``answer_mode``. ``boxed`` or ``is_markdown: false`` maps to
+``item``; ``markdown`` or ``is_markdown: true`` maps to ``table``. An explicit
+``answer_type`` always takes priority. It selects the research strategy only;
+``answer_mode`` still independently selects the final boxed or Markdown
+wrapper.
+
 For WideSeek-R2 GISA data, enable the GISA-specific Markdown evaluator as follows:
 
 .. code:: yaml
@@ -175,13 +189,14 @@ For WideSeek-R2 GISA data, enable the GISA-specific Markdown evaluator as follow
 
 ``data.is_gisa`` defaults to ``False``. When enabled, all GISA answers use local,
 deterministic exact match (EM) and never call the judge model. Boxed ``item``
-records compare the direct answer string. Markdown records must provide
-``answer_type`` as ``table``, ``set``, or ``list``. Tables compare column names,
-row order, and cell contents exactly. Sets and lists discard the Markdown header
-and ``unique_columns`` metadata and compare from the first content row; set order
-and duplicate occurrences are ignored, while list order and duplicates are
-strict. With ``data.is_hybrid: True``, a per-record ``is_markdown`` or
-``answer_mode`` selects the output mode.
+records compare the direct answer string. Markdown records support ``table``,
+``set``, or ``list``; a missing ``answer_type`` defaults to ``table``, so
+``set`` and ``list`` records must identify their type explicitly. Tables compare
+column names, row order, and cell contents exactly. Sets and lists discard the
+Markdown header and ``unique_columns`` metadata and compare from the first
+content row; set order and duplicate occurrences are ignored, while list order
+and duplicates are strict. With ``data.is_hybrid: True``, a per-record
+``is_markdown`` or ``answer_mode`` selects the output mode.
 
 actor
 ~~~~~~~~~~~~~~~

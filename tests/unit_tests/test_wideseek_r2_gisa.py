@@ -75,7 +75,6 @@ def test_gisa_boxed_record_carries_item_type(tmp_path):
         "answer": "red",
         "unique_columns": None,
         "is_markdown": False,
-        "answer_type": "item",
     }
 
     answer = _build_dataset(tmp_path, record, answer_mode="markdown")[0].answer
@@ -87,6 +86,19 @@ def test_gisa_boxed_record_carries_item_type(tmp_path):
         "is_gisa": True,
         "answer_type": "item",
     }
+
+
+def test_gisa_markdown_record_defaults_to_table_type(tmp_path):
+    record = {
+        "question": "Describe the colors.",
+        "answer": "```markdown\n| Item | Value |\n| --- | --- |\n| red | warm |\n```",
+        "is_markdown": True,
+    }
+
+    answer = _build_dataset(tmp_path, record)[0].answer
+
+    assert answer["answer_mode"] == "markdown"
+    assert answer["answer_type"] == "table"
 
 
 def test_gisa_markdown_record_requires_supported_answer_type(tmp_path):

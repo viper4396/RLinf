@@ -53,6 +53,27 @@ def normalize_answer_mode(value) -> str:
     )
 
 
+def normalize_answer_type(value) -> str:
+    """Normalize an answer-structure value used for prompt strategy selection.
+
+    Args:
+        value: Expected to name one of the four supported answer structures.
+
+    Returns:
+        A lowercase ``item``, ``set``, ``list``, or ``table`` string.
+
+    Raises:
+        ValueError: If ``value`` is not a supported answer type.
+    """
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"item", "set", "list", "table"}:
+            return normalized
+    raise ValueError(
+        f"Unsupported answer_type {value!r}; expected item, set, list, or table."
+    )
+
+
 class WideSeekR2Dataset(ReasoningDataset):
     def __init__(
         self,
@@ -93,6 +114,25 @@ class WideSeekR2Dataset(ReasoningDataset):
             return normalize_answer_mode(record["is_markdown"])
         return default
 
+    @staticmethod
+    def _record_answer_type(record: dict, default_mode: str) -> str:
+        """Resolve the search-strategy type for one record.
+
+        An explicit ``answer_type`` has priority. Otherwise, record-level
+        ``answer_mode`` or legacy ``is_markdown`` metadata is used when present,
+        followed by the already-resolved answer mode. Boxed maps to ``item`` and
+        Markdown maps to ``table``.
+        """
+        if "answer_type" in record:
+            return normalize_answer_type(record["answer_type"])
+        if "answer_mode" in record:
+            fallback_mode = normalize_answer_mode(record["answer_mode"])
+        elif "is_markdown" in record:
+            fallback_mode = normalize_answer_mode(record["is_markdown"])
+        else:
+            fallback_mode = default_mode
+        return "item" if fallback_mode == "boxed" else "table"
+
     def __getitem__(self, idx):
         """Return a single prompt with its answer payload."""
         record = self.data[idx]
@@ -104,9 +144,8 @@ class WideSeekR2Dataset(ReasoningDataset):
             if self.is_hybrid
             else self.answer_mode
         )
-        answer_type = None
+        answer_type = self._record_answer_type(record, answer_mode)
         if self.is_gisa:
-            answer_type = str(record.get("answer_type", "")).strip().lower()
             supported_types = (
                 {"table", "set", "list"} if answer_mode == "markdown" else {"item"}
             )
@@ -125,10 +164,10 @@ class WideSeekR2Dataset(ReasoningDataset):
                 "unique_columns": record.get(self.unique_columns_key, []),
                 "answer_mode": answer_mode,
                 "instance_id": record.get("instance_id", idx),
+                "answer_type": answer_type,
             }
             if self.is_gisa:
                 answer_dict["is_gisa"] = True
-                answer_dict["answer_type"] = answer_type
             # Try to get evaluation info if available
             evaluation = record.get("evaluation", None)
             if evaluation:
@@ -145,10 +184,10 @@ class WideSeekR2Dataset(ReasoningDataset):
                 "answer": answer if isinstance(answer, list) else [answer],
                 "answer_mode": answer_mode,
                 "instance_id": record.get("instance_id", idx),
+                "answer_type": answer_type,
             }
             if self.is_gisa:
                 answer["is_gisa"] = True
-                answer["answer_type"] = answer_type
 
         prompt_tokens, prompt_length = self.encode(prompt)
         prompt_tokens_tensor = torch.as_tensor(prompt_tokens, dtype=torch.int64)
