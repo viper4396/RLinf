@@ -24,6 +24,9 @@ from omegaconf import OmegaConf
 from omegaconf.dictconfig import DictConfig
 from torch.utils.data import Dataset
 
+from rlinf.agents.wideseek_r2.utils.eval_metrics import (
+    aggregate_gisa_markdown_metrics,
+)
 from rlinf.data.io_struct import DynamicRolloutResult
 from rlinf.runners.agent_eval_runner import AgentEvalRunner
 from rlinf.utils.placement import ModelParallelComponentPlacement
@@ -178,6 +181,7 @@ class WideSeekR2AgentEvalRunner(AgentEvalRunner):
         """
         answer_mode = self.cfg.data.get("answer_mode", "boxed")
         markdown_mode = answer_mode == "markdown"
+        gisa_markdown_mode = markdown_mode and self.cfg.data.get("is_gisa", False)
 
         processed_results = []
         total_queries = len(self.accumulated_raw_results)
@@ -339,6 +343,12 @@ class WideSeekR2AgentEvalRunner(AgentEvalRunner):
             )
             aggregated_metrics["max_item_f1@k"] = (
                 sum(acc["max_f1_k"]) / len(acc["max_f1_k"]) if acc["max_f1_k"] else 0.0
+            )
+            aggregated_metrics.update(
+                aggregate_gisa_markdown_metrics(
+                    self.accumulated_raw_results,
+                    enabled=gisa_markdown_mode,
+                )
             )
         else:
             aggregated_metrics["pass@1"] = (

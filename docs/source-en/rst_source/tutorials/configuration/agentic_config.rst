@@ -188,17 +188,29 @@ For WideSeek-R2 GISA data, enable the GISA-specific Markdown evaluator as follow
     is_gisa: True
 
 ``data.is_gisa`` defaults to ``False``. When enabled, all GISA answers use local,
-deterministic exact match (EM) and never call the judge model. Boxed ``item``
-records use binary EM on the direct answer string. Markdown ``table``, ``set``,
-and ``list`` records use exact cell matches and the corresponding precision and
-recall counts to calculate F1 (equivalently,
+deterministic matching and never call the judge model. Boxed ``item`` records use
+binary exact match (EM) on the direct answer string. Markdown ``table``, ``set``,
+and ``list`` records use exact content matches and the corresponding precision
+and recall counts to calculate F1 (equivalently,
 ``2 * matched_cells / (predicted_cells + reference_cells)``).
+They also report whole-answer EM. Set EM ignores order, list EM requires the
+exact sequence, and table EM follows the existing aligned exact-cell semantics.
+The resulting ``metrics.json`` contains ``item_f1@1``, ``avg_item_f1@k``, and
+``max_item_f1@k`` for cell F1, plus ``exact_match@1``,
+``avg_exact_match@k``, and ``max_exact_match@k`` for whole-answer EM. Table
+records additionally contain ``row_f1@1``, ``avg_row_f1@k``, and
+``max_row_f1@k``. List records additionally contain ``order_score@1``,
+``avg_order_score@k``, and ``max_order_score@k``. The ``avg`` metrics average all
+``k`` rollout scores; the ``max`` metrics average each question's best rollout.
 A missing ``answer_type`` defaults to ``table``, so ``set`` and ``list`` records
 must identify their type explicitly. Tables use column names for schema matching
 and ``unique_columns`` to align rows, so row order does not affect the score.
-Sets and lists discard the Markdown header and ``unique_columns`` metadata and
-compare from the first content row; sets ignore order and duplicate occurrences,
-while lists compare cells positionally and preserve duplicates. With
+Table row F1 treats every distinct complete row over the shared schema as one
+item. Sets and lists discard the Markdown header and ``unique_columns`` metadata
+and compare from the first content row. Sets ignore order and duplicate
+occurrences. List content F1 ignores order but counts duplicate occurrences;
+its order score uses ``difflib.SequenceMatcher`` and equals
+``2 * matching_elements / total_elements``. With
 ``data.is_hybrid: True``, a per-record ``is_markdown`` or ``answer_mode`` selects
 the output mode. For Markdown ``set`` and ``list`` records, the system prompt
 requires exactly one fenced, single-column Markdown pipe table with one item per

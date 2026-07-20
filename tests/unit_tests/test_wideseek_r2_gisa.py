@@ -20,6 +20,9 @@ import pytest
 from omegaconf import OmegaConf
 
 from rlinf.agents.wideseek_r2.utils import reward
+from rlinf.agents.wideseek_r2.utils.eval_metrics import (
+    aggregate_gisa_markdown_metrics,
+)
 from rlinf.data.datasets.wideseek_r2 import WideSeekR2Dataset
 
 
@@ -163,7 +166,7 @@ def test_gisa_set_cell_f1_ignores_header_order_and_duplicates():
     assert format_ok is True
 
 
-def test_gisa_list_cell_f1_ignores_header_but_requires_order():
+def test_gisa_list_content_f1_ignores_order_and_preserves_duplicates():
     label_answer = _gisa_markdown_label("list")
     ordered_answer = pd.DataFrame(
         {
@@ -178,10 +181,23 @@ def test_gisa_list_cell_f1_ignores_header_but_requires_order():
     reordered_answer = ordered_answer.iloc[::-1].reset_index(drop=True)
     partially_correct_answer = ordered_answer.copy()
     partially_correct_answer.loc[2, "Arbitrary header"] = "Peru"
+    duplicate_answer = ordered_answer.copy()
+    duplicate_answer.loc[3, "Arbitrary header"] = "Chile"
 
     assert _score_gisa(ordered_answer, label_answer) == (1.0, True)
-    assert _score_gisa(reordered_answer, label_answer) == (0.0, True)
+    assert _score_gisa(reordered_answer, label_answer) == (1.0, True)
     assert _score_gisa(partially_correct_answer, label_answer) == (0.75, True)
+    assert _score_gisa(duplicate_answer, label_answer) == (0.75, True)
+
+    reordered_scores, format_ok = reward.evaluate_gisa_markdown_scores(
+        reordered_answer, label_answer
+    )
+    assert format_ok is True
+    assert reordered_scores == {
+        "cell_f1": 1.0,
+        "order_score": pytest.approx(0.25),
+        "exact_match": 0.0,
+    }
 
 
 def test_gisa_table_cell_f1_aligns_rows_and_compares_cells():
@@ -207,6 +223,12 @@ def test_gisa_table_cell_f1_aligns_rows_and_compares_cells():
     assert _score_gisa(changed_header, label_answer) == (0.0, True)
     assert _score_gisa(reordered_answer, label_answer) == (1.0, True)
     assert _score_gisa(partially_correct_answer, label_answer) == (0.75, True)
+
+    partial_scores, format_ok = reward.evaluate_gisa_markdown_scores(
+        partially_correct_answer, label_answer
+    )
+    assert format_ok is True
+    assert partial_scores["row_f1"] == pytest.approx(0.5)
 
 
 def test_gisa_item_uses_em_without_judge_model():
@@ -264,3 +286,84 @@ def test_gisa_em_does_not_call_configured_judge_model():
     )
 
     assert (score, format_ok) == (1.0, True)
+
+
+def test_gisa_markdown_metrics_include_em_row_f1_and_order_score():
+    def raw_result(answer, final_answers):
+        return {
+            "group_size": len(final_answers),
+            "answer": answer,
+            "samples": [
+                {
+                    "turns": [],
+                    "total_turn_list": None,
+                    "final_answer_format": 1,
+                    "final_answer": final_answer.to_dict(orient="records"),
+                }
+                for final_answer in final_answers
+            ],
+        }
+
+    table_answer = {
+        "answer": (
+            "```markdown\n| Name | Country |\n| --- | --- |\n"
+            "| Alice | Chile |\n| Bob | Bolivia |\n```"
+        ),
+        "unique_columns": ["Name"],
+        "answer_mode": "markdown",
+        "answer_type": "table",
+    }
+    exact_table = pd.DataFrame(
+        {"Name": ["Alice", "Bob"], "Country": ["Chile", "Bolivia"]}
+    )
+    partial_table = exact_table.copy()
+    partial_table.loc[1, "Country"] = "Peru"
+
+    list_answer = _gisa_markdown_label("list")
+    exact_list = pd.DataFrame(
+        {"Any header": ["Chile", "Argentina", "Bolivia", "Ecuador"]}
+    )
+    reordered_list = exact_list.iloc[::-1].reset_index(drop=True)
+
+    set_answer = _gisa_markdown_label("set")
+    exact_set = exact_list.copy()
+    partial_set = exact_set.iloc[:2].copy()
+
+    raw_results = [
+        raw_result(table_answer, [exact_table, partial_table]),
+        raw_result(list_answer, [reordered_list, exact_list]),
+        raw_result(set_answer, [partial_set, exact_set]),
+    ]
+
+    metrics = aggregate_gisa_markdown_metrics(raw_results, enabled=True)
+
+    assert metrics["exact_match@1"] == pytest.approx(1 / 3)
+    assert metrics["avg_exact_match@k"] == pytest.approx(0.5)
+    assert metrics["max_exact_match@k"] == pytest.approx(1.0)
+    assert metrics["row_f1@1"] == pytest.approx(1.0)
+    assert metrics["avg_row_f1@k"] == pytest.approx(0.75)
+    assert metrics["max_row_f1@k"] == pytest.approx(1.0)
+    assert metrics["order_score@1"] == pytest.approx(0.25)
+    assert metrics["avg_order_score@k"] == pytest.approx(0.625)
+    assert metrics["max_order_score@k"] == pytest.approx(1.0)
+
+
+def test_non_gisa_markdown_metrics_do_not_include_exact_match():
+    raw_results = [
+        {
+            "group_size": 1,
+            "answer": {"answer_mode": "markdown", "answer_type": "table"},
+            "samples": [
+                {
+                    "turns": [],
+                    "total_turn_list": None,
+                    "final_answer_format": 1,
+                    "llm_reward": 1.0,
+                }
+            ],
+        }
+    ]
+
+    metrics = aggregate_gisa_markdown_metrics(raw_results, enabled=False)
+
+    assert metrics == {}

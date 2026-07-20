@@ -179,16 +179,28 @@ JSONL 记录可以将 ``answer_type`` 设置为 ``item``、``set``、``list`` �
     is_gisa: True
 
 ``data.is_gisa`` 默认为 ``False``。启用后，所有 GISA 答案均使用本地、
-确定性的精确匹配（EM），不会调用 judge model。boxed ``item`` 记录对答案
-字符串进行二值 EM。Markdown ``table``、``set`` 和 ``list`` 记录先逐 cell
-进行精确匹配，再根据相应的 precision 和 recall 计数计算 F1（等价于
-``2 * 匹配 cell 数 / (预测 cell 数 + 标准 cell 数)``）。缺少
+确定性匹配，不会调用 judge model。boxed ``item`` 记录对答案字符串进行二值
+精确匹配（EM）。Markdown ``table``、``set`` 和 ``list`` 记录先逐 cell
+进行内容精确匹配，再根据相应的 precision 和 recall 计数计算 F1（等价于
+``2 * 匹配 cell 数 / (预测 cell 数 + 标准 cell 数)``）。同时还会统计整答
+EM：set EM 忽略顺序，list EM 要求序列完全一致，table EM 沿用现有的对齐后
+逐 cell 精确匹配语义。生成的 ``metrics.json``
+会包含逐 cell F1 指标 ``item_f1@1``、``avg_item_f1@k`` 和
+``max_item_f1@k``，以及整答 EM 指标 ``exact_match@1``、
+``avg_exact_match@k`` 和 ``max_exact_match@k``。table 还会包含
+``row_f1@1``、``avg_row_f1@k`` 和 ``max_row_f1@k``；list 还会包含
+``order_score@1``、``avg_order_score@k`` 和 ``max_order_score@k``。
+``avg`` 指标取 ``k`` 次 rollout 得分的平均值，``max`` 指标取每道题 ``k`` 次
+rollout 中的最高分后再求平均。缺少
 ``answer_type`` 时默认按 ``table`` 处理，因此 ``set`` 和 ``list`` 记录必须
 显式标注类型。表格使用列名匹配 schema，并根据 ``unique_columns`` 对齐行，
-因此行顺序不影响得分。集合和列表会丢弃 Markdown 表头及
-``unique_columns`` 元数据，从第一行正式内容开始比较；集合忽略顺序和重复项，
-列表按位置比较并保留重复项。设置 ``data.is_hybrid: True`` 后，每条记录的
-``is_markdown`` 或 ``answer_mode`` 决定其输出模式。对于 Markdown ``set`` 和
+因此行顺序不影响得分。Table Row F1 将共享 schema 上每个不同的完整行视为
+一个 item。集合和列表会丢弃 Markdown 表头及 ``unique_columns`` 元数据，
+从第一行正式内容开始比较；集合忽略顺序和重复项。List 内容 F1 忽略顺序但
+保留重复项计数；Order Score 使用 ``difflib.SequenceMatcher``，计算公式为
+``2 * 匹配元素数 / 两个列表的元素总数``。设置 ``data.is_hybrid: True`` 后，
+每条记录的 ``is_markdown`` 或 ``answer_mode`` 决定其输出模式。对于 Markdown
+``set`` 和
 ``list`` 记录，system prompt 会要求只输出一个带围栏的单列 Markdown pipe
 table，每个 item 占一行，并明确禁止 JSON、Python list、项目符号列表和纯文本
 答案；``list`` 的各行必须遵循题目要求的顺序。
