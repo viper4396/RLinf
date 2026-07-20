@@ -15,6 +15,8 @@
 from rlinf.agents.wideseek_r2.utils.prompt import (
     BOXED_FORMAT_EN,
     MARKDOWN_FORMAT_EN,
+    MARKDOWN_LIST_FORMAT_EN,
+    MARKDOWN_SET_FORMAT_EN,
     PLANNER_ITEM_STRATEGY_EN,
     PLANNER_LIST_STRATEGY_EN,
     PLANNER_SET_STRATEGY_EN,
@@ -49,11 +51,13 @@ _SINGLE_AGENT_STRATEGIES = {
 }
 
 
-def _format_instruction(answer_mode: str) -> str:
+def _format_instruction(answer_mode: str, answer_type: str | None = None) -> str:
     """Return the final-answer format instruction for the given answer mode.
 
     Args:
         answer_mode: Either ``"markdown"`` or ``"boxed"``.
+        answer_type: Optional answer structure used to specialize Markdown
+            collection formatting.
 
     Returns:
         The format instruction string injected into the system prompt.
@@ -62,6 +66,13 @@ def _format_instruction(answer_mode: str) -> str:
         ValueError: If ``answer_mode`` is not a supported value.
     """
     if answer_mode == "markdown":
+        normalized_type = (
+            str(answer_type).strip().lower() if answer_type is not None else None
+        )
+        if normalized_type == "set":
+            return MARKDOWN_SET_FORMAT_EN
+        if normalized_type == "list":
+            return MARKDOWN_LIST_FORMAT_EN
         return MARKDOWN_FORMAT_EN
     if answer_mode == "boxed":
         return BOXED_FORMAT_EN
@@ -145,7 +156,7 @@ def get_prompt_planner(
     unlimited-mode few-shot is used; otherwise the capped few-shot injects the
     limit so the narrative matches the parser's enforcement.
     """
-    format_instruction = _format_instruction(answer_mode)
+    format_instruction = _format_instruction(answer_mode, answer_type)
     if add_few_shot:
         if max_workers_per_planner < 0:
             system = SYSTEM_PROMPT_PLANNER_UNLIMITED.format(format_instruction)
@@ -185,7 +196,7 @@ def get_prompt_single_agent(
     answer_type: str | None = None,
 ) -> list:
     """Build the single-agent prompt with optional few-shot examples."""
-    format_instruction = _format_instruction(answer_mode)
+    format_instruction = _format_instruction(answer_mode, answer_type)
     if add_few_shot:
         system = SYSTEM_PROMPT_SINGLE_AGENT.format(format_instruction)
     else:

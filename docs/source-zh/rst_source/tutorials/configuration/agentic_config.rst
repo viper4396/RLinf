@@ -188,7 +188,10 @@ JSONL 记录可以将 ``answer_type`` 设置为 ``item``、``set``、``list`` �
 因此行顺序不影响得分。集合和列表会丢弃 Markdown 表头及
 ``unique_columns`` 元数据，从第一行正式内容开始比较；集合忽略顺序和重复项，
 列表按位置比较并保留重复项。设置 ``data.is_hybrid: True`` 后，每条记录的
-``is_markdown`` 或 ``answer_mode`` 决定其输出模式。
+``is_markdown`` 或 ``answer_mode`` 决定其输出模式。对于 Markdown ``set`` 和
+``list`` 记录，system prompt 会要求只输出一个带围栏的单列 Markdown pipe
+table，每个 item 占一行，并明确禁止 JSON、Python list、项目符号列表和纯文本
+答案；``list`` 的各行必须遵循题目要求的顺序。
 
 actor
 ~~~~~~~~~~~~~~~

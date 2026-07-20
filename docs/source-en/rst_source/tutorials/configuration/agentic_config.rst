@@ -200,7 +200,10 @@ Sets and lists discard the Markdown header and ``unique_columns`` metadata and
 compare from the first content row; sets ignore order and duplicate occurrences,
 while lists compare cells positionally and preserve duplicates. With
 ``data.is_hybrid: True``, a per-record ``is_markdown`` or ``answer_mode`` selects
-the output mode.
+the output mode. For Markdown ``set`` and ``list`` records, the system prompt
+requires exactly one fenced, single-column Markdown pipe table with one item per
+row and explicitly rejects JSON, Python-list, bullet-list, and plain-text answer
+formats. List rows must follow the requested order.
 
 actor
 ~~~~~~~~~~~~~~~

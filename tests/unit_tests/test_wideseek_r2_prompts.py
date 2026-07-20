@@ -87,6 +87,43 @@ def test_single_agent_noshot_injects_selected_answer_type_strategy(
     assert "\\boxed" in system_prompt
 
 
+@pytest.mark.parametrize(
+    ("prompt_builder", "answer_type", "order_instruction"),
+    [
+        ("planner", "set", "Row order does not matter"),
+        ("planner", "list", "in the exact required order"),
+        ("single", "set", "Row order does not matter"),
+        ("single", "list", "in the exact required order"),
+    ],
+)
+def test_markdown_set_and_list_prompts_require_pipe_tables(
+    prompt_builder: str, answer_type: str, order_instruction: str
+):
+    if prompt_builder == "planner":
+        messages = get_prompt_planner(
+            question="Research this task.",
+            answer_mode="markdown",
+            add_few_shot=False,
+            max_workers_per_planner=4,
+            answer_type=answer_type,
+        )
+    else:
+        messages = get_prompt_single_agent(
+            question="Research this task.",
+            answer_mode="markdown",
+            add_few_shot=False,
+            answer_type=answer_type,
+        )
+
+    system_prompt = messages[0]["content"]
+    assert "after closing `</think>`" in system_prompt
+    assert "output only one fenced Markdown pipe table" in system_prompt
+    assert "| Item |" in system_prompt
+    assert "each " + answer_type + " " in system_prompt
+    assert order_instruction in system_prompt
+    assert "pipe table, NOT JSON" in system_prompt
+
+
 def test_noshot_prompt_answer_type_falls_back_from_answer_mode():
     planner_system = get_prompt_planner(
         question="Research this task.",

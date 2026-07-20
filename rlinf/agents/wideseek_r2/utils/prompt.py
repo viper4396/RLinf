@@ -414,6 +414,22 @@ Provide a detailed answer and supporting information for this task."""
 
 BOXED_FORMAT_EN = "If you determine that no further external knowledge is required, you have to wrap your final answer in \\boxed{}."
 MARKDOWN_FORMAT_EN = "If you determine that no further external knowledge is required, you have to wrap your final answer in the following format \n```markdown\n{data_content}\n```"
+MARKDOWN_SET_FORMAT_EN = """If you determine that no further external knowledge is required, then after closing `</think>` you MUST output only one fenced Markdown pipe table in this form:
+```markdown
+| Item |
+| :--- |
+| first set member |
+| second set member |
+```
+Put each set member in its own row under the single `Item` column. Row order does not matter, and duplicate members must be removed. The fenced content must be a pipe table, NOT JSON. Do NOT output a JSON object or array, Python list, bullets, comma-separated text, or additional prose."""
+MARKDOWN_LIST_FORMAT_EN = """If you determine that no further external knowledge is required, then after closing `</think>` you MUST output only one fenced Markdown pipe table in this form:
+```markdown
+| Item |
+| :--- |
+| first list item |
+| second list item |
+```
+Put each list item in its own row under the single `Item` column, in the exact required order. Preserve meaningful duplicate items. The fenced content must be a pipe table, NOT JSON. Do NOT output a JSON object or array, Python list, bullets, comma-separated text, or additional prose."""
 
 
 LLM_JUDGE_PROMPT = """Question: {question}
