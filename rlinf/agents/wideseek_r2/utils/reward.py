@@ -231,39 +231,92 @@ def _normalize_em_value(value) -> str:
     return "" if pd.isna(value) else str(value).strip()
 
 
-def _markdown_contents(answer) -> list | None:
-    """Return Markdown-table row contents without exposing column names."""
+def _flatten_markdown_contents(answer) -> list[str] | None:
+    """Return normalized Markdown data cells in row-major order."""
     answer_df = _markdown_dataframe(answer)
     if answer_df is None:
         return None
-
-    contents = []
-    for row in answer_df.itertuples(index=False, name=None):
-        normalized_row = [_normalize_em_value(value) for value in row]
-        contents.append(
-            normalized_row[0] if len(normalized_row) == 1 else normalized_row
-        )
-    return contents
-
-
-def _markdown_table_signature(answer) -> tuple | None:
-    """Return exact ordered headers and rows for a Markdown table."""
-    answer_df = _markdown_dataframe(answer)
-    if answer_df is None:
-        return None
-    columns = tuple(_normalize_em_value(column) for column in answer_df.columns)
-    rows = tuple(
-        tuple(_normalize_em_value(value) for value in row)
+    return [
+        _normalize_em_value(value)
         for row in answer_df.itertuples(index=False, name=None)
+        for value in row
+    ]
+
+
+def _cell_f1(true_positives: int, num_predictions: int, num_references: int) -> float:
+    """Calculate F1 from exact cell matches and cell counts."""
+    denominator = num_predictions + num_references
+    return 2.0 * true_positives / denominator if denominator else 0.0
+
+
+def _normalize_table_column(column) -> str:
+    """Normalize a table column name for schema and row-key alignment."""
+    return _normalize_em_value(column).lower()
+
+
+def _gisa_table_cell_f1(correct_answer, predicted_answer, unique_columns) -> float:
+    """Calculate exact cell F1 after aligning table rows by unique columns."""
+    correct_df = _markdown_dataframe(correct_answer)
+    predicted_df = _markdown_dataframe(predicted_answer)
+    if correct_df is None or predicted_df is None:
+        return 0.0
+
+    correct_df = correct_df.copy()
+    predicted_df = predicted_df.copy()
+    correct_df.columns = [
+        _normalize_table_column(column) for column in correct_df.columns
+    ]
+    predicted_df.columns = [
+        _normalize_table_column(column) for column in predicted_df.columns
+    ]
+
+    num_references = correct_df.size
+    num_predictions = predicted_df.size
+    if correct_df.columns.has_duplicates or predicted_df.columns.has_duplicates:
+        return _cell_f1(0, num_predictions, num_references)
+
+    correct_columns = set(correct_df.columns)
+    predicted_columns = set(predicted_df.columns)
+    shared_columns = [
+        column for column in correct_df.columns if column in predicted_columns
+    ]
+    normalized_unique_columns = [
+        _normalize_table_column(column) for column in (unique_columns or [])
+    ]
+
+    if normalized_unique_columns and not set(normalized_unique_columns).issubset(
+        correct_columns & predicted_columns
+    ):
+        return _cell_f1(0, num_predictions, num_references)
+
+    def normalized_row(df: pd.DataFrame, row_index: int, columns: list[str]) -> tuple:
+        return tuple(
+            _normalize_em_value(df.iloc[row_index][column]) for column in columns
+        )
+
+    aligned_rows = []
+    if normalized_unique_columns:
+        predicted_rows_by_key: dict[tuple, list[int]] = {}
+        for row_index in range(len(predicted_df)):
+            key = normalized_row(predicted_df, row_index, normalized_unique_columns)
+            predicted_rows_by_key.setdefault(key, []).append(row_index)
+
+        for correct_index in range(len(correct_df)):
+            key = normalized_row(correct_df, correct_index, normalized_unique_columns)
+            predicted_indices = predicted_rows_by_key.get(key)
+            if predicted_indices:
+                aligned_rows.append((correct_index, predicted_indices.pop(0)))
+    else:
+        aligned_rows = list(range(min(len(correct_df), len(predicted_df))))
+        aligned_rows = [(row_index, row_index) for row_index in aligned_rows]
+
+    true_positives = sum(
+        _normalize_em_value(correct_df.iloc[correct_index][column])
+        == _normalize_em_value(predicted_df.iloc[predicted_index][column])
+        for correct_index, predicted_index in aligned_rows
+        for column in shared_columns
     )
-    return columns, rows
-
-
-def _freeze_content(value):
-    """Convert nested row content into a hashable exact-match value."""
-    if isinstance(value, list):
-        return tuple(_freeze_content(item) for item in value)
-    return value
+    return _cell_f1(true_positives, num_predictions, num_references)
 
 
 def evaluate_gisa_exact_match(
@@ -272,16 +325,16 @@ def evaluate_gisa_exact_match(
 ) -> tuple[float, bool]:
     """Evaluate every GISA answer locally with deterministic exact match.
 
-    Item answers use direct string EM. Markdown tables compare ordered headers
-    and rows. Sets and lists discard headers and compare only content rows;
-    sets ignore order while lists preserve it.
+    Item answers use binary string EM. Markdown answers aggregate exact cell
+    matches into F1. Tables align rows using unique columns, sets ignore cell
+    order and duplicates, and lists compare cells positionally.
 
     Args:
         extract_answer: Parsed prediction DataFrame.
         label_answer: Ground-truth answer payload.
 
     Returns:
-        ``(score, format_ok)`` with a deterministic binary EM score.
+        ``(score, format_ok)``. Markdown scores are cell-level F1 values.
     """
     answer_type = label_answer.get("answer_type")
     answer_mode = label_answer.get("answer_mode")
@@ -303,26 +356,42 @@ def evaluate_gisa_exact_match(
 
     correct_answer = label_answer.get("answer", "")
     if answer_type == "table":
-        correct_table = _markdown_table_signature(correct_answer)
-        predicted_table = _markdown_table_signature(extract_answer)
-        if correct_table is None or predicted_table is None:
+        correct_df = _markdown_dataframe(correct_answer)
+        predicted_df = _markdown_dataframe(extract_answer)
+        if correct_df is None or predicted_df is None:
             return 0.0, False
-        return float(predicted_table == correct_table), True
+        return (
+            _gisa_table_cell_f1(
+                correct_df,
+                predicted_df,
+                label_answer.get("unique_columns", []),
+            ),
+            True,
+        )
 
     if answer_type not in {"set", "list"}:
         return 0.0, False
 
-    correct_contents = _markdown_contents(correct_answer)
-    predicted_contents = _markdown_contents(extract_answer)
+    correct_contents = _flatten_markdown_contents(correct_answer)
+    predicted_contents = _flatten_markdown_contents(extract_answer)
     if correct_contents is None or predicted_contents is None:
         return 0.0, False
 
     if answer_type == "set":
-        correct_values = {_freeze_content(value) for value in correct_contents}
-        predicted_values = {_freeze_content(value) for value in predicted_contents}
-        return float(predicted_values == correct_values), True
+        correct_values = set(correct_contents)
+        predicted_values = set(predicted_contents)
+        true_positives = len(correct_values & predicted_values)
+        return _cell_f1(
+            true_positives, len(predicted_values), len(correct_values)
+        ), True
 
-    return float(predicted_contents == correct_contents), True
+    true_positives = sum(
+        predicted == correct
+        for predicted, correct in zip(predicted_contents, correct_contents)
+    )
+    return _cell_f1(
+        true_positives, len(predicted_contents), len(correct_contents)
+    ), True
 
 
 async def evaluate_markdown(

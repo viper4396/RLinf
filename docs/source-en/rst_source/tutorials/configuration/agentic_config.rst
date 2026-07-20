@@ -189,14 +189,18 @@ For WideSeek-R2 GISA data, enable the GISA-specific Markdown evaluator as follow
 
 ``data.is_gisa`` defaults to ``False``. When enabled, all GISA answers use local,
 deterministic exact match (EM) and never call the judge model. Boxed ``item``
-records compare the direct answer string. Markdown records support ``table``,
-``set``, or ``list``; a missing ``answer_type`` defaults to ``table``, so
-``set`` and ``list`` records must identify their type explicitly. Tables compare
-column names, row order, and cell contents exactly. Sets and lists discard the
-Markdown header and ``unique_columns`` metadata and compare from the first
-content row; set order and duplicate occurrences are ignored, while list order
-and duplicates are strict. With ``data.is_hybrid: True``, a per-record
-``is_markdown`` or ``answer_mode`` selects the output mode.
+records use binary EM on the direct answer string. Markdown ``table``, ``set``,
+and ``list`` records use exact cell matches and the corresponding precision and
+recall counts to calculate F1 (equivalently,
+``2 * matched_cells / (predicted_cells + reference_cells)``).
+A missing ``answer_type`` defaults to ``table``, so ``set`` and ``list`` records
+must identify their type explicitly. Tables use column names for schema matching
+and ``unique_columns`` to align rows, so row order does not affect the score.
+Sets and lists discard the Markdown header and ``unique_columns`` metadata and
+compare from the first content row; sets ignore order and duplicate occurrences,
+while lists compare cells positionally and preserve duplicates. With
+``data.is_hybrid: True``, a per-record ``is_markdown`` or ``answer_mode`` selects
+the output mode.
 
 actor
 ~~~~~~~~~~~~~~~

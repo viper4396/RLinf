@@ -179,14 +179,16 @@ JSONL 记录可以将 ``answer_type`` 设置为 ``item``、``set``、``list`` �
     is_gisa: True
 
 ``data.is_gisa`` 默认为 ``False``。启用后，所有 GISA 答案均使用本地、
-确定性的精确匹配（EM），不会调用 judge model。boxed ``item`` 记录直接比较
-答案字符串。Markdown 记录支持 ``table``、``set`` 或 ``list``；缺少
+确定性的精确匹配（EM），不会调用 judge model。boxed ``item`` 记录对答案
+字符串进行二值 EM。Markdown ``table``、``set`` 和 ``list`` 记录先逐 cell
+进行精确匹配，再根据相应的 precision 和 recall 计数计算 F1（等价于
+``2 * 匹配 cell 数 / (预测 cell 数 + 标准 cell 数)``）。缺少
 ``answer_type`` 时默认按 ``table`` 处理，因此 ``set`` 和 ``list`` 记录必须
-显式标注类型。表格严格比较列名、行顺序和单元格内容；集合和列表会丢弃
-Markdown 表头及 ``unique_columns`` 元数据，从第一行正式内容开始比较，
-其中集合忽略顺序和重复项，列表严格比较顺序和重复项。设置
-``data.is_hybrid: True`` 后，每条记录的 ``is_markdown`` 或 ``answer_mode``
-决定其输出模式。
+显式标注类型。表格使用列名匹配 schema，并根据 ``unique_columns`` 对齐行，
+因此行顺序不影响得分。集合和列表会丢弃 Markdown 表头及
+``unique_columns`` 元数据，从第一行正式内容开始比较；集合忽略顺序和重复项，
+列表按位置比较并保留重复项。设置 ``data.is_hybrid: True`` 后，每条记录的
+``is_markdown`` 或 ``answer_mode`` 决定其输出模式。
 
 actor
 ~~~~~~~~~~~~~~~

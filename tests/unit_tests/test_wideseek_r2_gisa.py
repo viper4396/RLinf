@@ -141,7 +141,7 @@ def _score_gisa(extract_answer, label_answer, answer_mode="markdown"):
     )
 
 
-def test_gisa_set_em_ignores_header_order_and_duplicates():
+def test_gisa_set_cell_f1_ignores_header_order_and_duplicates():
     label_answer = _gisa_markdown_label("set")
     predicted_answer = pd.DataFrame(
         {
@@ -158,10 +158,12 @@ def test_gisa_set_em_ignores_header_order_and_duplicates():
     assert _score_gisa(predicted_answer, label_answer) == (1.0, True)
 
     predicted_answer.loc[len(predicted_answer)] = "Peru"
-    assert _score_gisa(predicted_answer, label_answer) == (0.0, True)
+    score, format_ok = _score_gisa(predicted_answer, label_answer)
+    assert score == pytest.approx(8 / 9)
+    assert format_ok is True
 
 
-def test_gisa_list_em_ignores_header_but_requires_order():
+def test_gisa_list_cell_f1_ignores_header_but_requires_order():
     label_answer = _gisa_markdown_label("list")
     ordered_answer = pd.DataFrame(
         {
@@ -174,12 +176,15 @@ def test_gisa_list_em_ignores_header_but_requires_order():
         }
     )
     reordered_answer = ordered_answer.iloc[::-1].reset_index(drop=True)
+    partially_correct_answer = ordered_answer.copy()
+    partially_correct_answer.loc[2, "Arbitrary header"] = "Peru"
 
     assert _score_gisa(ordered_answer, label_answer) == (1.0, True)
     assert _score_gisa(reordered_answer, label_answer) == (0.0, True)
+    assert _score_gisa(partially_correct_answer, label_answer) == (0.75, True)
 
 
-def test_gisa_table_em_compares_headers_rows_and_cells():
+def test_gisa_table_cell_f1_aligns_rows_and_compares_cells():
     label_answer = {
         "answer": (
             "```markdown\n| Name | Country |\n| --- | --- |\n"
@@ -195,10 +200,13 @@ def test_gisa_table_em_compares_headers_rows_and_cells():
     )
     changed_header = exact_answer.rename(columns={"Name": "Person"})
     reordered_answer = exact_answer.iloc[::-1].reset_index(drop=True)
+    partially_correct_answer = exact_answer.copy()
+    partially_correct_answer.loc[1, "Country"] = "Peru"
 
     assert _score_gisa(exact_answer, label_answer) == (1.0, True)
     assert _score_gisa(changed_header, label_answer) == (0.0, True)
-    assert _score_gisa(reordered_answer, label_answer) == (0.0, True)
+    assert _score_gisa(reordered_answer, label_answer) == (1.0, True)
+    assert _score_gisa(partially_correct_answer, label_answer) == (0.75, True)
 
 
 def test_gisa_item_uses_em_without_judge_model():
