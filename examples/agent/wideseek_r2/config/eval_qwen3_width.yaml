@@ -38,7 +38,7 @@ data:
   val_rollout_batch_size: 128
   prompt_key: question
   answer_key: answer
-  answer_mode: markdown
+  answer_type: table
   norm_column: False
   unique_columns: unique_columns 
   validation_shuffle: False

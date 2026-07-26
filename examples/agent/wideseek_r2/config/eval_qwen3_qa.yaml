@@ -37,7 +37,7 @@ data:
   val_rollout_batch_size: 128
   prompt_key: question
   answer_key: answer
-  answer_mode: boxed
+  answer_type: item
   val_data_paths: /mnt/project_rlinf/xzxuan/data/Asearch_train/ASearcher-LRM-35k.jsonl # TODO:(USER) Replace with the actual path to the evaluation dataset
   validation_shuffle: False
   data_size: 128

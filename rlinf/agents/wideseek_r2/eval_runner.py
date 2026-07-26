@@ -25,7 +25,7 @@ from omegaconf.dictconfig import DictConfig
 from torch.utils.data import Dataset
 
 from rlinf.agents.wideseek_r2.utils.eval_metrics import (
-    aggregate_gisa_markdown_metrics,
+    aggregate_gisa_metrics,
 )
 from rlinf.data.io_struct import DynamicRolloutResult
 from rlinf.runners.agent_eval_runner import AgentEvalRunner
@@ -161,6 +161,7 @@ class WideSeekR2AgentEvalRunner(AgentEvalRunner):
                     "final_answer": final_answer,
                     "final_answer_text": sample.get("final_answer_text", None),
                     "llm_reward": sample.get("llm_reward", 0.0),
+                    "gisa_metrics": sample.get("gisa_metrics", {}),
                     "final_answer_format": sample.get("final_answer_format", 0),
                     "num_turns": sample.get("num_turns", 0),
                     "origin_question": sample.get("origin_question", None),
@@ -179,9 +180,7 @@ class WideSeekR2AgentEvalRunner(AgentEvalRunner):
         Returns:
             Tuple of `(processed_results, aggregated_metrics)`.
         """
-        answer_mode = self.cfg.data.get("answer_mode", "boxed")
-        markdown_mode = answer_mode == "markdown"
-        gisa_markdown_mode = markdown_mode and self.cfg.data.get("is_gisa", False)
+        gisa_mode = self.cfg.data.get("is_gisa", False)
 
         processed_results = []
         total_queries = len(self.accumulated_raw_results)
@@ -212,10 +211,7 @@ class WideSeekR2AgentEvalRunner(AgentEvalRunner):
         mas_sum_num_subagents = 0
         mas_num_valid_trajs = 0
 
-        if markdown_mode:
-            acc = {"f1_1": [], "avg_f1_k": [], "max_f1_k": []}
-        else:
-            acc = {"pass1": [], "passk": [], "avgk": []}
+        acc = {"f1_1": [], "avg_f1_k": [], "max_f1_k": []}
 
         for idx, raw_result in enumerate(self.accumulated_raw_results):
             group_size = raw_result.get("group_size", 1)
@@ -315,14 +311,9 @@ class WideSeekR2AgentEvalRunner(AgentEvalRunner):
 
             values = [float(sample.get("llm_reward", 0) or 0) for sample in samples]
             if values:
-                if markdown_mode:
-                    acc["f1_1"].append(values[0])
-                    acc["avg_f1_k"].append(sum(values) / len(values))
-                    acc["max_f1_k"].append(max(values))
-                else:
-                    acc["pass1"].append(1.0 if values[0] > 0 else 0.0)
-                    acc["avgk"].append(sum(values) / len(values))
-                    acc["passk"].append(1.0 if any(v > 0 for v in values) else 0.0)
+                acc["f1_1"].append(values[0])
+                acc["avg_f1_k"].append(sum(values) / len(values))
+                acc["max_f1_k"].append(max(values))
 
             processed_results.append(
                 {
@@ -333,8 +324,12 @@ class WideSeekR2AgentEvalRunner(AgentEvalRunner):
                 }
             )
 
-        aggregated_metrics = {}
-        if markdown_mode:
+        if gisa_mode:
+            aggregated_metrics = aggregate_gisa_metrics(
+                self.accumulated_raw_results, enabled=True
+            )
+        else:
+            aggregated_metrics = {}
             aggregated_metrics["item_f1@1"] = (
                 sum(acc["f1_1"]) / len(acc["f1_1"]) if acc["f1_1"] else 0.0
             )
@@ -343,22 +338,6 @@ class WideSeekR2AgentEvalRunner(AgentEvalRunner):
             )
             aggregated_metrics["max_item_f1@k"] = (
                 sum(acc["max_f1_k"]) / len(acc["max_f1_k"]) if acc["max_f1_k"] else 0.0
-            )
-            aggregated_metrics.update(
-                aggregate_gisa_markdown_metrics(
-                    self.accumulated_raw_results,
-                    enabled=gisa_markdown_mode,
-                )
-            )
-        else:
-            aggregated_metrics["pass@1"] = (
-                sum(acc["pass1"]) / len(acc["pass1"]) if acc["pass1"] else 0.0
-            )
-            aggregated_metrics["avg@k"] = (
-                sum(acc["avgk"]) / len(acc["avgk"]) if acc["avgk"] else 0.0
-            )
-            aggregated_metrics["pass@k"] = (
-                sum(acc["passk"]) / len(acc["passk"]) if acc["passk"] else 0.0
             )
 
         if total_num_turns > 0:
@@ -490,6 +469,7 @@ class WideSeekR2AgentEvalRunner(AgentEvalRunner):
             extra_fields_traj.get("final_answer_format") or [0] * group_size
         )
         llm_reward_metric = extra_fields_traj.get("llm_reward") or [0.0] * group_size
+        gisa_metrics_metric = extra_fields_traj.get("gisa_metrics") or [{}] * group_size
 
         def _safe_idx(values, idx, default=None):
             """Safely index a list-like container with a default fallback."""
@@ -512,6 +492,7 @@ class WideSeekR2AgentEvalRunner(AgentEvalRunner):
                 _safe_idx(final_answer_format_metric, traj_idx, 0) or 0
             )
             llm_reward = _safe_idx(llm_reward_metric, traj_idx, 0.0) or 0.0
+            gisa_metrics = _safe_idx(gisa_metrics_metric, traj_idx, {}) or {}
 
             turn_idxes = [
                 i for i, j in enumerate(rollout_result.idx_to_traj) if j == traj_idx
@@ -571,6 +552,7 @@ class WideSeekR2AgentEvalRunner(AgentEvalRunner):
                     "total_turn_list": total_turn_list,
                     "final_answer_format": float(final_answer_format),
                     "llm_reward": float(llm_reward),
+                    "gisa_metrics": gisa_metrics,
                 }
             )
 

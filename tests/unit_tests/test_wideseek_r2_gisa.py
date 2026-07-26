@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import ast
 import asyncio
 import json
 
@@ -20,9 +21,7 @@ import pytest
 from omegaconf import OmegaConf
 
 from rlinf.agents.wideseek_r2.utils import reward
-from rlinf.agents.wideseek_r2.utils.eval_metrics import (
-    aggregate_gisa_markdown_metrics,
-)
+from rlinf.agents.wideseek_r2.utils.eval_metrics import aggregate_gisa_metrics
 from rlinf.data.datasets.wideseek_r2 import WideSeekR2Dataset
 
 
@@ -34,7 +33,7 @@ class _Tokenizer:
         return [1, 2]
 
 
-def _build_dataset(tmp_path, record, *, answer_mode="boxed"):
+def _build_dataset(tmp_path, record, *, default_answer_type="table"):
     data_path = tmp_path / "gisa.jsonl"
     data_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
     config = OmegaConf.create(
@@ -46,8 +45,7 @@ def _build_dataset(tmp_path, record, *, answer_mode="boxed"):
                 "apply_chat_template": False,
                 "filter_prompt_by_length": False,
                 "data_size": -1,
-                "answer_mode": answer_mode,
-                "is_hybrid": True,
+                "answer_type": default_answer_type,
                 "is_gisa": True,
                 "unique_columns": "unique_columns",
             }
@@ -56,191 +54,229 @@ def _build_dataset(tmp_path, record, *, answer_mode="boxed"):
     return WideSeekR2Dataset(str(data_path), config, _Tokenizer())
 
 
-def test_gisa_markdown_record_carries_answer_type(tmp_path):
+def _canonical(value) -> str:
+    text = str(value).strip().lower()
+    return (
+        text.replace("republic of chile", "chile")
+        .replace("santiago de chile", "santiago")
+        .replace("plurinational state of bolivia", "bolivia")
+    )
+
+
+class _SemanticJudge:
+    def __init__(self):
+        self.calls = []
+
+    async def __call__(self, messages):
+        self.calls.append(messages)
+        user_content = messages[-1]["content"]
+        if "idx_0" not in user_content:
+            return (
+                "Correct"
+                if "republic of chile" in user_content.lower()
+                and "chile" in user_content.lower()
+                else "Incorrect"
+            )
+
+        payload_text = user_content[
+            user_content.find("{") : user_content.rfind("}") + 1
+        ]
+        payload = ast.literal_eval(payload_text)
+        scores = {
+            index: float(_canonical(pair["response"]) == _canonical(pair["target"]))
+            for index, pair in payload.items()
+        }
+        return f"```json\n{json.dumps(scores)}\n```"
+
+
+def _score_gisa(extract_answer, label_answer, judge):
+    return asyncio.run(
+        reward.get_final_reward_score(
+            origin_question="Name the countries.",
+            extract_answer=extract_answer,
+            label_answer=label_answer,
+            norm_column=False,
+            judge_llm_generator=judge,
+        )
+    )
+
+
+def test_gisa_record_carries_answer_type(tmp_path):
     record = {
         "question": "Name the colors.",
         "answer": "```markdown\n| Item |\n| --- |\n| red |\n```",
         "unique_columns": ["Item"],
-        "is_markdown": True,
         "answer_type": "set",
     }
 
     answer = _build_dataset(tmp_path, record)[0].answer
 
-    assert answer["answer_mode"] == "markdown"
     assert answer["is_gisa"] is True
     assert answer["answer_type"] == "set"
 
 
-def test_gisa_boxed_record_carries_item_type(tmp_path):
+def test_gisa_item_record_uses_unified_markdown_payload(tmp_path):
     record = {
         "question": "Name one color.",
         "answer": "red",
         "unique_columns": None,
-        "is_markdown": False,
+        "answer_type": "item",
     }
 
-    answer = _build_dataset(tmp_path, record, answer_mode="markdown")[0].answer
+    answer = _build_dataset(tmp_path, record)[0].answer
 
     assert answer == {
-        "answer": ["red"],
-        "answer_mode": "boxed",
+        "answer": "red",
+        "unique_columns": None,
         "instance_id": 0,
         "is_gisa": True,
         "answer_type": "item",
     }
 
 
-def test_gisa_markdown_record_defaults_to_table_type(tmp_path):
+def test_gisa_record_defaults_to_table_type(tmp_path):
     record = {
         "question": "Describe the colors.",
         "answer": "```markdown\n| Item | Value |\n| --- | --- |\n| red | warm |\n```",
-        "is_markdown": True,
     }
 
     answer = _build_dataset(tmp_path, record)[0].answer
 
-    assert answer["answer_mode"] == "markdown"
     assert answer["answer_type"] == "table"
 
 
-def test_gisa_markdown_record_requires_supported_answer_type(tmp_path):
-    record = {
-        "question": "Name one color.",
-        "answer": "```markdown\n| Item |\n| --- |\n| red |\n```",
-        "is_markdown": True,
+def test_gisa_item_uses_semantic_cell_judge():
+    judge = _SemanticJudge()
+    label_answer = {
+        "answer": ["Chile"],
+        "is_gisa": True,
         "answer_type": "item",
     }
 
-    dataset = _build_dataset(tmp_path, record)
+    result = _score_gisa(
+        pd.DataFrame({"Item": ["Republic of Chile"]}),
+        label_answer,
+        judge,
+    )
 
-    with pytest.raises(ValueError, match="table, set, or list"):
-        dataset[0]
+    assert result == (1.0, True, {"cell_f1": 1.0, "pass": 1.0})
+    assert len(judge.calls) == 1
 
 
-def _gisa_markdown_label(answer_type):
-    return {
-        "answer": (
-            "```markdown\n| Item |\n| :--- |\n| Chile |\n| Argentina |\n"
-            "| Bolivia |\n| Ecuador |\n```"
-        ),
-        "unique_columns": ["Item"],
-        "answer_mode": "markdown",
+def test_gisa_set_f1_uses_semantic_cell_matching():
+    judge = _SemanticJudge()
+    label_answer = {
+        "answer": ("```markdown\n| Item |\n| --- |\n| Chile |\n| Bolivia |\n```"),
         "is_gisa": True,
-        "answer_type": answer_type,
+        "answer_type": "set",
     }
-
-
-def _score_gisa(extract_answer, label_answer, answer_mode="markdown"):
-    return asyncio.run(
-        reward.get_final_reward_score(
-            origin_question="Name the countries.",
-            extract_answer=extract_answer,
-            label_answer=label_answer,
-            answer_mode=answer_mode,
-            norm_column=False,
-            judge_llm_generator=None,
-        )
+    prediction = pd.DataFrame(
+        {"Item": ["Plurinational State of Bolivia", "Republic of Chile"]}
     )
 
+    score, format_ok, metrics = _score_gisa(prediction, label_answer, judge)
 
-def test_gisa_set_cell_f1_ignores_header_order_and_duplicates():
-    label_answer = _gisa_markdown_label("set")
-    predicted_answer = pd.DataFrame(
-        {
-            "Arbitrary header": [
-                "Ecuador",
-                "Chile",
-                "Bolivia",
-                "Argentina",
-                "Chile",
-            ]
-        }
-    )
-
-    assert _score_gisa(predicted_answer, label_answer) == (1.0, True)
-
-    predicted_answer.loc[len(predicted_answer)] = "Peru"
-    score, format_ok = _score_gisa(predicted_answer, label_answer)
-    assert score == pytest.approx(8 / 9)
+    assert score == 1.0
     assert format_ok is True
+    assert metrics == {"cell_f1": 1.0, "pass": 1.0}
+    assert len(judge.calls) == 1
 
 
-def test_gisa_list_content_f1_ignores_order_and_preserves_duplicates():
-    label_answer = _gisa_markdown_label("list")
-    ordered_answer = pd.DataFrame(
-        {
-            "Arbitrary header": [
-                "Chile",
-                "Argentina",
-                "Bolivia",
-                "Ecuador",
-            ]
-        }
+def test_gisa_list_preserves_semantic_f1_and_order_score():
+    judge = _SemanticJudge()
+    label_answer = {
+        "answer": ("```markdown\n| Item |\n| --- |\n| Chile |\n| Bolivia |\n```"),
+        "is_gisa": True,
+        "answer_type": "list",
+    }
+    reversed_prediction = pd.DataFrame(
+        {"Item": ["Plurinational State of Bolivia", "Republic of Chile"]}
     )
-    reordered_answer = ordered_answer.iloc[::-1].reset_index(drop=True)
-    partially_correct_answer = ordered_answer.copy()
-    partially_correct_answer.loc[2, "Arbitrary header"] = "Peru"
-    duplicate_answer = ordered_answer.copy()
-    duplicate_answer.loc[3, "Arbitrary header"] = "Chile"
 
-    assert _score_gisa(ordered_answer, label_answer) == (1.0, True)
-    assert _score_gisa(reordered_answer, label_answer) == (1.0, True)
-    assert _score_gisa(partially_correct_answer, label_answer) == (0.75, True)
-    assert _score_gisa(duplicate_answer, label_answer) == (0.75, True)
+    score, format_ok, metrics = _score_gisa(reversed_prediction, label_answer, judge)
 
-    reordered_scores, format_ok = reward.evaluate_gisa_markdown_scores(
-        reordered_answer, label_answer
-    )
+    assert score == 1.0
     assert format_ok is True
-    assert reordered_scores == {
+    assert metrics == {
         "cell_f1": 1.0,
-        "order_score": pytest.approx(0.25),
-        "exact_match": 0.0,
+        "order_score": pytest.approx(0.5),
+        "pass": 0.0,
     }
 
 
-def test_gisa_table_cell_f1_aligns_rows_and_compares_cells():
+def test_gisa_table_uses_cell_and_row_judges():
+    judge = _SemanticJudge()
     label_answer = {
         "answer": (
             "```markdown\n| Name | Country |\n| --- | --- |\n"
             "| Alice | Chile |\n| Bob | Bolivia |\n```"
         ),
         "unique_columns": ["Name"],
-        "answer_mode": "markdown",
         "is_gisa": True,
         "answer_type": "table",
     }
-    exact_answer = pd.DataFrame(
-        {"Name": ["Alice", "Bob"], "Country": ["Chile", "Bolivia"]}
+    prediction = pd.DataFrame(
+        {
+            "Name": ["Alice", "Bob"],
+            "Country": ["Republic of Chile", "Peru"],
+        }
     )
-    changed_header = exact_answer.rename(columns={"Name": "Person"})
-    reordered_answer = exact_answer.iloc[::-1].reset_index(drop=True)
-    partially_correct_answer = exact_answer.copy()
-    partially_correct_answer.loc[1, "Country"] = "Peru"
 
-    assert _score_gisa(exact_answer, label_answer) == (1.0, True)
-    assert _score_gisa(changed_header, label_answer) == (0.0, True)
-    assert _score_gisa(reordered_answer, label_answer) == (1.0, True)
-    assert _score_gisa(partially_correct_answer, label_answer) == (0.75, True)
+    score, format_ok, metrics = _score_gisa(prediction, label_answer, judge)
 
-    partial_scores, format_ok = reward.evaluate_gisa_markdown_scores(
-        partially_correct_answer, label_answer
-    )
+    assert score == pytest.approx(0.75)
     assert format_ok is True
-    assert partial_scores["row_f1"] == pytest.approx(0.5)
+    assert metrics == {
+        "cell_f1": pytest.approx(0.75),
+        "row_f1": pytest.approx(0.5),
+        "pass": 0.0,
+    }
+    assert len(judge.calls) == 3
 
 
-def test_gisa_item_uses_em_without_judge_model():
+def test_gisa_requires_judge_model():
     label_answer = {
         "answer": ["Chile"],
-        "answer_mode": "boxed",
         "is_gisa": True,
         "answer_type": "item",
     }
 
-    assert _score_gisa("Chile", label_answer, answer_mode="boxed") == (1.0, True)
-    assert _score_gisa("chile", label_answer, answer_mode="boxed") == (0.0, True)
+    assert _score_gisa(pd.DataFrame({"Item": ["Chile"]}), label_answer, None) == (
+        0.0,
+        False,
+        {},
+    )
+
+
+@pytest.mark.parametrize(
+    ("answer_type", "invalid_answer"),
+    [
+        ("item", pd.DataFrame({"Item": ["Chile", "Argentina"]})),
+        ("set", pd.DataFrame({"Item": ["Chile"], "Other": ["extra"]})),
+        ("list", pd.DataFrame({"Answer": ["Chile"]})),
+        ("table", pd.DataFrame()),
+    ],
+)
+def test_gisa_rejects_invalid_markdown_shape_before_judge(answer_type, invalid_answer):
+    async def judge(_messages):
+        raise AssertionError("Invalid GISA output must not call the judge")
+
+    label_answer = {
+        "answer": ["Chile"],
+        "is_gisa": True,
+        "answer_type": answer_type,
+    }
+
+    assert _score_gisa(invalid_answer, label_answer, judge) == (0.0, False, {})
+
+
+def test_item_markdown_output_parses_to_one_cell_table():
+    answer = reward.extract_final_answer(
+        "```markdown\n| Item |\n| :--- |\n| Chile |\n```"
+    )
+
+    assert isinstance(answer, pd.DataFrame)
+    assert answer.to_dict(orient="records") == [{"Item": "Chile"}]
 
 
 def test_non_gisa_item_still_uses_judge_model():
@@ -250,120 +286,93 @@ def test_non_gisa_item_still_uses_judge_model():
         calls.append(messages)
         return "Correct"
 
-    score, format_ok = asyncio.run(
+    result = asyncio.run(
         reward.get_final_reward_score(
             origin_question="Name one country.",
-            extract_answer="Chile",
-            label_answer={"answer": ["Chile"], "answer_mode": "boxed"},
-            answer_mode="boxed",
+            extract_answer=pd.DataFrame({"Item": ["Chile"]}),
+            label_answer={"answer": ["Chile"], "answer_type": "item"},
             norm_column=False,
             judge_llm_generator=judge,
         )
     )
 
-    assert (score, format_ok) == (1.0, True)
+    assert result == (1.0, True, {})
     assert len(calls) == 1
 
 
-def test_gisa_em_does_not_call_configured_judge_model():
-    async def judge(_messages):
-        raise AssertionError("GISA answer EM must not call the judge model")
-
-    score, format_ok = asyncio.run(
-        reward.get_final_reward_score(
-            origin_question="Name one country.",
-            extract_answer="Chile",
-            label_answer={
-                "answer": ["Chile"],
-                "answer_mode": "boxed",
-                "is_gisa": True,
-                "answer_type": "item",
-            },
-            answer_mode="boxed",
-            norm_column=False,
-            judge_llm_generator=judge,
-        )
-    )
-
-    assert (score, format_ok) == (1.0, True)
-
-
-def test_gisa_markdown_metrics_include_em_row_f1_and_order_score():
-    def raw_result(answer, final_answers):
-        return {
-            "group_size": len(final_answers),
-            "answer": answer,
-            "samples": [
-                {
-                    "turns": [],
-                    "total_turn_list": None,
-                    "final_answer_format": 1,
-                    "final_answer": final_answer.to_dict(orient="records"),
-                }
-                for final_answer in final_answers
-            ],
-        }
-
-    table_answer = {
-        "answer": (
-            "```markdown\n| Name | Country |\n| --- | --- |\n"
-            "| Alice | Chile |\n| Bob | Bolivia |\n```"
-        ),
-        "unique_columns": ["Name"],
-        "answer_mode": "markdown",
-        "answer_type": "table",
-    }
-    exact_table = pd.DataFrame(
-        {"Name": ["Alice", "Bob"], "Country": ["Chile", "Bolivia"]}
-    )
-    partial_table = exact_table.copy()
-    partial_table.loc[1, "Country"] = "Peru"
-
-    list_answer = _gisa_markdown_label("list")
-    exact_list = pd.DataFrame(
-        {"Any header": ["Chile", "Argentina", "Bolivia", "Ecuador"]}
-    )
-    reordered_list = exact_list.iloc[::-1].reset_index(drop=True)
-
-    set_answer = _gisa_markdown_label("set")
-    exact_set = exact_list.copy()
-    partial_set = exact_set.iloc[:2].copy()
-
-    raw_results = [
-        raw_result(table_answer, [exact_table, partial_table]),
-        raw_result(list_answer, [reordered_list, exact_list]),
-        raw_result(set_answer, [partial_set, exact_set]),
-    ]
-
-    metrics = aggregate_gisa_markdown_metrics(raw_results, enabled=True)
-
-    assert metrics["exact_match@1"] == pytest.approx(1 / 3)
-    assert metrics["avg_exact_match@k"] == pytest.approx(0.5)
-    assert metrics["max_exact_match@k"] == pytest.approx(1.0)
-    assert metrics["row_f1@1"] == pytest.approx(1.0)
-    assert metrics["avg_row_f1@k"] == pytest.approx(0.75)
-    assert metrics["max_row_f1@k"] == pytest.approx(1.0)
-    assert metrics["order_score@1"] == pytest.approx(0.25)
-    assert metrics["avg_order_score@k"] == pytest.approx(0.625)
-    assert metrics["max_order_score@k"] == pytest.approx(1.0)
-
-
-def test_non_gisa_markdown_metrics_do_not_include_exact_match():
+def test_gisa_metrics_preserve_f1_order_and_pass():
     raw_results = [
         {
-            "group_size": 1,
-            "answer": {"answer_mode": "markdown", "answer_type": "table"},
+            "answer": {"answer_type": "table"},
             "samples": [
                 {
-                    "turns": [],
-                    "total_turn_list": None,
-                    "final_answer_format": 1,
-                    "llm_reward": 1.0,
-                }
+                    "gisa_metrics": {
+                        "cell_f1": 1.0,
+                        "row_f1": 1.0,
+                        "pass": 1.0,
+                    }
+                },
+                {
+                    "gisa_metrics": {
+                        "cell_f1": 0.75,
+                        "row_f1": 0.5,
+                        "pass": 0.0,
+                    }
+                },
             ],
-        }
+        },
+        {
+            "answer": {"answer_type": "list"},
+            "samples": [
+                {
+                    "gisa_metrics": {
+                        "cell_f1": 1.0,
+                        "order_score": 0.5,
+                        "pass": 0.0,
+                    }
+                },
+                {
+                    "gisa_metrics": {
+                        "cell_f1": 1.0,
+                        "order_score": 1.0,
+                        "pass": 1.0,
+                    }
+                },
+            ],
+        },
+        {
+            "answer": {"answer_type": "item"},
+            "samples": [
+                {"gisa_metrics": {"cell_f1": 1.0, "pass": 1.0}},
+                {"gisa_metrics": {"cell_f1": 0.0, "pass": 0.0}},
+            ],
+        },
+        {
+            "answer": {"answer_type": "set"},
+            "samples": [
+                {"gisa_metrics": {"cell_f1": 0.5, "pass": 0.0}},
+                {"gisa_metrics": {"cell_f1": 1.0, "pass": 1.0}},
+            ],
+        },
     ]
 
-    metrics = aggregate_gisa_markdown_metrics(raw_results, enabled=False)
+    metrics = aggregate_gisa_metrics(raw_results, enabled=True)
 
-    assert metrics == {}
+    assert metrics == {
+        "item_f1@1": pytest.approx(0.875),
+        "avg_item_f1@k": pytest.approx(0.78125),
+        "max_item_f1@k": 1.0,
+        "pass@1": 0.5,
+        "avg@k": 0.5,
+        "pass@k": 1.0,
+        "row_f1@1": 1.0,
+        "avg_row_f1@k": 0.75,
+        "max_row_f1@k": 1.0,
+        "order_score@1": 0.5,
+        "avg_order_score@k": 0.75,
+        "max_order_score@k": 1.0,
+    }
+
+
+def test_non_gisa_results_do_not_include_gisa_metrics():
+    assert aggregate_gisa_metrics([], enabled=False) == {}

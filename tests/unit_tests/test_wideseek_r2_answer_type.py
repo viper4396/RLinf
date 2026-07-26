@@ -32,25 +32,21 @@ def _load_answer(
     tmp_path,
     record: dict,
     *,
-    answer_mode: str,
-    is_hybrid: bool = False,
+    default_answer_type: str | None = None,
 ):
     data_path = tmp_path / "data.jsonl"
     data_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
-    config = OmegaConf.create(
-        {
-            "data": {
-                "max_prompt_length": 8,
-                "prompt_key": "question",
-                "answer_key": "answer",
-                "apply_chat_template": False,
-                "filter_prompt_by_length": False,
-                "data_size": -1,
-                "answer_mode": answer_mode,
-                "is_hybrid": is_hybrid,
-            }
-        }
-    )
+    data_config = {
+        "max_prompt_length": 8,
+        "prompt_key": "question",
+        "answer_key": "answer",
+        "apply_chat_template": False,
+        "filter_prompt_by_length": False,
+        "data_size": -1,
+    }
+    if default_answer_type is not None:
+        data_config["answer_type"] = default_answer_type
+    config = OmegaConf.create({"data": data_config})
     dataset = WideSeekR2Dataset(str(data_path), config, _Tokenizer())
     return dataset[0].answer
 
@@ -64,51 +60,64 @@ def test_explicit_answer_type_is_normalized_and_preserved(tmp_path, answer_type)
             "answer": "reference",
             "answer_type": answer_type.upper(),
         },
-        answer_mode="boxed",
     )
 
     assert answer["answer_type"] == answer_type
+    assert "answer_mode" not in answer
 
 
-@pytest.mark.parametrize(
-    ("record_metadata", "config_mode", "expected_type"),
-    [
-        ({"answer_mode": "boxed"}, "markdown", "item"),
-        ({"answer_mode": "markdown"}, "boxed", "table"),
-        ({"answer_mode": "boxed", "is_markdown": True}, "markdown", "item"),
-        ({"is_markdown": False}, "markdown", "item"),
-        ({"is_markdown": True}, "boxed", "table"),
-        ({}, "boxed", "item"),
-        ({}, "markdown", "table"),
-    ],
-)
-def test_missing_answer_type_falls_back_from_format_metadata(
-    tmp_path, record_metadata, config_mode, expected_type
-):
+@pytest.mark.parametrize("default_answer_type", ["item", "set", "list", "table"])
+def test_missing_answer_type_uses_dataset_default(tmp_path, default_answer_type):
     answer = _load_answer(
         tmp_path,
         {
             "question": "Research this task.",
             "answer": "reference",
-            **record_metadata,
         },
-        answer_mode=config_mode,
+        default_answer_type=default_answer_type,
     )
 
-    assert answer["answer_type"] == expected_type
+    assert answer["answer_type"] == default_answer_type
 
 
-def test_explicit_answer_type_has_priority_over_format_metadata(tmp_path):
+def test_missing_record_and_dataset_answer_type_defaults_to_table(tmp_path):
+    answer = _load_answer(
+        tmp_path,
+        {
+            "question": "Research this task.",
+            "answer": "reference",
+        },
+    )
+
+    assert answer["answer_type"] == "table"
+
+
+def test_legacy_format_metadata_does_not_affect_answer_type(tmp_path):
+    answer = _load_answer(
+        tmp_path,
+        {
+            "question": "Research this task.",
+            "answer": "reference",
+            "answer_mode": "boxed",
+            "is_markdown": False,
+        },
+        default_answer_type="table",
+    )
+
+    assert answer["answer_type"] == "table"
+    assert "answer_mode" not in answer
+    assert "is_markdown" not in answer
+
+
+def test_explicit_answer_type_has_priority_over_dataset_default(tmp_path):
     answer = _load_answer(
         tmp_path,
         {
             "question": "Research this task.",
             "answer": "reference",
             "answer_type": "list",
-            "answer_mode": "boxed",
-            "is_markdown": False,
         },
-        answer_mode="boxed",
+        default_answer_type="item",
     )
 
     assert answer["answer_type"] == "list"
@@ -123,5 +132,4 @@ def test_invalid_explicit_answer_type_is_rejected(tmp_path):
                 "answer": "reference",
                 "answer_type": "graph",
             },
-            answer_mode="markdown",
         )

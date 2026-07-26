@@ -85,6 +85,7 @@ class WideSeekR2AgentLoopWorker(MultiAgentLoopWorker):
             "total_turn_list",
             "final_answer_format",
             "llm_reward",
+            "gisa_metrics",
         ]
 
         self.max_prompt_len = int(self.cfg.data.max_prompt_length)
@@ -100,7 +101,6 @@ class WideSeekR2AgentLoopWorker(MultiAgentLoopWorker):
             assert self.fixed_role
 
         self.workflow = self.cfg.agentloop.get("workflow", "mas")
-        self.is_hybrid = self.cfg.data.get("is_hybrid", False)
 
         if self.use_llm_judge:
             llm_ip = self.cfg.agentloop.get("llm_ip", "")
@@ -187,7 +187,6 @@ class WideSeekR2AgentLoopWorker(MultiAgentLoopWorker):
         self,
         worker_request: ToolRequest,
         main_task: str,
-        answer_mode: str,
         sub_traj_id: int,
     ) -> tuple[list[AgentLoopOutput], Optional[str], list]:
         """Execute one planner-created subtask through the worker role loop.
@@ -195,7 +194,6 @@ class WideSeekR2AgentLoopWorker(MultiAgentLoopWorker):
         Args:
             worker_request: Planner output converted to a `subtask` tool request.
             main_task: Original user question for worker grounding.
-            answer_mode: Answer mode for this sample (``markdown`` or ``boxed``).
             sub_traj_id: Sub-trajectory index used for training regrouping.
 
         Returns:
@@ -219,7 +217,6 @@ class WideSeekR2AgentLoopWorker(MultiAgentLoopWorker):
             role="worker",
             sub_traj_id=sub_traj_id,
             main_task=main_task,
-            answer_mode=answer_mode,
         )
         worker_format_valid = bool(answer_text and answer_text.strip())
         quality_score = 0.0
@@ -256,7 +253,6 @@ class WideSeekR2AgentLoopWorker(MultiAgentLoopWorker):
         role: str,
         sub_traj_id: int,
         main_task: str | None = None,
-        answer_mode: str = "boxed",
         answer_type: str | None = None,
     ) -> tuple[list[AgentLoopOutput], Optional[str], list]:
         """Run one query under a specific role until stop or turn budget.
@@ -266,7 +262,6 @@ class WideSeekR2AgentLoopWorker(MultiAgentLoopWorker):
             role: One of `planner`, `worker`, or `single`.
             sub_traj_id: Sub-trajectory id for downstream regrouping.
             main_task: Original task text required when `role == "worker"`.
-            answer_mode: Answer mode for this sample (``markdown`` or ``boxed``).
             answer_type: Dataset-provided answer structure for no-shot main roles.
 
         Returns:
@@ -290,7 +285,6 @@ class WideSeekR2AgentLoopWorker(MultiAgentLoopWorker):
         message_history, tools = build_message_history_and_tools(
             origin_question=origin_question,
             role=role,
-            answer_mode=answer_mode,
             add_few_shot=add_few_shot,
             max_workers_per_planner=max_workers_per_planner,
             max_toolcall_per_worker=max_toolcall_per_worker,
@@ -387,7 +381,6 @@ class WideSeekR2AgentLoopWorker(MultiAgentLoopWorker):
                         self.worker_call(
                             tool_request,
                             origin_question,
-                            answer_mode,
                             sub_traj_id + i + sub_traj_num,
                         )
                     )
@@ -540,7 +533,6 @@ class WideSeekR2AgentLoopWorker(MultiAgentLoopWorker):
         else:
             role = "planner"
 
-        answer_mode = answer["answer_mode"]
         answer_type = answer.get("answer_type")
 
         (
@@ -551,19 +543,17 @@ class WideSeekR2AgentLoopWorker(MultiAgentLoopWorker):
             question=origin_question,
             role=role,
             sub_traj_id=sub_traj_id,
-            answer_mode=answer_mode,
             answer_type=answer_type,
         )
 
-        final_answer_extract = extract_final_answer(answer_text, mode=answer_mode)
+        final_answer_extract = extract_final_answer(answer_text, mode="markdown")
 
         # credit assignment
         norm_column = self.cfg.data.get("norm_column", False)
-        llm_reward, format = await get_final_reward_score(
+        llm_reward, format, gisa_metrics = await get_final_reward_score(
             origin_question,
             final_answer_extract,
             answer,
-            answer_mode,
             norm_column,
             self.llm_generator,
         )
@@ -596,6 +586,7 @@ class WideSeekR2AgentLoopWorker(MultiAgentLoopWorker):
                 "reward": reward_score,
                 "origin_question": origin_question,
                 "llm_reward": llm_reward,
+                "gisa_metrics": gisa_metrics,
                 "total_turn_list": total_turn_list if self.workflow == "mas" else None,
                 "instance_id": answer["instance_id"],
                 "num_valid_planner_turns": num_valid_planner_turns,

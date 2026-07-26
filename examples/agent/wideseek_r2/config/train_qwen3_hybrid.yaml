@@ -55,11 +55,10 @@ data:
   rollout_batch_size: 128
   prompt_key: question
   answer_key: answer
-  answer_mode: markdown
+  answer_type: table
   unique_columns: unique_columns 
   train_data_paths: /mnt/public/xzxuan/data/WideSeek-R1-train-data/hybrid_20k.jsonl # TODO:(USER) Replace with the actual path to the training dataset
   shuffle: False
-  is_hybrid: True
   data_size: -1
 
 actor:
@@ -75,4 +74,3 @@ actor:
     use_hf_ckpt: True
     ckpt_convertor:
       model: Qwen3-4B
-

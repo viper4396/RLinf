@@ -25,34 +25,6 @@ from rlinf.data.datasets.reasoning import ReasoningDataset
 from rlinf.data.utils import batch_pad_to_fixed_len
 
 
-def normalize_answer_mode(value) -> str:
-    """Normalize a config/record answer-mode value to ``markdown`` or ``boxed``.
-
-    Accepts the new string form (``"markdown"`` / ``"boxed"``) as well as the
-    legacy boolean ``is_markdown`` form (``True`` -> ``"markdown"``,
-    ``False`` -> ``"boxed"``) so that existing datasets keep working.
-
-    Args:
-        value: A string answer mode or a legacy boolean ``is_markdown`` flag.
-
-    Returns:
-        Either ``"markdown"`` or ``"boxed"``.
-
-    Raises:
-        ValueError: If the value cannot be interpreted as a supported mode.
-    """
-    if isinstance(value, bool):
-        return "markdown" if value else "boxed"
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        if normalized in ("markdown", "boxed"):
-            return normalized
-    raise ValueError(
-        f"Unsupported answer_mode {value!r}; expected 'markdown' or 'boxed' "
-        "(or the legacy boolean is_markdown)."
-    )
-
-
 def normalize_answer_type(value) -> str:
     """Normalize an answer-structure value used for prompt strategy selection.
 
@@ -82,56 +54,23 @@ class WideSeekR2Dataset(ReasoningDataset):
         tokenizer: PreTrainedTokenizer,
     ):
         super().__init__(data_paths, config, tokenizer)
-        # Config-level answer mode is resolved ONLY from `data.answer_mode`
-        # (default "boxed"); a config-level legacy `is_markdown` key is
-        # intentionally NOT accepted. Per-record legacy `is_markdown` is still
-        # normalized in `_record_answer_mode` (the approved DEC-4 compatibility
-        # surface for existing hybrid data).
-        self.answer_mode = self._config_answer_mode(config.data)
+        self.default_answer_type = normalize_answer_type(
+            config.data.get("answer_type", "table")
+        )
         self.unique_columns_key = config.data.get("unique_columns", "unique_columns")
-        self.is_hybrid = config.data.get("is_hybrid", False)
         self.is_gisa = config.data.get("is_gisa", False)
 
     @staticmethod
-    def _config_answer_mode(data_cfg) -> str:
-        """Resolve the dataset-level default answer mode from config.
-
-        Only ``data.answer_mode`` is honored (defaulting to ``"boxed"`` when
-        unset); a config-level legacy ``is_markdown`` key is NOT accepted.
-        """
-        return normalize_answer_mode(data_cfg.get("answer_mode", "boxed"))
-
-    @staticmethod
-    def _record_answer_mode(record: dict, default: str) -> str:
-        """Resolve the answer mode for one hybrid record.
-
-        Prefers a per-record ``answer_mode``, then a legacy per-record
-        ``is_markdown`` flag, and finally the dataset-level ``default``.
-        """
-        if "answer_mode" in record:
-            return normalize_answer_mode(record["answer_mode"])
-        if "is_markdown" in record:
-            return normalize_answer_mode(record["is_markdown"])
-        return default
-
-    @staticmethod
-    def _record_answer_type(record: dict, default_mode: str) -> str:
+    def _record_answer_type(record: dict, default_type: str) -> str:
         """Resolve the search-strategy type for one record.
 
-        An explicit ``answer_type`` has priority. Otherwise, record-level
-        ``answer_mode`` or legacy ``is_markdown`` metadata is used when present,
-        followed by the already-resolved answer mode. Boxed maps to ``item`` and
-        Markdown maps to ``table``.
+        An explicit record-level ``answer_type`` has priority. Otherwise the
+        dataset-level default is used. Final answers always use Markdown, so
+        legacy format metadata does not participate in type selection.
         """
         if "answer_type" in record:
             return normalize_answer_type(record["answer_type"])
-        if "answer_mode" in record:
-            fallback_mode = normalize_answer_mode(record["answer_mode"])
-        elif "is_markdown" in record:
-            fallback_mode = normalize_answer_mode(record["is_markdown"])
-        else:
-            fallback_mode = default_mode
-        return "item" if fallback_mode == "boxed" else "table"
+        return default_type
 
     def __getitem__(self, idx):
         """Return a single prompt with its answer payload."""
@@ -139,55 +78,26 @@ class WideSeekR2Dataset(ReasoningDataset):
         prompt = record[self.prompt_key]
         answer = record[self.answer_key]
 
-        answer_mode = (
-            self._record_answer_mode(record, self.answer_mode)
-            if self.is_hybrid
-            else self.answer_mode
-        )
-        answer_type = self._record_answer_type(record, answer_mode)
+        answer_type = self._record_answer_type(record, self.default_answer_type)
+        answer_dict = {
+            "answer": answer,
+            "unique_columns": record.get(self.unique_columns_key, []),
+            "instance_id": record.get("instance_id", idx),
+            "answer_type": answer_type,
+        }
         if self.is_gisa:
-            supported_types = (
-                {"table", "set", "list"} if answer_mode == "markdown" else {"item"}
-            )
-            if answer_type not in supported_types:
-                expected = (
-                    "table, set, or list" if answer_mode == "markdown" else "item"
-                )
-                raise ValueError(
-                    f"GISA {answer_mode} records require answer_type to be "
-                    f"one of {expected}; got {answer_type!r} at index {idx}."
-                )
-
-        if answer_mode == "markdown":
-            answer_dict = {
-                "answer": answer,
-                "unique_columns": record.get(self.unique_columns_key, []),
-                "answer_mode": answer_mode,
-                "instance_id": record.get("instance_id", idx),
-                "answer_type": answer_type,
-            }
-            if self.is_gisa:
-                answer_dict["is_gisa"] = True
-            # Try to get evaluation info if available
-            evaluation = record.get("evaluation", None)
-            if evaluation:
-                if isinstance(evaluation, str):
-                    try:
-                        evaluation = json.loads(evaluation)
-                    except json.JSONDecodeError:
-                        pass
-            if isinstance(evaluation, dict):
-                answer_dict["required"] = evaluation.get("required", [])
-            answer = answer_dict
-        else:
-            answer = {
-                "answer": answer if isinstance(answer, list) else [answer],
-                "answer_mode": answer_mode,
-                "instance_id": record.get("instance_id", idx),
-                "answer_type": answer_type,
-            }
-            if self.is_gisa:
-                answer["is_gisa"] = True
+            answer_dict["is_gisa"] = True
+        # Try to get evaluation info if available
+        evaluation = record.get("evaluation", None)
+        if evaluation:
+            if isinstance(evaluation, str):
+                try:
+                    evaluation = json.loads(evaluation)
+                except json.JSONDecodeError:
+                    pass
+        if isinstance(evaluation, dict):
+            answer_dict["required"] = evaluation.get("required", [])
+        answer = answer_dict
 
         prompt_tokens, prompt_length = self.encode(prompt)
         prompt_tokens_tensor = torch.as_tensor(prompt_tokens, dtype=torch.int64)

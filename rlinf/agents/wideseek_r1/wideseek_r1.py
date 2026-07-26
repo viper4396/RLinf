@@ -365,6 +365,8 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
         is_markdown: bool,
         language: str,
         main_task: str | None,
+        answer_type: str | None = None,
+        is_gisa: bool = False,
     ) -> tuple[list[dict], list[dict]]:
         """Build role-specific prompt history and exposed tool descriptions.
 
@@ -374,6 +376,8 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
             is_markdown: Whether markdown answer format is required.
             language: Prompt language identifier (`en` or `zh`).
             main_task: Parent task text required for worker prompts.
+            answer_type: Dataset-provided GISA answer structure.
+            is_gisa: Whether to apply GISA-specific format instructions.
 
         Returns:
             A tuple of `(message_history, tools)` for chat-template rendering.
@@ -381,9 +385,15 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
         tools_description = (
             tools_description_zh if language == "zh" else tools_description_en
         )
+        add_few_shot = self.cfg.agentloop.get("add_few_shot", None)
         if role == "planner":
             message_history = get_prompt_planner(
-                origin_question, is_markdown=is_markdown, language=language
+                origin_question,
+                is_markdown=is_markdown,
+                language=language,
+                add_few_shot=add_few_shot,
+                answer_type=answer_type,
+                is_gisa=is_gisa,
             )
             tools = [tools_description["create_sub_agents"]]
         elif role == "worker":
@@ -394,7 +404,12 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
             tools = [tools_description["search"], tools_description["access"]]
         elif role == "single":
             message_history = get_prompt_single_agent(
-                origin_question, is_markdown=is_markdown, language=language
+                origin_question,
+                is_markdown=is_markdown,
+                language=language,
+                add_few_shot=add_few_shot,
+                answer_type=answer_type,
+                is_gisa=is_gisa,
             )
             tools = [
                 tools_description["search_single_agent"],
@@ -463,6 +478,8 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
         main_task: str | None = None,
         is_markdown: bool = False,
         language: str = "en",
+        answer_type: str | None = None,
+        is_gisa: bool = False,
     ) -> tuple[
         list[AgentLoopOutput],
         str,
@@ -482,6 +499,8 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
             main_task: Original task text required when `role == "worker"`.
             is_markdown: Whether markdown answer format is required.
             language: Prompt language.
+            answer_type: Dataset-provided GISA answer structure.
+            is_gisa: Whether to apply GISA-specific format instructions.
 
         Returns:
             Tuple of `(output_buffer, answer_text, total_turn_list, num_turn_subagents, num_effective_subagents, access_search_ratio, task_failed, succ_end)`.
@@ -504,6 +523,8 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
             is_markdown=is_markdown,
             language=language,
             main_task=main_task,
+            answer_type=answer_type,
+            is_gisa=is_gisa,
         )
         max_turns = self._set_max_turns(role=role)
         max_allow_turns = self._set_max_allow_turns(role=role)
@@ -833,6 +854,8 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
             role = "planner"
 
         is_markdown = answer["is_markdown"]
+        answer_type = answer.get("answer_type")
+        is_gisa = answer.get("is_gisa", False)
 
         (
             output_buffer,
@@ -849,6 +872,8 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
             sub_traj_id=sub_traj_id,
             is_markdown=is_markdown,
             language=language,
+            answer_type=answer_type,
+            is_gisa=is_gisa,
         )
 
         if is_markdown:

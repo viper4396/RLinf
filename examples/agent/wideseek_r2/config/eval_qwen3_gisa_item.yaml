@@ -9,7 +9,7 @@ cluster:
     rollout: all
 
 runner:
-  experiment_name: gisa_markdown
+  experiment_name: gisa_item
   output_dir: ./logs/eval
   seq_length: 32000
 
@@ -49,10 +49,8 @@ data:
   val_rollout_batch_size: 20
   prompt_key: question
   answer_key: answer
-  answer_mode: markdown
-  is_hybrid: False
+  answer_type: item
   is_gisa: True
-  unique_columns: unique_columns
   validation_shuffle: False
-  val_data_paths: /mnt/project_rlinf/xzxuan/WideSeek-R2/suheng/data/gisa_full373_markdown.jsonl
+  val_data_paths: /mnt/project_rlinf/xzxuan/WideSeek-R2/suheng/data/gisa_full373_non_markdown.jsonl
   data_size: -1

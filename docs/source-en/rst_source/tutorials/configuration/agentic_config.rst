@@ -169,53 +169,48 @@ JSONL record may set ``answer_type`` to ``item``, ``set``, ``list``, or
 describe how to stage and fan out sub-agents, while single-agent prompts
 describe the search/access order. The model does not infer the type itself.
 
-If ``answer_type`` is absent, the dataset infers it from record metadata in
-this order: ``answer_mode``, legacy ``is_markdown``, then the resolved
-dataset-level ``answer_mode``. ``boxed`` or ``is_markdown: false`` maps to
-``item``; ``markdown`` or ``is_markdown: true`` maps to ``table``. An explicit
-``answer_type`` always takes priority. It selects the research strategy only;
-``answer_mode`` still independently selects the final boxed or Markdown
-wrapper.
+All main-role final answers use exactly one fenced Markdown pipe table.
+``item`` uses one column named ``Item`` and exactly one data row; ``set`` and
+``list`` use the same column with one member per row; ``table`` uses the
+requested schema. ``answer_mode``, ``is_markdown``, and ``is_hybrid`` are no
+longer used. If a record omits ``answer_type``, ``data.answer_type`` supplies
+the dataset default, which itself defaults to ``table``. A record-level value
+always takes priority.
 
-For WideSeek-R2 GISA data, enable the GISA-specific Markdown evaluator as follows:
+For WideSeek-R2 GISA data, enable GISA LLM-judge evaluation as follows:
 
 .. code:: yaml
 
   data:
     type: wideseek_r2
-    answer_mode: markdown
-    is_hybrid: True
+    answer_type: table
     is_gisa: True
 
-``data.is_gisa`` defaults to ``False``. When enabled, all GISA answers use local,
-deterministic matching and never call the judge model. Boxed ``item`` records use
-binary exact match (EM) on the direct answer string. Markdown ``table``, ``set``,
-and ``list`` records use exact content matches and the corresponding precision
-and recall counts to calculate F1 (equivalently,
-``2 * matched_cells / (predicted_cells + reference_cells)``).
-They also report whole-answer EM. Set EM ignores order, list EM requires the
-exact sequence, and table EM follows the existing aligned exact-cell semantics.
-The resulting ``metrics.json`` contains ``item_f1@1``, ``avg_item_f1@k``, and
-``max_item_f1@k`` for cell F1, plus ``exact_match@1``,
-``avg_exact_match@k``, and ``max_exact_match@k`` for whole-answer EM. Table
-records additionally contain ``row_f1@1``, ``avg_row_f1@k``, and
-``max_row_f1@k``. List records additionally contain ``order_score@1``,
-``avg_order_score@k``, and ``max_order_score@k``. The ``avg`` metrics average all
-``k`` rollout scores; the ``max`` metrics average each question's best rollout.
-A missing ``answer_type`` defaults to ``table``, so ``set`` and ``list`` records
-must identify their type explicitly. Tables use column names for schema matching
-and ``unique_columns`` to align rows, so row order does not affect the score.
-Table row F1 treats every distinct complete row over the shared schema as one
-item. Sets and lists discard the Markdown header and ``unique_columns`` metadata
-and compare from the first content row. Sets ignore order and duplicate
-occurrences. List content F1 ignores order but counts duplicate occurrences;
-its order score uses ``difflib.SequenceMatcher`` and equals
-``2 * matching_elements / total_elements``. With
-``data.is_hybrid: True``, a per-record ``is_markdown`` or ``answer_mode`` selects
-the output mode. For Markdown ``set`` and ``list`` records, the system prompt
-requires exactly one fenced, single-column Markdown pipe table with one item per
-row and explicitly rejects JSON, Python-list, bullet-list, and plain-text answer
-formats. List rows must follow the requested order.
+``data.is_gisa`` defaults to ``False``. When enabled, configure a usable judge
+model with ``agentloop.use_llm_judge: True`` and the corresponding judge server
+settings. GISA keeps its cell F1, table row F1, list order score, and whole-answer
+pass metrics, but semantic matches are decided by the LLM judge instead of exact
+string equality. Before judging, the evaluator validates the Markdown structure:
+``item`` must be a one-column, one-row ``Item`` table; ``set`` and ``list`` must
+be single-column ``Item`` tables; and ``table`` must be a non-empty table.
+
+For ``item``, the sole cell is judged against the accepted reference answers.
+For ``set`` and ``list``, every predicted/reference cell pair is judged and a
+maximum one-to-one semantic matching determines cell F1. List order score uses
+an LCS over the same semantic-match matrix. For ``table``, rows are aligned by
+LLM-judged ``unique_columns`` when provided (otherwise positionally), aligned
+cells are judged for cell F1, and complete row pairs are judged separately for
+row F1. A pass requires full cell F1; list additionally requires full order
+score, while table additionally requires full row F1.
+
+The resulting ``metrics.json`` retains ``item_f1@1``, ``avg_item_f1@k``, and
+``max_item_f1@k``. Table records additionally report ``row_f1@1``,
+``avg_row_f1@k``, and ``max_row_f1@k``; list records additionally report
+``order_score@1``, ``avg_order_score@k``, and ``max_order_score@k``. The old
+whole-answer EM is now represented as judge-based ``pass@1``, ``avg@k``, and
+``pass@k``. A missing ``answer_type`` defaults to ``table``, so ``set`` and
+``list`` records must identify their type explicitly; homogeneous item datasets
+should set ``data.answer_type: item``.
 
 actor
 ~~~~~~~~~~~~~~~

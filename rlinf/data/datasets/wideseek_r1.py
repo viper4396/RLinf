@@ -37,81 +37,59 @@ class WideSeekR1Dataset(ReasoningDataset):
         self.unique_columns_key = config.data.get("unique_columns", "unique_columns")
         self.is_hybrid = config.data.get("is_hybrid", False)
         self.enable_zh = config.data.get("enable_zh", False)
+        self.is_gisa = config.data.get("is_gisa", False)
 
     def __getitem__(self, idx):
-        """
-        Return a single prompt.
-        """
+        """Return a single prompt and its evaluation metadata."""
+        record = self.data[idx]
         language = "en"
         if self.enable_zh:
-            instance_id = self.data[idx].get("instance_id", "")
-            if "zh" in str(instance_id) or self.data[idx].get("language", "en") == "zh":
+            instance_id = record.get("instance_id", "")
+            if "zh" in str(instance_id) or record.get("language", "en") == "zh":
                 language = "zh"
-        if not self.is_hybrid:
-            prompt = self.data[idx][self.prompt_key]
-            answer = self.data[idx][self.answer_key]
+        prompt = record[self.prompt_key]
+        raw_answer = record[self.answer_key]
+        is_markdown = (
+            record.get("is_markdown", False) if self.is_hybrid else self.is_markdown
+        )
+        answer_type = (
+            str(record.get("answer_type", "table" if is_markdown else "item"))
+            .strip()
+            .lower()
+        )
 
-            if self.is_markdown:
-                # Build answer dict from data
-                answer_dict = {
-                    "answer": answer,
-                    "unique_columns": self.data[idx].get(self.unique_columns_key, []),
-                    "is_markdown": self.is_markdown,
-                    "instance_id": self.data[idx].get("instance_id", idx),
-                    "language": language,
-                }
-                # Try to get evaluation info if available
-                evaluation = self.data[idx].get("evaluation", None)
-                if evaluation:
-                    if isinstance(evaluation, str):
-                        try:
-                            evaluation = json.loads(evaluation)
-                        except json.JSONDecodeError:
-                            pass
-                if isinstance(evaluation, dict):
-                    answer_dict["required"] = evaluation.get("required", [])
-                answer = answer_dict
-            else:
-                answer_dict = {
-                    "answer": answer if isinstance(answer, list) else [answer],
-                    "is_markdown": self.is_markdown,
-                    "instance_id": self.data[idx].get("instance_id", idx),
-                    "language": language,
-                }
-                answer = answer_dict
-        else:
-            prompt = self.data[idx][self.prompt_key]
-            answer = self.data[idx][self.answer_key]
-            is_markdown = self.data[idx].get("is_markdown", False)
+        if self.is_gisa:
+            supported_types = {"table", "set", "list"} if is_markdown else {"item"}
+            if answer_type not in supported_types:
+                expected = "table, set, or list" if is_markdown else "item"
+                raise ValueError(
+                    f"GISA {'markdown' if is_markdown else 'boxed'} records require "
+                    f"answer_type to be one of {expected}; got {answer_type!r} "
+                    f"at index {idx}."
+                )
 
-            if is_markdown:
-                # Build answer dict from data
-                answer_dict = {
-                    "answer": answer,
-                    "unique_columns": self.data[idx].get(self.unique_columns_key, []),
-                    "is_markdown": is_markdown,
-                    "instance_id": self.data[idx].get("instance_id", idx),
-                    "language": language,
-                }
-                # Try to get evaluation info if available
-                evaluation = self.data[idx].get("evaluation", None)
-                if evaluation:
-                    if isinstance(evaluation, str):
-                        try:
-                            evaluation = json.loads(evaluation)
-                        except json.JSONDecodeError:
-                            pass
-                if isinstance(evaluation, dict):
-                    answer_dict["required"] = evaluation.get("required", [])
-                answer = answer_dict
-            else:
-                answer_dict = {
-                    "answer": answer if isinstance(answer, list) else [answer],
-                    "is_markdown": is_markdown,
-                    "instance_id": self.data[idx].get("instance_id", idx),
-                    "language": language,
-                }
-                answer = answer_dict
+        answer = {
+            "answer": raw_answer,
+            "is_markdown": is_markdown,
+            "instance_id": record.get("instance_id", idx),
+            "language": language,
+            "answer_type": answer_type,
+        }
+        if self.is_gisa:
+            answer["is_gisa"] = True
+
+        if is_markdown:
+            answer["unique_columns"] = record.get(self.unique_columns_key, [])
+            evaluation = record.get("evaluation", None)
+            if isinstance(evaluation, str):
+                try:
+                    evaluation = json.loads(evaluation)
+                except json.JSONDecodeError:
+                    pass
+            if isinstance(evaluation, dict):
+                answer["required"] = evaluation.get("required", [])
+        elif not isinstance(raw_answer, list):
+            answer["answer"] = [raw_answer]
 
         prompt_tokens, prompt_length = self.encode(prompt)
         prompt_tokens_tensor = torch.as_tensor(prompt_tokens, dtype=torch.int64)

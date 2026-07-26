@@ -13,10 +13,10 @@
 # limitations under the License.
 
 from rlinf.agents.wideseek_r2.utils.prompt import (
-    BOXED_FORMAT_EN,
-    MARKDOWN_FORMAT_EN,
+    MARKDOWN_ITEM_FORMAT_EN,
     MARKDOWN_LIST_FORMAT_EN,
     MARKDOWN_SET_FORMAT_EN,
+    MARKDOWN_TABLE_FORMAT_EN,
     PLANNER_ITEM_STRATEGY_EN,
     PLANNER_LIST_STRATEGY_EN,
     PLANNER_SET_STRATEGY_EN,
@@ -51,50 +51,46 @@ _SINGLE_AGENT_STRATEGIES = {
 }
 
 
-def _format_instruction(answer_mode: str, answer_type: str | None = None) -> str:
-    """Return the final-answer format instruction for the given answer mode.
+def _format_instruction(answer_type: str | None) -> str:
+    """Return the Markdown format instruction for the given answer type.
 
     Args:
-        answer_mode: Either ``"markdown"`` or ``"boxed"``.
-        answer_type: Optional answer structure used to specialize Markdown
-            collection formatting.
+        answer_type: Optional answer structure. Missing values default to table.
 
     Returns:
-        The format instruction string injected into the system prompt.
+        The type-specific Markdown instruction injected into the system prompt.
 
     Raises:
-        ValueError: If ``answer_mode`` is not a supported value.
+        ValueError: If ``answer_type`` is not supported.
     """
-    if answer_mode == "markdown":
-        normalized_type = (
-            str(answer_type).strip().lower() if answer_type is not None else None
-        )
-        if normalized_type == "set":
-            return MARKDOWN_SET_FORMAT_EN
-        if normalized_type == "list":
-            return MARKDOWN_LIST_FORMAT_EN
-        return MARKDOWN_FORMAT_EN
-    if answer_mode == "boxed":
-        return BOXED_FORMAT_EN
-    raise ValueError(
-        f"Unsupported answer_mode {answer_mode!r}; expected 'markdown' or 'boxed'."
+    normalized_type = (
+        str(answer_type).strip().lower() if answer_type is not None else "table"
     )
+    instructions = {
+        "item": MARKDOWN_ITEM_FORMAT_EN,
+        "set": MARKDOWN_SET_FORMAT_EN,
+        "list": MARKDOWN_LIST_FORMAT_EN,
+        "table": MARKDOWN_TABLE_FORMAT_EN,
+    }
+    if normalized_type not in instructions:
+        supported = ", ".join(instructions)
+        raise ValueError(
+            f"Unsupported answer_type {answer_type!r}; expected one of {supported}."
+        )
+    return instructions[normalized_type]
 
 
 def _answer_type_strategy(
     answer_type: str | None,
-    answer_mode: str,
     role: str,
 ) -> str:
     """Return the role-specific strategy injected into a no-shot prompt.
 
-    ``answer_type`` normally comes from the dataset. The fallback mirrors the
-    dataset contract for direct callers of this prompt utility: boxed answers
-    are items, while Markdown answers are tables.
+    ``answer_type`` normally comes from the dataset. Missing values default to
+    ``table``, matching the dataset contract.
 
     Args:
         answer_type: One of ``item``, ``set``, ``list``, or ``table``.
-        answer_mode: Final-answer wrapper mode used when ``answer_type`` is None.
         role: Either ``planner`` or ``single``.
 
     Returns:
@@ -110,10 +106,9 @@ def _answer_type_strategy(
     else:
         raise ValueError(f"Unsupported strategy role {role!r}.")
 
-    if answer_type is None:
-        normalized_type = "item" if answer_mode == "boxed" else "table"
-    else:
-        normalized_type = str(answer_type).strip().lower()
+    normalized_type = (
+        str(answer_type).strip().lower() if answer_type is not None else "table"
+    )
     if normalized_type not in strategies:
         supported = ", ".join(strategies)
         raise ValueError(
@@ -145,7 +140,6 @@ def _fanout_guidance(max_workers_per_planner: int) -> str:
 
 def get_prompt_planner(
     question: str,
-    answer_mode: str,
     add_few_shot: bool,
     max_workers_per_planner: int,
     answer_type: str | None = None,
@@ -156,7 +150,7 @@ def get_prompt_planner(
     unlimited-mode few-shot is used; otherwise the capped few-shot injects the
     limit so the narrative matches the parser's enforcement.
     """
-    format_instruction = _format_instruction(answer_mode, answer_type)
+    format_instruction = _format_instruction(answer_type)
     if add_few_shot:
         if max_workers_per_planner < 0:
             system = SYSTEM_PROMPT_PLANNER_UNLIMITED.format(format_instruction)
@@ -168,9 +162,7 @@ def get_prompt_planner(
         system = SYSTEM_PROMPT_PLANNER_NOSHOT.format(
             format_instruction,
             fanout_guidance=_fanout_guidance(max_workers_per_planner),
-            answer_type_strategy=_answer_type_strategy(
-                answer_type, answer_mode, role="planner"
-            ),
+            answer_type_strategy=_answer_type_strategy(answer_type, role="planner"),
         )
     return [
         {"role": "system", "content": system},
@@ -191,20 +183,17 @@ def get_prompt_worker(origin_question: str, subtask: str) -> list:
 
 def get_prompt_single_agent(
     question: str,
-    answer_mode: str,
     add_few_shot: bool,
     answer_type: str | None = None,
 ) -> list:
     """Build the single-agent prompt with optional few-shot examples."""
-    format_instruction = _format_instruction(answer_mode, answer_type)
+    format_instruction = _format_instruction(answer_type)
     if add_few_shot:
         system = SYSTEM_PROMPT_SINGLE_AGENT.format(format_instruction)
     else:
         system = SYSTEM_PROMPT_SINGLE_AGENT_NOSHOT.format(
             format_instruction,
-            answer_type_strategy=_answer_type_strategy(
-                answer_type, answer_mode, role="single"
-            ),
+            answer_type_strategy=_answer_type_strategy(answer_type, role="single"),
         )
     return [
         {"role": "system", "content": system},
@@ -215,7 +204,6 @@ def get_prompt_single_agent(
 def build_message_history_and_tools(
     origin_question: str,
     role: str,
-    answer_mode: str,
     add_few_shot: bool,
     max_workers_per_planner: int,
     max_toolcall_per_worker: int,
@@ -227,7 +215,6 @@ def build_message_history_and_tools(
     Args:
         origin_question: Query text for this role loop.
         role: Current role (`planner`, `worker`, or `single`).
-        answer_mode: Answer mode for this sample (``markdown`` or ``boxed``).
         add_few_shot: Whether to include few-shot examples in the system prompt.
         max_workers_per_planner: Sub-agent per-call limit for prompt/tool
             descriptions; negative means unlimited.
@@ -245,7 +232,6 @@ def build_message_history_and_tools(
     if role == "planner":
         message_history = get_prompt_planner(
             origin_question,
-            answer_mode=answer_mode,
             add_few_shot=add_few_shot,
             max_workers_per_planner=max_workers_per_planner,
             answer_type=answer_type,
@@ -258,7 +244,6 @@ def build_message_history_and_tools(
     elif role == "single":
         message_history = get_prompt_single_agent(
             origin_question,
-            answer_mode=answer_mode,
             add_few_shot=add_few_shot,
             answer_type=answer_type,
         )

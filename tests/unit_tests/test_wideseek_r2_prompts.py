@@ -49,7 +49,6 @@ def test_planner_noshot_injects_selected_answer_type_strategy(
 ):
     messages = get_prompt_planner(
         question="Research this task.",
-        answer_mode="markdown",
         add_few_shot=False,
         max_workers_per_planner=-1,
         answer_type=answer_type,
@@ -76,7 +75,6 @@ def test_single_agent_noshot_injects_selected_answer_type_strategy(
 ):
     messages = get_prompt_single_agent(
         question="Research this task.",
-        answer_mode="boxed",
         add_few_shot=False,
         answer_type=answer_type,
     )
@@ -84,7 +82,7 @@ def test_single_agent_noshot_injects_selected_answer_type_strategy(
     system_prompt = messages[0]["content"]
     _assert_only_strategy(system_prompt, answer_type)
     assert search_strategy in system_prompt
-    assert "\\boxed" in system_prompt
+    assert "```markdown" in system_prompt
 
 
 @pytest.mark.parametrize(
@@ -102,7 +100,6 @@ def test_markdown_set_and_list_prompts_require_pipe_tables(
     if prompt_builder == "planner":
         messages = get_prompt_planner(
             question="Research this task.",
-            answer_mode="markdown",
             add_few_shot=False,
             max_workers_per_planner=4,
             answer_type=answer_type,
@@ -110,7 +107,6 @@ def test_markdown_set_and_list_prompts_require_pipe_tables(
     else:
         messages = get_prompt_single_agent(
             question="Research this task.",
-            answer_mode="markdown",
             add_few_shot=False,
             answer_type=answer_type,
         )
@@ -124,34 +120,55 @@ def test_markdown_set_and_list_prompts_require_pipe_tables(
     assert "pipe table, NOT JSON" in system_prompt
 
 
-def test_noshot_prompt_answer_type_falls_back_from_answer_mode():
+@pytest.mark.parametrize("prompt_builder", ["planner", "single"])
+def test_markdown_item_prompt_requires_exactly_one_item_row(prompt_builder: str):
+    if prompt_builder == "planner":
+        messages = get_prompt_planner(
+            question="Research this task.",
+            add_few_shot=False,
+            max_workers_per_planner=4,
+            answer_type="item",
+        )
+    else:
+        messages = get_prompt_single_agent(
+            question="Research this task.",
+            add_few_shot=False,
+            answer_type="item",
+        )
+
+    system_prompt = messages[0]["content"]
+    assert "output only one fenced Markdown pipe table" in system_prompt
+    assert "| Item |" in system_prompt
+    assert "| the single answer |" in system_prompt
+    assert "exactly one column named `Item` and exactly one data row" in system_prompt
+    assert "Do NOT add alternatives or a second row" in system_prompt
+    assert "\\boxed" not in system_prompt
+
+
+def test_noshot_prompt_missing_answer_type_defaults_to_table():
     planner_system = get_prompt_planner(
         question="Research this task.",
-        answer_mode="boxed",
         add_few_shot=False,
         max_workers_per_planner=4,
     )[0]["content"]
     single_system = get_prompt_single_agent(
         question="Research this task.",
-        answer_mode="markdown",
         add_few_shot=False,
     )[0]["content"]
 
-    _assert_only_strategy(planner_system, "item")
+    _assert_only_strategy(planner_system, "table")
     _assert_only_strategy(single_system, "table")
 
 
 def test_task_type_strategy_guidance_is_limited_to_noshot_prompts():
     planner_system = get_prompt_planner(
         question="Research this task.",
-        answer_mode="boxed",
         add_few_shot=True,
         max_workers_per_planner=4,
         answer_type="set",
     )[0]["content"]
     single_system = get_prompt_single_agent(
         question="Research this task.",
-        answer_mode="markdown",
         add_few_shot=True,
         answer_type="list",
     )[0]["content"]
@@ -164,7 +181,6 @@ def test_noshot_prompt_rejects_unsupported_answer_type():
     with pytest.raises(ValueError, match="Unsupported answer_type"):
         get_prompt_single_agent(
             question="Research this task.",
-            answer_mode="markdown",
             add_few_shot=False,
             answer_type="graph",
         )

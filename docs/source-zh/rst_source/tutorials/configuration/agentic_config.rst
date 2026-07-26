@@ -161,49 +161,44 @@ JSONL 记录可以将 ``answer_type`` 设置为 ``item``、``set``、``list`` �
 调用 sub-agent，single-agent prompt 说明 search/access 的先后顺序，模型不再
 自行判断类型。
 
-如果记录缺少 ``answer_type``，数据集依次根据记录级 ``answer_mode``、旧字段
-``is_markdown``、最终解析出的数据集级 ``answer_mode`` 推断。``boxed`` 或
-``is_markdown: false`` 等同于 ``item``；``markdown`` 或
-``is_markdown: true`` 等同于 ``table``。显式 ``answer_type`` 始终优先，并且
-只选择检索策略；最终使用 boxed 还是 Markdown 包装仍由 ``answer_mode``
-独立决定。
+所有主角色最终答案统一使用一个带围栏的 Markdown pipe table。``item`` 使用
+名为 ``Item`` 的单列且只能有一行数据；``set`` 和 ``list`` 使用相同单列，
+每个成员占一行；``table`` 使用题目要求的 schema。系统不再读取
+``answer_mode``、``is_markdown`` 或 ``is_hybrid``。如果记录缺少
+``answer_type``，则使用数据集级 ``data.answer_type``，后者默认是
+``table``；记录级配置始终优先。
 
-对于 WideSeek-R2 GISA 数据，可按如下方式启用 GISA 专用 Markdown 评估：
+对于 WideSeek-R2 GISA 数据，可按如下方式启用 GISA LLM-judge 评估：
 
 .. code:: yaml
 
   data:
     type: wideseek_r2
-    answer_mode: markdown
-    is_hybrid: True
+    answer_type: table
     is_gisa: True
 
-``data.is_gisa`` 默认为 ``False``。启用后，所有 GISA 答案均使用本地、
-确定性匹配，不会调用 judge model。boxed ``item`` 记录对答案字符串进行二值
-精确匹配（EM）。Markdown ``table``、``set`` 和 ``list`` 记录先逐 cell
-进行内容精确匹配，再根据相应的 precision 和 recall 计数计算 F1（等价于
-``2 * 匹配 cell 数 / (预测 cell 数 + 标准 cell 数)``）。同时还会统计整答
-EM：set EM 忽略顺序，list EM 要求序列完全一致，table EM 沿用现有的对齐后
-逐 cell 精确匹配语义。生成的 ``metrics.json``
-会包含逐 cell F1 指标 ``item_f1@1``、``avg_item_f1@k`` 和
-``max_item_f1@k``，以及整答 EM 指标 ``exact_match@1``、
-``avg_exact_match@k`` 和 ``max_exact_match@k``。table 还会包含
-``row_f1@1``、``avg_row_f1@k`` 和 ``max_row_f1@k``；list 还会包含
-``order_score@1``、``avg_order_score@k`` 和 ``max_order_score@k``。
-``avg`` 指标取 ``k`` 次 rollout 得分的平均值，``max`` 指标取每道题 ``k`` 次
-rollout 中的最高分后再求平均。缺少
-``answer_type`` 时默认按 ``table`` 处理，因此 ``set`` 和 ``list`` 记录必须
-显式标注类型。表格使用列名匹配 schema，并根据 ``unique_columns`` 对齐行，
-因此行顺序不影响得分。Table Row F1 将共享 schema 上每个不同的完整行视为
-一个 item。集合和列表会丢弃 Markdown 表头及 ``unique_columns`` 元数据，
-从第一行正式内容开始比较；集合忽略顺序和重复项。List 内容 F1 忽略顺序但
-保留重复项计数；Order Score 使用 ``difflib.SequenceMatcher``，计算公式为
-``2 * 匹配元素数 / 两个列表的元素总数``。设置 ``data.is_hybrid: True`` 后，
-每条记录的 ``is_markdown`` 或 ``answer_mode`` 决定其输出模式。对于 Markdown
-``set`` 和
-``list`` 记录，system prompt 会要求只输出一个带围栏的单列 Markdown pipe
-table，每个 item 占一行，并明确禁止 JSON、Python list、项目符号列表和纯文本
-答案；``list`` 的各行必须遵循题目要求的顺序。
+``data.is_gisa`` 默认为 ``False``。启用后，需要通过
+``agentloop.use_llm_judge: True`` 和对应的 judge server 配置提供可用的
+judge model。GISA 保留 cell F1、table row F1、list order score 和整答 pass
+指标，但是否匹配改由 LLM judge 判断语义等价，不再使用字符串精确相等。调用
+judge 前会先验证 Markdown 结构：``item`` 必须是名为 ``Item`` 的单列单行
+表格；``set`` 和 ``list`` 必须是名为 ``Item`` 的单列表格；``table`` 必须是
+非空表格。
+
+对于 ``item``，judge 比较唯一 cell 和可接受的参考答案。对于 ``set`` 和
+``list``，judge 会比较每个预测/参考 cell 对，再通过最大一一语义匹配计算 cell
+F1；list order score 则在同一语义匹配矩阵上计算 LCS。对于 ``table``，若提供
+``unique_columns``，先使用 LLM judge 对齐 key（否则按位置对齐），再逐个判断
+对齐后的 cell 以计算 cell F1，并单独判断完整 row 对来计算 row F1。pass 要求
+cell F1 为满分；list 还要求 order score 为满分，table 还要求 row F1 为满分。
+
+生成的 ``metrics.json`` 保留 ``item_f1@1``、``avg_item_f1@k`` 和
+``max_item_f1@k``。table 还会报告 ``row_f1@1``、``avg_row_f1@k`` 和
+``max_row_f1@k``；list 还会报告 ``order_score@1``、
+``avg_order_score@k`` 和 ``max_order_score@k``。原来的整答 EM 改为
+judge-based ``pass@1``、``avg@k`` 和 ``pass@k``。缺少 ``answer_type`` 时
+默认按 ``table`` 处理，因此 ``set`` 和 ``list`` 记录必须显式标注类型；同质
+item 数据集应设置 ``data.answer_type: item``。
 
 actor
 ~~~~~~~~~~~~~~~

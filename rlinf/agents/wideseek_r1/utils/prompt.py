@@ -512,8 +512,48 @@ USER_PROMPT_SINGLE_AGENT_ZH = """# 任务
 
 BOXED_FORMAT_EN = "If you determine that no further external knowledge is required, you have to wrap your final answer in <answer> tags with \\boxed{} inside:\n<answer>\n\\boxed{{{data_content}}}\n</answer>"
 MARKDOWN_FORMAT_EN = "If you determine that no further external knowledge is required, you have to wrap your final answer in <answer> tags with markdown format inside:\n<answer>\n```markdown\n{data_content}\n```\n</answer>"
+MARKDOWN_SET_FORMAT_EN = """If you determine that no further external knowledge is required, then after closing `</think>` you MUST output only one fenced Markdown pipe table wrapped in `<answer>` tags in this form:
+<answer>
+```markdown
+| Item |
+| :--- |
+| first set member |
+| second set member |
+```
+</answer>
+Put each set member in its own row under the single `Item` column. Row order does not matter, and duplicate members must be removed. The fenced content must be a pipe table, NOT JSON. Do NOT output a JSON object or array, Python list, bullets, comma-separated text, or additional prose outside the `<answer>` block."""
+MARKDOWN_LIST_FORMAT_EN = """If you determine that no further external knowledge is required, then after closing `</think>` you MUST output only one fenced Markdown pipe table wrapped in `<answer>` tags in this form:
+<answer>
+```markdown
+| Item |
+| :--- |
+| first list item |
+| second list item |
+```
+</answer>
+Put each list item in its own row under the single `Item` column, in the exact required order. Preserve meaningful duplicate items. The fenced content must be a pipe table, NOT JSON. Do NOT output a JSON object or array, Python list, bullets, comma-separated text, or additional prose outside the `<answer>` block."""
 BOXED_FORMAT_ZH = "如果你判断不再需要额外的外部知识，你必须将最终答案用 <answer> 标签包裹，并在其中使用 \\boxed{}：\n<answer>\n\\boxed{{{data_content}}}\n</answer>"
 MARKDOWN_FORMAT_ZH = "如果你判断不再需要额外的外部知识，你必须将最终答案用 <answer> 标签包裹，并在其中使用 markdown 格式：\n<answer>\n```markdown\n{data_content}\n```\n</answer>"
+MARKDOWN_SET_FORMAT_ZH = """如果你判断不再需要额外的外部知识，那么在结束 `</think>` 后，你必须只输出一个由 `<answer>` 标签包裹的 Markdown 管道表格，格式如下：
+<answer>
+```markdown
+| Item |
+| :--- |
+| 第一个集合成员 |
+| 第二个集合成员 |
+```
+</answer>
+每个集合成员单独占据 `Item` 单列下的一行。行顺序不重要，并且必须删除重复成员。代码块中的内容必须是管道表格，不能是 JSON。不要输出 JSON 对象或数组、Python 列表、项目符号、逗号分隔文本，也不要在 `<answer>` 块之外输出额外说明。"""
+MARKDOWN_LIST_FORMAT_ZH = """如果你判断不再需要额外的外部知识，那么在结束 `</think>` 后，你必须只输出一个由 `<answer>` 标签包裹的 Markdown 管道表格，格式如下：
+<answer>
+```markdown
+| Item |
+| :--- |
+| 第一个列表项 |
+| 第二个列表项 |
+```
+</answer>
+每个列表项单独占据 `Item` 单列下的一行，并严格保持题目要求的顺序。保留有意义的重复项。代码块中的内容必须是管道表格，不能是 JSON。不要输出 JSON 对象或数组、Python 列表、项目符号、逗号分隔文本，也不要在 `<answer>` 块之外输出额外说明。"""
 
 
 LLM_JUDGE_PROMPT = """Question: {question}

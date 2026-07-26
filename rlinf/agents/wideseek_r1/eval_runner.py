@@ -24,6 +24,9 @@ from omegaconf import OmegaConf
 from omegaconf.dictconfig import DictConfig
 from torch.utils.data import Dataset
 
+from rlinf.agents.wideseek_r1.utils.eval_metrics import (
+    aggregate_gisa_markdown_metrics,
+)
 from rlinf.data.io_struct import DynamicRolloutResult
 from rlinf.runners.agent_eval_runner import AgentEvalRunner
 from rlinf.utils.placement import ModelParallelComponentPlacement
@@ -177,6 +180,7 @@ class WideSeekR1AgentEvalRunner(AgentEvalRunner):
             Tuple of `(processed_results, aggregated_metrics)`.
         """
         is_markdown = self.cfg.data.get("is_markdown", False)
+        gisa_markdown_mode = is_markdown and self.cfg.data.get("is_gisa", False)
 
         processed_results = []
         total_queries = len(self.accumulated_raw_results)
@@ -216,9 +220,9 @@ class WideSeekR1AgentEvalRunner(AgentEvalRunner):
         mas_num_access_search_ratio_entries = 0
 
         if is_markdown:
-            acc = {}
+            acc = {"f1_1": [], "avg_f1_k": [], "max_f1_k": []}
         else:
-            acc = {"pass1": [], "passk": [], "avgk": [], "maxk": []}
+            acc = {"pass1": [], "passk": [], "avgk": []}
 
         for idx, raw_result in enumerate(self.accumulated_raw_results):
             group_size = raw_result.get("group_size", 1)
@@ -330,11 +334,13 @@ class WideSeekR1AgentEvalRunner(AgentEvalRunner):
                 mas_sum_num_subagents += sum(mas_num_subagents_list)
                 mas_num_valid_trajs += len(mas_main_agent_turns_list)
 
-            if is_markdown:
-                pass
-            else:
-                values = [float(sample.get("llm_reward", 0) or 0) for sample in samples]
-                if values:
+            values = [float(sample.get("llm_reward", 0) or 0) for sample in samples]
+            if values:
+                if is_markdown:
+                    acc["f1_1"].append(values[0])
+                    acc["avg_f1_k"].append(sum(values) / len(values))
+                    acc["max_f1_k"].append(max(values))
+                else:
                     acc["pass1"].append(1.0 if values[0] > 0 else 0.0)
                     acc["avgk"].append(sum(values) / len(values))
                     acc["passk"].append(1.0 if any(v > 0 for v in values) else 0.0)
@@ -350,7 +356,21 @@ class WideSeekR1AgentEvalRunner(AgentEvalRunner):
 
         aggregated_metrics = {}
         if is_markdown:
-            pass
+            aggregated_metrics["item_f1@1"] = (
+                sum(acc["f1_1"]) / len(acc["f1_1"]) if acc["f1_1"] else 0.0
+            )
+            aggregated_metrics["avg_item_f1@k"] = (
+                sum(acc["avg_f1_k"]) / len(acc["avg_f1_k"]) if acc["avg_f1_k"] else 0.0
+            )
+            aggregated_metrics["max_item_f1@k"] = (
+                sum(acc["max_f1_k"]) / len(acc["max_f1_k"]) if acc["max_f1_k"] else 0.0
+            )
+            aggregated_metrics.update(
+                aggregate_gisa_markdown_metrics(
+                    self.accumulated_raw_results,
+                    enabled=gisa_markdown_mode,
+                )
+            )
         else:
             aggregated_metrics["pass@1"] = (
                 sum(acc["pass1"]) / len(acc["pass1"]) if acc["pass1"] else 0.0

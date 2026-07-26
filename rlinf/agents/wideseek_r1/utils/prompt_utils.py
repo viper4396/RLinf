@@ -17,6 +17,10 @@ from rlinf.agents.wideseek_r1.utils.prompt import (
     BOXED_FORMAT_ZH,
     MARKDOWN_FORMAT_EN,
     MARKDOWN_FORMAT_ZH,
+    MARKDOWN_LIST_FORMAT_EN,
+    MARKDOWN_LIST_FORMAT_ZH,
+    MARKDOWN_SET_FORMAT_EN,
+    MARKDOWN_SET_FORMAT_ZH,
     SYSTEM_PROMPT_PLANNER,
     SYSTEM_PROMPT_PLANNER_NOSHOT,
     SYSTEM_PROMPT_PLANNER_ZH,
@@ -36,27 +40,83 @@ from rlinf.agents.wideseek_r1.utils.prompt import (
 )
 
 
-def get_prompt_planner(question: str, is_markdown: bool, language: str) -> str:
+def _format_instruction(
+    is_markdown: bool,
+    language: str,
+    *,
+    is_gisa: bool = False,
+    answer_type: str | None = None,
+) -> str:
+    """Select the final-answer instruction for one sample.
+
+    GISA sets and lists use a stricter one-column pipe-table contract so their
+    cells can be compared without treating JSON keys or prose as table data.
+    Existing non-GISA formatting remains unchanged.
+    """
+    if not is_markdown:
+        return BOXED_FORMAT_ZH if language == "zh" else BOXED_FORMAT_EN
+
+    normalized_type = (
+        str(answer_type).strip().lower() if answer_type is not None else "table"
+    )
+    if is_gisa and normalized_type == "set":
+        return MARKDOWN_SET_FORMAT_ZH if language == "zh" else MARKDOWN_SET_FORMAT_EN
+    if is_gisa and normalized_type == "list":
+        return MARKDOWN_LIST_FORMAT_ZH if language == "zh" else MARKDOWN_LIST_FORMAT_EN
+    return MARKDOWN_FORMAT_ZH if language == "zh" else MARKDOWN_FORMAT_EN
+
+
+def _resolve_add_few_shot(add_few_shot: bool | None, is_markdown: bool) -> bool:
+    """Preserve the legacy R1 selection unless explicitly configured."""
+    return is_markdown if add_few_shot is None else bool(add_few_shot)
+
+
+def get_prompt_planner(
+    question: str,
+    is_markdown: bool,
+    language: str,
+    *,
+    add_few_shot: bool | None = None,
+    answer_type: str | None = None,
+    is_gisa: bool = False,
+) -> list[dict]:
     if language == "zh":
-        return get_prompt_planner_zh(question, is_markdown)
+        return get_prompt_planner_zh(
+            question,
+            is_markdown,
+            add_few_shot=add_few_shot,
+            answer_type=answer_type,
+            is_gisa=is_gisa,
+        )
     else:
-        return get_prompt_planner_en(question, is_markdown)
+        return get_prompt_planner_en(
+            question,
+            is_markdown,
+            add_few_shot=add_few_shot,
+            answer_type=answer_type,
+            is_gisa=is_gisa,
+        )
 
 
-def get_prompt_planner_en(question: str, is_markdown: bool) -> str:
-    # Add fewshot only for markdown questions
-    add_few_shot = is_markdown
-
+def get_prompt_planner_en(
+    question: str,
+    is_markdown: bool,
+    *,
+    add_few_shot: bool | None = None,
+    answer_type: str | None = None,
+    is_gisa: bool = False,
+) -> list[dict]:
+    add_few_shot = _resolve_add_few_shot(add_few_shot, is_markdown)
+    format_instruction = _format_instruction(
+        is_markdown,
+        "en",
+        is_gisa=is_gisa,
+        answer_type=answer_type,
+    )
     if add_few_shot:
-        if is_markdown:
-            system = SYSTEM_PROMPT_PLANNER.format(MARKDOWN_FORMAT_EN)
-        else:
-            system = SYSTEM_PROMPT_PLANNER.format(BOXED_FORMAT_EN)
+        system = SYSTEM_PROMPT_PLANNER.format(format_instruction)
     else:
-        if is_markdown:
-            system = SYSTEM_PROMPT_PLANNER_NOSHOT.format(MARKDOWN_FORMAT_EN)
-        else:
-            system = SYSTEM_PROMPT_PLANNER_NOSHOT.format(BOXED_FORMAT_EN)
+        system = SYSTEM_PROMPT_PLANNER_NOSHOT.format(format_instruction)
 
     return [
         {"role": "system", "content": system},
@@ -64,20 +124,25 @@ def get_prompt_planner_en(question: str, is_markdown: bool) -> str:
     ]
 
 
-def get_prompt_planner_zh(question: str, is_markdown: bool) -> str:
-    # Add fewshot only for markdown questions
-    add_few_shot = is_markdown
-
+def get_prompt_planner_zh(
+    question: str,
+    is_markdown: bool,
+    *,
+    add_few_shot: bool | None = None,
+    answer_type: str | None = None,
+    is_gisa: bool = False,
+) -> list[dict]:
+    add_few_shot = _resolve_add_few_shot(add_few_shot, is_markdown)
+    format_instruction = _format_instruction(
+        is_markdown,
+        "zh",
+        is_gisa=is_gisa,
+        answer_type=answer_type,
+    )
     if add_few_shot:
-        if is_markdown:
-            system = SYSTEM_PROMPT_PLANNER_ZH.format(MARKDOWN_FORMAT_ZH)
-        else:
-            system = SYSTEM_PROMPT_PLANNER_ZH.format(BOXED_FORMAT_ZH)
+        system = SYSTEM_PROMPT_PLANNER_ZH.format(format_instruction)
     else:
-        if is_markdown:
-            system = SYSTEM_PROMPT_PLANNER_ZH_NOSHOT.format(MARKDOWN_FORMAT_ZH)
-        else:
-            system = SYSTEM_PROMPT_PLANNER_ZH_NOSHOT.format(BOXED_FORMAT_ZH)
+        system = SYSTEM_PROMPT_PLANNER_ZH_NOSHOT.format(format_instruction)
 
     return [
         {"role": "system", "content": system},
@@ -85,7 +150,7 @@ def get_prompt_planner_zh(question: str, is_markdown: bool) -> str:
     ]
 
 
-def get_prompt_worker(origin_question: str, subtask: str, language="en") -> str:
+def get_prompt_worker(origin_question: str, subtask: str, language="en") -> list[dict]:
     if language == "zh":
         text = USER_PROMPT_WORKER_ZH.format(origin_question, subtask)
     else:
@@ -101,27 +166,52 @@ def get_prompt_worker(origin_question: str, subtask: str, language="en") -> str:
     ]
 
 
-def get_prompt_single_agent(question: str, is_markdown: bool, language) -> str:
+def get_prompt_single_agent(
+    question: str,
+    is_markdown: bool,
+    language: str,
+    *,
+    add_few_shot: bool | None = None,
+    answer_type: str | None = None,
+    is_gisa: bool = False,
+) -> list[dict]:
     if language == "zh":
-        return get_prompt_single_agent_zh(question, is_markdown)
+        return get_prompt_single_agent_zh(
+            question,
+            is_markdown,
+            add_few_shot=add_few_shot,
+            answer_type=answer_type,
+            is_gisa=is_gisa,
+        )
     else:
-        return get_prompt_single_agent_en(question, is_markdown)
+        return get_prompt_single_agent_en(
+            question,
+            is_markdown,
+            add_few_shot=add_few_shot,
+            answer_type=answer_type,
+            is_gisa=is_gisa,
+        )
 
 
-def get_prompt_single_agent_en(question: str, is_markdown: bool) -> str:
-    # Add fewshot only for markdown questions
-    add_few_shot = is_markdown
-
+def get_prompt_single_agent_en(
+    question: str,
+    is_markdown: bool,
+    *,
+    add_few_shot: bool | None = None,
+    answer_type: str | None = None,
+    is_gisa: bool = False,
+) -> list[dict]:
+    add_few_shot = _resolve_add_few_shot(add_few_shot, is_markdown)
+    format_instruction = _format_instruction(
+        is_markdown,
+        "en",
+        is_gisa=is_gisa,
+        answer_type=answer_type,
+    )
     if add_few_shot:
-        if is_markdown:
-            system = SYSTEM_PROMPT_SINGLE_AGENT.format(MARKDOWN_FORMAT_EN)
-        else:
-            system = SYSTEM_PROMPT_SINGLE_AGENT.format(BOXED_FORMAT_EN)
+        system = SYSTEM_PROMPT_SINGLE_AGENT.format(format_instruction)
     else:
-        if is_markdown:
-            system = SYSTEM_PROMPT_SINGLE_AGENT_NOSHOT.format(MARKDOWN_FORMAT_EN)
-        else:
-            system = SYSTEM_PROMPT_SINGLE_AGENT_NOSHOT.format(BOXED_FORMAT_EN)
+        system = SYSTEM_PROMPT_SINGLE_AGENT_NOSHOT.format(format_instruction)
 
     return [
         {"role": "system", "content": system},
@@ -129,20 +219,25 @@ def get_prompt_single_agent_en(question: str, is_markdown: bool) -> str:
     ]
 
 
-def get_prompt_single_agent_zh(question: str, is_markdown: bool) -> str:
-    # Add fewshot only for markdown questions
-    add_few_shot = is_markdown
-
+def get_prompt_single_agent_zh(
+    question: str,
+    is_markdown: bool,
+    *,
+    add_few_shot: bool | None = None,
+    answer_type: str | None = None,
+    is_gisa: bool = False,
+) -> list[dict]:
+    add_few_shot = _resolve_add_few_shot(add_few_shot, is_markdown)
+    format_instruction = _format_instruction(
+        is_markdown,
+        "zh",
+        is_gisa=is_gisa,
+        answer_type=answer_type,
+    )
     if add_few_shot:
-        if is_markdown:
-            system = SYSTEM_PROMPT_SINGLE_AGENT_ZH.format(MARKDOWN_FORMAT_ZH)
-        else:
-            system = SYSTEM_PROMPT_SINGLE_AGENT_ZH.format(BOXED_FORMAT_ZH)
+        system = SYSTEM_PROMPT_SINGLE_AGENT_ZH.format(format_instruction)
     else:
-        if is_markdown:
-            system = SYSTEM_PROMPT_SINGLE_AGENT_ZH_NOSHOT.format(MARKDOWN_FORMAT_ZH)
-        else:
-            system = SYSTEM_PROMPT_SINGLE_AGENT_ZH_NOSHOT.format(BOXED_FORMAT_ZH)
+        system = SYSTEM_PROMPT_SINGLE_AGENT_ZH_NOSHOT.format(format_instruction)
 
     return [
         {"role": "system", "content": system},

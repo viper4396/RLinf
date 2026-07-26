@@ -98,6 +98,7 @@ data:
   num_workers: 2
   prompt_key: question
   answer_key: answer
+  is_gisa: False
   apply_chat_template: False
   shuffle: True
   validation_shuffle: False
@@ -120,6 +121,8 @@ agentloop:
   print_outputs: False # whether to print the outputs (token ids, texts, tool calls, etc.) of agent loop worker.
   max_workers_per_planner: 10
   max_toolcall_per_worker: 5
+  # null preserves the legacy behavior: Markdown uses few-shot and boxed uses no-shot.
+  add_few_shot: null
   is_dynamic_rollout_batch: True
 
   # use original R1 flat reward (format + search + llm - length) instead of turn/traj modes.

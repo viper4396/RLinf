@@ -16,8 +16,6 @@ import asyncio
 import copy
 import json
 import re
-from collections import Counter
-from difflib import SequenceMatcher
 from io import StringIO
 from typing import Awaitable, Callable
 
@@ -128,66 +126,66 @@ async def get_final_reward_score(
     origin_question,
     extract_answer,
     label_answer,
-    answer_mode,
     norm_column,
     judge_llm_generator: Callable[[list], Awaitable[str]] | None,
 ):
-    """Compute final reward score for boxed answers or markdown-table answers.
+    """Compute the final reward score for a Markdown-table answer.
 
     Args:
         origin_question: Original user question text.
-        extract_answer: Parsed model answer (string or DataFrame).
+        extract_answer: Parsed model answer DataFrame.
         label_answer: Ground-truth answer payload from dataset.
-        answer_mode: Answer mode for this sample (``markdown`` or ``boxed``).
         norm_column: Whether to normalize markdown column names aggressively.
         judge_llm_generator: Shared LLM judge generator function backed by SGLang.
-            GISA exact-match evaluation does not use it.
 
     Returns:
-        Tuple of `(reward_score, format_ok)`.
+        Tuple of ``(reward_score, format_ok, answer_metrics)``. GISA samples
+        populate ``answer_metrics`` with judge-based structured scores.
     """
     if isinstance(label_answer, dict) and label_answer.get("is_gisa", False):
-        return evaluate_gisa_exact_match(
+        return await evaluate_gisa_with_llm_judge(
+            question=origin_question,
             extract_answer=extract_answer,
             label_answer=label_answer,
+            judge_llm_generator=judge_llm_generator,
         )
 
     if judge_llm_generator is None:
-        return 0.0, False
+        return 0.0, False, {}
 
-    if answer_mode == "markdown":
-        return await evaluate_markdown(
-            extract_answer, label_answer, judge_llm_generator, norm_column
-        )
-
-    label_answer = label_answer["answer"]
-    if label_answer is not None and extract_answer is not None:
-        # Use LLM as judge
+    if label_answer.get("answer_type") == "item":
+        predicted_item = _markdown_item_value(extract_answer)
+        if predicted_item is None:
+            return 0.0, False, {}
         reward_score = await verify_answer_with_llm_judge(
             question=origin_question,
-            predicted_answer=extract_answer,
-            correct_answer=label_answer,
+            predicted_answer=predicted_item,
+            correct_answer=label_answer.get("answer"),
             judge_llm_generator=judge_llm_generator,
         )
-    else:
-        reward_score = 0.0
+        return reward_score, True, {}
 
-    return reward_score, True
+    reward_score, format_ok = await evaluate_markdown(
+        extract_answer, label_answer, judge_llm_generator, norm_column
+    )
+    return reward_score, format_ok, {}
 
 
 async def verify_answer_with_llm_judge(
     question: str,
-    predicted_answer: str,
-    correct_answer: list,
+    predicted_answer,
+    correct_answer,
     judge_llm_generator: Callable[[list], Awaitable[str]],
+    answer_type: str = "item",
 ) -> float:
     """Use an LLM judge to score equivalence between prediction and reference.
 
     Args:
         question: Original user question.
-        predicted_answer: Model-predicted boxed answer.
-        correct_answer: Reference answer list from dataset.
+        predicted_answer: Model-predicted answer.
+        correct_answer: Reference answer or accepted-reference list.
         judge_llm_generator: Shared LLM judge generator function backed by SGLang.
+        answer_type: Structural semantics used when comparing the answers.
 
     Returns:
         `1.0` if judged correct, otherwise `0.0`.
@@ -195,17 +193,33 @@ async def verify_answer_with_llm_judge(
     from rlinf.agents.wideseek_r2.utils.prompt import LLM_JUDGE_PROMPT
 
     # A single-element reference list is unwrapped to its only element.
-    reference = correct_answer[0] if len(correct_answer) == 1 else correct_answer
+    reference = (
+        correct_answer[0]
+        if isinstance(correct_answer, list) and len(correct_answer) == 1
+        else correct_answer
+    )
     judge_prompt_text = LLM_JUDGE_PROMPT.format(
         question=question,
         correct_answer=reference,
         response=predicted_answer,
     )
 
+    type_rules = {
+        "item": "The prediction passes when it is semantically equivalent to any accepted reference answer.",
+        "set": "Treat both answers as sets: ignore member order and duplicate occurrences, but require the same members.",
+        "list": "Treat both answers as ordered lists: require the same members in the same order, including meaningful duplicates.",
+        "table": "Treat both answers as tables: require the requested schema and semantically equivalent row and cell content.",
+    }
     judge_messages = [
         {
             "role": "system",
-            "content": "You are an evaluation assistant. Please determine if the predicted answer is equivalent to the labeled answer.",
+            "content": (
+                "You are an evaluation assistant. Determine whether the predicted "
+                "answer is equivalent to the labeled answer. "
+                f"{type_rules.get(answer_type, type_rules['table'])} "
+                "Allow harmless wording and formatting differences. Conclude with "
+                "exactly Correct or Incorrect."
+            ),
         },
         {"role": "user", "content": judge_prompt_text},
     ]
@@ -225,7 +239,12 @@ def _markdown_dataframe(answer) -> pd.DataFrame | None:
         answer = extract_final_answer(answer, mode="markdown", strict=False)
     elif isinstance(answer, list):
         try:
-            answer = pd.DataFrame.from_records(answer)
+            if answer and all(
+                not isinstance(value, (dict, list, tuple)) for value in answer
+            ):
+                answer = pd.DataFrame({"Item": answer})
+            else:
+                answer = pd.DataFrame.from_records(answer)
         except (TypeError, ValueError):
             return None
     if not isinstance(answer, pd.DataFrame) or answer.empty:
@@ -233,231 +252,305 @@ def _markdown_dataframe(answer) -> pd.DataFrame | None:
     return answer
 
 
-def _normalize_em_value(value) -> str:
-    """Normalize surrounding whitespace while preserving exact text."""
+def _normalize_answer_value(value) -> str:
+    """Normalize an answer value for judge serialization."""
     return "" if pd.isna(value) else str(value).strip()
 
 
-def _flatten_markdown_contents(answer) -> list[str] | None:
-    """Return normalized Markdown data cells in row-major order."""
+def _markdown_item_value(answer) -> str | None:
+    """Return the sole value from a valid one-row ``Item`` Markdown table."""
     answer_df = _markdown_dataframe(answer)
-    if answer_df is None:
+    if answer_df is None or answer_df.shape != (1, 1):
         return None
+    if _normalize_answer_value(answer_df.columns[0]).lower() != "item":
+        return None
+    return _normalize_answer_value(answer_df.iat[0, 0])
+
+
+def _f1_score(matches: int, predictions: int, references: int) -> float:
+    """Calculate F1 from a number of semantically matched items."""
+    denominator = predictions + references
+    return 2.0 * matches / denominator if denominator else 0.0
+
+
+def _maximum_semantic_matching(matrix: list[list[bool]]) -> list[tuple[int, int]]:
+    """Return a maximum one-to-one matching from a semantic-equivalence matrix."""
+    if not matrix or not matrix[0]:
+        return []
+
+    reference_matches = [-1] * len(matrix[0])
+
+    def augment(prediction_index: int, seen: list[bool]) -> bool:
+        for reference_index, equivalent in enumerate(matrix[prediction_index]):
+            if not equivalent or seen[reference_index]:
+                continue
+            seen[reference_index] = True
+            previous_prediction = reference_matches[reference_index]
+            if previous_prediction < 0 or augment(previous_prediction, seen):
+                reference_matches[reference_index] = prediction_index
+                return True
+        return False
+
+    for prediction_index in range(len(matrix)):
+        augment(prediction_index, [False] * len(matrix[0]))
+
     return [
-        _normalize_em_value(value)
-        for row in answer_df.itertuples(index=False, name=None)
-        for value in row
+        (prediction_index, reference_index)
+        for reference_index, prediction_index in enumerate(reference_matches)
+        if prediction_index >= 0
     ]
 
 
-def _cell_f1(true_positives: int, num_predictions: int, num_references: int) -> float:
-    """Calculate F1 from exact cell matches and cell counts."""
-    denominator = num_predictions + num_references
-    return 2.0 * true_positives / denominator if denominator else 0.0
+async def _semantic_equivalence_matrix(
+    predictions: list,
+    references: list,
+    judge_llm_generator: Callable[[list], Awaitable[str]],
+) -> list[list[bool]]:
+    """Judge every prediction/reference pair and return an equivalence matrix."""
+    if not predictions or not references:
+        return [[False] * len(references) for _ in predictions]
 
+    pair_predictions = []
+    pair_references = []
+    for prediction in predictions:
+        for reference in references:
+            pair_predictions.append(prediction)
+            pair_references.append(reference)
 
-def _normalize_table_column(column) -> str:
-    """Normalize a table column name for schema and row-key alignment."""
-    return _normalize_em_value(column).lower()
-
-
-def _gisa_table_cell_f1(correct_answer, predicted_answer, unique_columns) -> float:
-    """Calculate exact cell F1 after aligning table rows by unique columns."""
-    correct_df = _markdown_dataframe(correct_answer)
-    predicted_df = _markdown_dataframe(predicted_answer)
-    if correct_df is None or predicted_df is None:
-        return 0.0
-
-    correct_df = correct_df.copy()
-    predicted_df = predicted_df.copy()
-    correct_df.columns = [
-        _normalize_table_column(column) for column in correct_df.columns
-    ]
-    predicted_df.columns = [
-        _normalize_table_column(column) for column in predicted_df.columns
-    ]
-
-    num_references = correct_df.size
-    num_predictions = predicted_df.size
-    if correct_df.columns.has_duplicates or predicted_df.columns.has_duplicates:
-        return _cell_f1(0, num_predictions, num_references)
-
-    correct_columns = set(correct_df.columns)
-    predicted_columns = set(predicted_df.columns)
-    shared_columns = [
-        column for column in correct_df.columns if column in predicted_columns
-    ]
-    normalized_unique_columns = [
-        _normalize_table_column(column) for column in (unique_columns or [])
-    ]
-
-    if normalized_unique_columns and not set(normalized_unique_columns).issubset(
-        correct_columns & predicted_columns
-    ):
-        return _cell_f1(0, num_predictions, num_references)
-
-    def normalized_row(df: pd.DataFrame, row_index: int, columns: list[str]) -> tuple:
-        return tuple(
-            _normalize_em_value(df.iloc[row_index][column]) for column in columns
-        )
-
-    aligned_rows = []
-    if normalized_unique_columns:
-        predicted_rows_by_key: dict[tuple, list[int]] = {}
-        for row_index in range(len(predicted_df)):
-            key = normalized_row(predicted_df, row_index, normalized_unique_columns)
-            predicted_rows_by_key.setdefault(key, []).append(row_index)
-
-        for correct_index in range(len(correct_df)):
-            key = normalized_row(correct_df, correct_index, normalized_unique_columns)
-            predicted_indices = predicted_rows_by_key.get(key)
-            if predicted_indices:
-                aligned_rows.append((correct_index, predicted_indices.pop(0)))
-    else:
-        aligned_rows = list(range(min(len(correct_df), len(predicted_df))))
-        aligned_rows = [(row_index, row_index) for row_index in aligned_rows]
-
-    true_positives = sum(
-        _normalize_em_value(correct_df.iloc[correct_index][column])
-        == _normalize_em_value(predicted_df.iloc[predicted_index][column])
-        for correct_index, predicted_index in aligned_rows
-        for column in shared_columns
+    scores = await llm_judge_column(
+        pair_predictions,
+        pair_references,
+        judge_llm_generator,
     )
-    return _cell_f1(true_positives, num_predictions, num_references)
+    width = len(references)
+    return [
+        [score >= 0.5 for score in scores[offset : offset + width]]
+        for offset in range(0, len(scores), width)
+    ]
 
 
-def _gisa_table_row_f1(correct_answer, predicted_answer) -> float:
-    """Calculate exact row F1 over the shared table schema."""
-    correct_df = _markdown_dataframe(correct_answer)
-    predicted_df = _markdown_dataframe(predicted_answer)
-    if correct_df is None or predicted_df is None:
+def _semantic_order_score(matrix: list[list[bool]]) -> float:
+    """Calculate an LCS-style order score from semantic element matches."""
+    if not matrix or not matrix[0]:
         return 0.0
 
-    correct_df = correct_df.copy()
-    predicted_df = predicted_df.copy()
-    correct_df.columns = [
-        _normalize_table_column(column) for column in correct_df.columns
+    num_predictions = len(matrix)
+    num_references = len(matrix[0])
+    lcs = [[0] * (num_references + 1) for _ in range(num_predictions + 1)]
+    for prediction_index in range(1, num_predictions + 1):
+        for reference_index in range(1, num_references + 1):
+            if matrix[prediction_index - 1][reference_index - 1]:
+                lcs[prediction_index][reference_index] = (
+                    lcs[prediction_index - 1][reference_index - 1] + 1
+                )
+            else:
+                lcs[prediction_index][reference_index] = max(
+                    lcs[prediction_index - 1][reference_index],
+                    lcs[prediction_index][reference_index - 1],
+                )
+    return _f1_score(
+        lcs[num_predictions][num_references],
+        num_predictions,
+        num_references,
+    )
+
+
+async def _evaluate_gisa_collection(
+    answer_type: str,
+    predicted_df: pd.DataFrame,
+    reference_df: pd.DataFrame,
+    judge_llm_generator: Callable[[list], Awaitable[str]],
+) -> dict[str, float]:
+    """Evaluate a set or list with semantic cell matching."""
+    predicted_values = [
+        _normalize_answer_value(value) for value in predicted_df.iloc[:, 0].tolist()
     ]
-    predicted_df.columns = [
-        _normalize_table_column(column) for column in predicted_df.columns
+    reference_values = [
+        _normalize_answer_value(value) for value in reference_df.iloc[:, 0].tolist()
     ]
-    if correct_df.columns.has_duplicates or predicted_df.columns.has_duplicates:
-        return 0.0
+    if answer_type == "set":
+        predicted_values = list(dict.fromkeys(predicted_values))
+        reference_values = list(dict.fromkeys(reference_values))
+
+    matrix = await _semantic_equivalence_matrix(
+        predicted_values,
+        reference_values,
+        judge_llm_generator,
+    )
+    matched_items = len(_maximum_semantic_matching(matrix))
+    cell_f1 = _f1_score(
+        matched_items,
+        len(predicted_values),
+        len(reference_values),
+    )
+    metrics = {"cell_f1": cell_f1}
+    if answer_type == "list":
+        order_score = _semantic_order_score(matrix)
+        metrics["order_score"] = order_score
+        metrics["pass"] = float(cell_f1 == 1.0 and order_score == 1.0)
+    else:
+        metrics["pass"] = float(cell_f1 == 1.0)
+    return metrics
+
+
+def _normalized_table(df: pd.DataFrame) -> pd.DataFrame | None:
+    """Return a copy with normalized, unique column names."""
+    result = df.copy()
+    result.columns = [
+        _normalize_answer_value(column).lower() for column in result.columns
+    ]
+    if result.columns.has_duplicates:
+        return None
+    return result
+
+
+def _table_rows(df: pd.DataFrame, columns: list[str]) -> list[dict[str, str]]:
+    """Serialize selected table columns into row dictionaries for the judge."""
+    return [
+        {
+            column: _normalize_answer_value(df.iloc[row_index][column])
+            for column in columns
+        }
+        for row_index in range(len(df))
+    ]
+
+
+async def _evaluate_gisa_table(
+    predicted_df: pd.DataFrame,
+    reference_df: pd.DataFrame,
+    unique_columns: list,
+    judge_llm_generator: Callable[[list], Awaitable[str]],
+) -> dict[str, float]:
+    """Evaluate table cells and complete rows with semantic LLM matching."""
+    predicted_df = _normalized_table(predicted_df)
+    reference_df = _normalized_table(reference_df)
+    if predicted_df is None or reference_df is None:
+        return {"cell_f1": 0.0, "row_f1": 0.0, "pass": 0.0}
 
     shared_columns = [
-        column for column in correct_df.columns if column in predicted_df.columns
+        column for column in reference_df.columns if column in predicted_df.columns
     ]
+    num_predictions = predicted_df.size
+    num_references = reference_df.size
     if not shared_columns:
-        return 0.0
+        return {"cell_f1": 0.0, "row_f1": 0.0, "pass": 0.0}
 
-    correct_rows = {
-        tuple(_normalize_em_value(value) for value in row)
-        for row in correct_df[shared_columns].itertuples(index=False, name=None)
+    normalized_unique_columns = [
+        _normalize_answer_value(column).lower() for column in (unique_columns or [])
+    ]
+    if normalized_unique_columns and set(normalized_unique_columns).issubset(
+        set(shared_columns)
+    ):
+        prediction_keys = _table_rows(predicted_df, normalized_unique_columns)
+        reference_keys = _table_rows(reference_df, normalized_unique_columns)
+        key_matrix = await _semantic_equivalence_matrix(
+            prediction_keys,
+            reference_keys,
+            judge_llm_generator,
+        )
+        aligned_rows = _maximum_semantic_matching(key_matrix)
+    else:
+        aligned_rows = [
+            (row_index, row_index)
+            for row_index in range(min(len(predicted_df), len(reference_df)))
+        ]
+
+    cell_predictions = []
+    cell_references = []
+    for prediction_index, reference_index in aligned_rows:
+        for column in shared_columns:
+            cell_predictions.append(predicted_df.iloc[prediction_index][column])
+            cell_references.append(reference_df.iloc[reference_index][column])
+
+    cell_scores = await llm_judge_column(
+        cell_predictions,
+        cell_references,
+        judge_llm_generator,
+    )
+    matched_cells = sum(score >= 0.5 for score in cell_scores)
+    cell_f1 = _f1_score(matched_cells, num_predictions, num_references)
+
+    predicted_rows = _table_rows(predicted_df, shared_columns)
+    reference_rows = _table_rows(reference_df, shared_columns)
+    row_matrix = await _semantic_equivalence_matrix(
+        predicted_rows,
+        reference_rows,
+        judge_llm_generator,
+    )
+    matched_rows = len(_maximum_semantic_matching(row_matrix))
+    row_f1 = _f1_score(matched_rows, len(predicted_rows), len(reference_rows))
+    return {
+        "cell_f1": cell_f1,
+        "row_f1": row_f1,
+        "pass": float(cell_f1 == 1.0 and row_f1 == 1.0),
     }
-    predicted_rows = {
-        tuple(_normalize_em_value(value) for value in row)
-        for row in predicted_df[shared_columns].itertuples(index=False, name=None)
-    }
-    true_positives = len(correct_rows & predicted_rows)
-    return _cell_f1(true_positives, len(predicted_rows), len(correct_rows))
 
 
-def evaluate_gisa_markdown_scores(
+async def evaluate_gisa_with_llm_judge(
+    question: str,
     extract_answer,
     label_answer: dict,
-) -> tuple[dict[str, float], bool]:
-    """Compute deterministic GISA scores for one Markdown answer.
+    judge_llm_generator: Callable[[list], Awaitable[str]] | None,
+) -> tuple[float, bool, dict[str, float]]:
+    """Evaluate GISA cells and rows with semantic LLM-judge decisions.
 
     Args:
-        extract_answer: Parsed prediction DataFrame or serialized records.
-        label_answer: Ground-truth answer payload.
-
-    Returns:
-        A score dictionary and whether both Markdown answers were parseable.
-    """
-    answer_type = label_answer.get("answer_type")
-    correct_contents = _flatten_markdown_contents(label_answer.get("answer", ""))
-    predicted_contents = _flatten_markdown_contents(extract_answer)
-    if correct_contents is None or predicted_contents is None:
-        return {}, False
-
-    if answer_type == "table":
-        cell_f1 = _gisa_table_cell_f1(
-            label_answer.get("answer", ""),
-            extract_answer,
-            label_answer.get("unique_columns", []),
-        )
-        return {
-            "cell_f1": cell_f1,
-            "row_f1": _gisa_table_row_f1(
-                label_answer.get("answer", ""), extract_answer
-            ),
-            "exact_match": float(cell_f1 == 1.0),
-        }, True
-
-    if answer_type == "set":
-        correct_values = set(correct_contents)
-        predicted_values = set(predicted_contents)
-        true_positives = len(correct_values & predicted_values)
-        cell_f1 = _cell_f1(true_positives, len(predicted_values), len(correct_values))
-        return {"cell_f1": cell_f1, "exact_match": float(cell_f1 == 1.0)}, True
-
-    if answer_type == "list":
-        correct_counter = Counter(correct_contents)
-        predicted_counter = Counter(predicted_contents)
-        true_positives = sum((correct_counter & predicted_counter).values())
-        cell_f1 = _cell_f1(
-            true_positives, len(predicted_contents), len(correct_contents)
-        )
-        return {
-            "cell_f1": cell_f1,
-            "order_score": SequenceMatcher(
-                None, correct_contents, predicted_contents
-            ).ratio(),
-            "exact_match": float(correct_contents == predicted_contents),
-        }, True
-
-    return {}, False
-
-
-def evaluate_gisa_exact_match(
-    extract_answer,
-    label_answer: dict,
-) -> tuple[float, bool]:
-    """Evaluate every GISA answer locally with deterministic exact match.
-
-    Item answers use binary string EM. Markdown answers aggregate exact cell
-    matches into F1. Tables align rows using unique columns, sets ignore cell
-    order and duplicates, and list content F1 ignores order while preserving
-    duplicate counts.
-
-    Args:
+        question: Original user question.
         extract_answer: Parsed prediction DataFrame.
         label_answer: Ground-truth answer payload.
+        judge_llm_generator: Shared LLM judge callback.
 
     Returns:
-        ``(score, format_ok)``. Markdown scores are cell-level F1 values.
+        ``(cell_f1, format_ok, metrics)``. Metrics always include judge-based
+        ``cell_f1`` and ``pass`` and may include ``row_f1`` or ``order_score``.
     """
-    answer_type = label_answer.get("answer_type")
-    answer_mode = label_answer.get("answer_mode")
+    if judge_llm_generator is None:
+        return 0.0, False, {}
 
-    if answer_mode == "boxed" and answer_type == "item":
-        if extract_answer is None:
-            return 0.0, False
-        references = label_answer.get("answer", [])
-        if not isinstance(references, list):
-            references = [references]
-        prediction = _normalize_em_value(extract_answer)
-        score = any(
-            prediction == _normalize_em_value(reference) for reference in references
+    answer_type = label_answer.get("answer_type", "table")
+    answer_df = _markdown_dataframe(extract_answer)
+    if answer_df is None:
+        return 0.0, False, {}
+    if answer_type == "item":
+        predicted_item = _markdown_item_value(answer_df)
+        if predicted_item is None:
+            return 0.0, False, {}
+        cell_f1 = await verify_answer_with_llm_judge(
+            question=question,
+            predicted_answer=predicted_item,
+            correct_answer=label_answer.get("answer"),
+            judge_llm_generator=judge_llm_generator,
+            answer_type=answer_type,
         )
-        return float(score), True
+        metrics = {"cell_f1": cell_f1, "pass": cell_f1}
+    elif answer_type in {"set", "list"}:
+        if answer_df.shape[1] != 1:
+            return 0.0, False, {}
+        if _normalize_answer_value(answer_df.columns[0]).lower() != "item":
+            return 0.0, False, {}
+        reference_df = _markdown_dataframe(label_answer.get("answer"))
+        if reference_df is None or reference_df.shape[1] != 1:
+            return 0.0, False, {}
+        metrics = await _evaluate_gisa_collection(
+            answer_type,
+            answer_df,
+            reference_df,
+            judge_llm_generator,
+        )
+    elif answer_type == "table":
+        reference_df = _markdown_dataframe(label_answer.get("answer"))
+        if reference_df is None:
+            return 0.0, False, {}
+        metrics = await _evaluate_gisa_table(
+            answer_df,
+            reference_df,
+            label_answer.get("unique_columns", []),
+            judge_llm_generator,
+        )
+    elif answer_type != "table":
+        return 0.0, False, {}
 
-    if answer_mode != "markdown":
-        return 0.0, False
-
-    scores, format_ok = evaluate_gisa_markdown_scores(extract_answer, label_answer)
-    return scores.get("cell_f1", 0.0), format_ok
+    return metrics["cell_f1"], True, metrics
 
 
 async def evaluate_markdown(
@@ -798,17 +891,17 @@ The reference vocabulary is as follows:
     return primary_key_map
 
 
-def extract_final_answer(text: str, mode: str = "boxed", strict=True):
+def extract_final_answer(text: str, mode: str = "markdown", strict=True):
     """Extract final answer from generated text using a specific parsing mode.
 
     Args:
         text: Raw generated text that may include reasoning/tool wrappers.
-        mode: Parsing mode (`tag`, `boxed`, or `markdown`).
+        mode: Parsing mode (``tag`` for workers or ``markdown`` for main roles).
         strict: For markdown mode, require fenced markdown blocks when True.
 
     Returns:
-        For `tag`/`boxed`: extracted string or None.
-        For `markdown`: parsed `pd.DataFrame` or None.
+        For ``tag``: extracted string or None.
+        For ``markdown``: parsed ``pd.DataFrame`` or None.
     """
     text = text.split("</think>")[-1].strip()
     if mode == "tag":
@@ -819,42 +912,6 @@ def extract_final_answer(text: str, mode: str = "boxed", strict=True):
         if len(matches) < 1:
             return None
         return matches[-1].group(1).strip()
-    elif mode == "boxed":
-        if not text:
-            return None
-
-        matches = []
-        i = 0
-
-        while i < len(text):
-            boxed_start = text.find(r"\boxed{", i)
-            if boxed_start == -1:
-                break
-
-            content_start = boxed_start + 7  # len(r'\boxed{') = 7
-            if content_start >= len(text):
-                break
-
-            # Count balanced braces
-            brace_count = 1
-            content_end = content_start
-
-            while content_end < len(text) and brace_count > 0:
-                char = text[content_end]
-                if char == "{":
-                    brace_count += 1
-                elif char == "}":
-                    brace_count -= 1
-                content_end += 1
-
-            if brace_count == 0:
-                content = text[content_start : content_end - 1]
-                matches.append(content)
-                i = content_end
-            else:
-                i = content_start
-
-        return matches[-1] if matches else None
     elif mode == "markdown":
         if not text or not isinstance(text, str):
             return None
@@ -916,4 +973,4 @@ def extract_final_answer(text: str, mode: str = "boxed", strict=True):
 
         return response_df
     else:
-        raise ValueError(f"Unknown mode: {mode}. Must be 'tag', 'boxed', or 'markdown'")
+        raise ValueError(f"Unknown mode: {mode}. Must be 'tag' or 'markdown'")

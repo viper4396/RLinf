@@ -4,7 +4,7 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     https://www.apache.org/licenses/LICENSE-2.0
+#     http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-GISA_ANSWER_TYPES = frozenset({"item", "table", "set", "list"})
+from rlinf.agents.wideseek_r1.utils.reward import evaluate_gisa_markdown_scores
+
+GISA_MARKDOWN_ANSWER_TYPES = frozenset({"table", "set", "list"})
 
 
 def _aggregate_grouped_scores(
@@ -31,45 +33,31 @@ def _aggregate_grouped_scores(
     }
 
 
-def _aggregate_pass_scores(pass_groups: list[list[float]]) -> dict[str, float]:
-    """Aggregate binary pass values using conventional pass metric names."""
-    if not pass_groups:
-        return {}
-    first_passes = [passes[0] for passes in pass_groups]
-    average_passes = [sum(passes) / len(passes) for passes in pass_groups]
-    any_passes = [max(passes) for passes in pass_groups]
-    return {
-        "pass@1": sum(first_passes) / len(first_passes),
-        "avg@k": sum(average_passes) / len(average_passes),
-        "pass@k": sum(any_passes) / len(any_passes),
-    }
-
-
-def aggregate_gisa_metrics(
+def aggregate_gisa_markdown_metrics(
     raw_results: list[dict], *, enabled: bool
 ) -> dict[str, float]:
-    """Aggregate judge-based GISA cell, row, order, and pass metrics.
+    """Aggregate GISA Markdown EM and answer-type-specific metrics.
 
     Args:
         raw_results: Per-question rollout results produced by the evaluator.
-        enabled: Whether GISA evaluation is enabled.
+        enabled: Whether GISA Markdown evaluation is enabled.
 
     Returns:
-        Aggregated cell F1 and pass metrics, plus table row F1 and list order
-        score when applicable. Returns an empty dictionary when disabled or no
-        eligible samples are present.
+        Universal whole-answer EM, table row F1, and list order score metrics,
+        or an empty dictionary when GISA Markdown evaluation is disabled.
     """
     if not enabled:
         return {}
 
-    cell_f1_groups = []
-    pass_groups = []
+    exact_match_groups = []
     row_f1_groups = []
     order_score_groups = []
     for raw_result in raw_results:
         answer = raw_result.get("answer")
         if not (
-            isinstance(answer, dict) and answer.get("answer_type") in GISA_ANSWER_TYPES
+            isinstance(answer, dict)
+            and answer.get("is_markdown", False)
+            and answer.get("answer_type") in GISA_MARKDOWN_ANSWER_TYPES
         ):
             continue
 
@@ -77,24 +65,23 @@ def aggregate_gisa_metrics(
         if not samples:
             continue
 
-        sample_metrics = [sample.get("gisa_metrics") or {} for sample in samples]
-        cell_f1_groups.append(
-            [float(metrics.get("cell_f1", 0.0)) for metrics in sample_metrics]
-        )
-        pass_groups.append(
-            [float(metrics.get("pass", 0.0)) for metrics in sample_metrics]
+        sample_scores = [
+            evaluate_gisa_markdown_scores(sample.get("final_answer"), answer)[0]
+            for sample in samples
+        ]
+        exact_match_groups.append(
+            [scores.get("exact_match", 0.0) for scores in sample_scores]
         )
         if answer.get("answer_type") == "table":
             row_f1_groups.append(
-                [float(metrics.get("row_f1", 0.0)) for metrics in sample_metrics]
+                [scores.get("row_f1", 0.0) for scores in sample_scores]
             )
         elif answer.get("answer_type") == "list":
             order_score_groups.append(
-                [float(metrics.get("order_score", 0.0)) for metrics in sample_metrics]
+                [scores.get("order_score", 0.0) for scores in sample_scores]
             )
 
-    metrics = _aggregate_grouped_scores(cell_f1_groups, "item_f1")
-    metrics.update(_aggregate_pass_scores(pass_groups))
+    metrics = _aggregate_grouped_scores(exact_match_groups, "exact_match")
     metrics.update(_aggregate_grouped_scores(row_f1_groups, "row_f1"))
     metrics.update(_aggregate_grouped_scores(order_score_groups, "order_score"))
     return metrics

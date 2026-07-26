@@ -1,0 +1,57 @@
+defaults:
+  - base_eval
+  - _self_
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,reward: all
+    rollout: all
+
+runner:
+  experiment_name: gisa_collections
+  output_dir: ./logs/eval
+  seq_length: 32000
+
+  max_epochs: 1
+  max_steps: -1
+
+algorithm:
+  group_size: 8
+
+agentloop:
+  workflow: mas
+  max_sa_turns: 48
+  max_planner_turns: 8
+  max_worker_turns: 16
+  max_workers_per_planner: 8
+  max_toolcall_per_worker: 6
+  use_llm_judge: True
+  use_local_judge: False
+  llm_ip: LLM_JUDGE_IP
+  llm_port: LLM_JUDGE_PORT
+  llm_type: LLM_JUDGE_MODEL
+
+rollout:
+  model:
+    model_path: /mnt/project_rlinf/xzxuan/model/Qwen3-4B
+
+tools:
+  online: False
+  search:
+    server_addr: 127.0.0.1:8003
+    topk: 5
+  use_access_summary: True
+
+data:
+  type: wideseek_r2
+  max_prompt_length: 4096
+  val_rollout_batch_size: 20
+  prompt_key: question
+  answer_key: answer
+  answer_type: table
+  is_gisa: True
+  unique_columns: unique_columns
+  validation_shuffle: False
+  val_data_paths: /mnt/project_rlinf/xzxuan/WideSeek-R2/suheng/data/gisa_full373_markdown.jsonl
+  data_size: -1
