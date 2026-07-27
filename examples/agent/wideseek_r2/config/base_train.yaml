@@ -113,6 +113,30 @@ agentloop:
   group_name: "AgentLoopGroup"
   toolcall_parser: "wideseek_r2-qwen"
   workflow: mas
+  graph_memory:
+    enabled: false
+    schema_version: v1
+    condition_dsl_version: v1
+    max_nodes: 20000
+    max_edges: 60000
+    max_actions: 5000
+    max_dynamic_expansions: 4000
+    max_graph_versions: 20000
+    max_notification_tokens: 512
+    max_selected_evidence_tokens: 2048
+    max_delta_events_per_turn: 8
+    planner_recent_delta_versions: 3
+    event_ttl_versions: 20
+    max_concurrent_actions: 32
+    action_retry_limit: 2
+    require_source_for_verified_claim: true
+    min_independent_sources: 1
+    allow_worker_fact_proposal: false
+    deterministic_render: true
+    reject_mixed_tool_phases: true
+    log_snapshot: true
+    max_snapshot_nodes: 2000
+    snapshot_include_source_excerpt: false
   max_planner_turns: 10
   max_worker_turns: 20
   max_sa_turns: 50

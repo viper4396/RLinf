@@ -19,8 +19,8 @@ import hydra
 import torch.multiprocessing as mp
 from omegaconf.omegaconf import OmegaConf
 
+from rlinf.agents.wideseek_r2.agent_loop import get_wideseek_r2_agent_loop_cls
 from rlinf.agents.wideseek_r2.tools import WideSeekR2ToolWorker
-from rlinf.agents.wideseek_r2.wideseek_r2 import WideSeekR2AgentLoopWorker
 from rlinf.config import validate_cfg
 from rlinf.data.datasets import create_rl_dataset
 from rlinf.data.tokenizers import hf_tokenizer
@@ -96,9 +96,10 @@ def main(cfg) -> None:
         f"agentloop worker num {len(agentloop_placement_strategy._node_ranks)} now should be equal to rollout dp size {component_placement.rollout_dp_size}"
     )
 
-    agentloop_group = WideSeekR2AgentLoopWorker.create_group(
-        cfg, component_placement
-    ).launch(
+    agent_loop_cls = get_wideseek_r2_agent_loop_cls(
+        cfg.agentloop.get("workflow", "mas")
+    )
+    agentloop_group = agent_loop_cls.create_group(cfg, component_placement).launch(
         cluster,
         name=cfg.agentloop.group_name,
         placement_strategy=agentloop_placement_strategy,

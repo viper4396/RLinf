@@ -1,0 +1,5 @@
+defaults:
+  - train_qwen3_graph_item
+  - _self_
+
+# Compatibility alias for the Phase 1 item configuration.

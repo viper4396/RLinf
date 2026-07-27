@@ -27,8 +27,8 @@ class _FakeSession:
         return _FakeResponse()
 
 
-def test_sglang_judge_request_enables_thinking():
-    """Judge requests should enable the model's thinking chat template mode."""
+def test_sglang_judge_request_disables_thinking_by_default():
+    """Judge requests disable thinking by default."""
 
     async def _run():
         session = _FakeSession()
@@ -44,7 +44,7 @@ def test_sglang_judge_request_enables_thinking():
 
         assert result == "judge response"
         assert session.request["json"]["chat_template_kwargs"] == {
-            "enable_thinking": True
+            "enable_thinking": False
         }
 
     asyncio.run(_run())

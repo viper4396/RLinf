@@ -183,6 +183,286 @@ class WideSeekR2AgentLoopWorker(MultiAgentLoopWorker):
         result_text = await self.llm_generator(messages)
         return result_text
 
+    def _build_role_context(
+        self,
+        *,
+        origin_question: str,
+        role: str,
+        add_few_shot: bool,
+        max_workers_per_planner: int,
+        max_toolcall_per_worker: int,
+        main_task: str | None,
+        answer_type: str | None,
+        max_turns: int,
+    ) -> list[int]:
+        """Build the initial prompt for one role conversation.
+
+        This hook deliberately contains the existing prompt construction logic
+        unchanged.  Workflow-specific loop implementations can override it to
+        add scoped context while keeping the base MAS/SA prompt behavior
+        stable.
+
+        Args:
+            origin_question: Role-specific question.
+            role: Current role (`planner`, `worker`, or `single`).
+            add_few_shot: Whether to include few-shot examples.
+            max_workers_per_planner: Per-turn planner fan-out limit.
+            max_toolcall_per_worker: Per-turn worker tool-call limit.
+            main_task: Original task text for a worker, if any.
+            answer_type: Dataset-provided answer structure.
+            max_turns: Maximum number of turns for the role.
+
+        Returns:
+            Tokenized and length-limited initial prompt ids.
+        """
+        message_history, tools = build_message_history_and_tools(
+            origin_question=origin_question,
+            role=role,
+            add_few_shot=add_few_shot,
+            max_workers_per_planner=max_workers_per_planner,
+            max_toolcall_per_worker=max_toolcall_per_worker,
+            main_task=main_task,
+            answer_type=answer_type,
+        )
+
+        turn_hint = get_first_turn_hint(max_turns=max_turns)
+        assert message_history[-1]["role"] == "user"
+        message_history[-1]["content"] += turn_hint
+
+        prompt_ids = self.tokenizer.apply_chat_template(
+            message_history, tokenize=True, add_generation_prompt=True, tools=tools
+        )
+        return prompt_ids[: self.max_total_len]
+
+    async def _before_role_turn(
+        self,
+        *,
+        prompt_ids: list[int],
+        role: str,
+        turn_idx: int,
+        conv_id: str,
+    ) -> list[int]:
+        """Update a role prompt immediately before generation.
+
+        The default implementation is a no-op.  Subclasses can use this hook
+        to inject turn-boundary events without changing the base workflow.
+
+        Args:
+            prompt_ids: Current conversation prompt ids.
+            role: Current role (`planner`, `worker`, or `single`).
+            turn_idx: Zero-based turn index.
+            conv_id: Stable conversation id used for rollout affinity.
+
+        Returns:
+            Prompt ids to use for the current generation.
+        """
+        del role, turn_idx, conv_id
+        return prompt_ids
+
+    async def _dispatch_planner_requests(
+        self,
+        tool_requests: list[ToolRequest],
+        *,
+        main_task: str,
+        sub_traj_id: int,
+        sub_traj_num: int,
+    ) -> list[tuple[list[AgentLoopOutput], Optional[str], list]]:
+        """Run planner-created worker requests concurrently.
+
+        This is the default planner fan-out path.  It preserves the existing
+        `asyncio.gather` semantics so an unhandled worker error still aborts
+        the query, while allowing a graph workflow to provide a scheduler-
+        backed implementation later.
+
+        Args:
+            tool_requests: Parsed planner subtask requests.
+            main_task: Original user question.
+            sub_traj_id: Planner sub-trajectory id (normally zero).
+            sub_traj_num: Number of worker trajectories already allocated in
+                this planner conversation.
+
+        Returns:
+            Results in the same order as `tool_requests`.
+        """
+        assert sub_traj_id == 0
+        tasks = [
+            self.worker_call(
+                tool_request,
+                main_task,
+                sub_traj_id + index + 1 + sub_traj_num,
+            )
+            for index, tool_request in enumerate(tool_requests)
+        ]
+        return await asyncio.gather(*tasks)
+
+    def _format_planner_feedback(
+        self,
+        tool_requests: list[ToolRequest],
+        worker_results: list[tuple[list[AgentLoopOutput], Optional[str], list]],
+        *,
+        turn_idx: int,
+        max_turns: int,
+    ) -> tuple[list[AgentLoopOutput], list, list[dict]]:
+        """Format worker results for the next planner turn.
+
+        Args:
+            tool_requests: Planner requests corresponding to `worker_results`.
+            worker_results: Worker outputs in request order.
+            turn_idx: Current planner turn index.
+            max_turns: Planner turn budget.
+
+        Returns:
+            Worker output buffer, worker turn statistics, and tool messages for
+            the planner conversation.
+        """
+        worker_buffer = []
+        worker_turn_list = []
+        tool_messages_text = []
+        for idx, (
+            worker_outputs_buffer,
+            worker_summary,
+            total_turn_list_worker,
+        ) in enumerate(worker_results):
+            worker_buffer.extend(worker_outputs_buffer)
+            worker_turn_list.extend(total_turn_list_worker)
+            # Format tool response with both request and result.
+            subtask_text = tool_requests[idx].arguments["subtask"]
+            # The worker `<answer>` extraction result decides success:
+            # a present summary -> result message, None -> failed message.
+            if worker_summary is not None:
+                tool_messages_text.append(
+                    get_planner_subtask_result_message(
+                        subtask_idx=idx + 1,
+                        subtask_text=subtask_text,
+                        worker_summary=worker_summary,
+                    )
+                )
+            else:
+                tool_messages_text.append(
+                    get_planner_subtask_failed_message(
+                        subtask_idx=idx + 1,
+                        subtask_text=subtask_text,
+                    )
+                )
+
+        turn_hint = get_next_turn_hint(
+            next_turn_idx=turn_idx + 2,
+            max_turns=max_turns,
+        )
+        tool_messages = [
+            {
+                "role": "tool",
+                "content": "\n\n".join(tool_messages_text) + turn_hint,
+            }
+        ]
+        return worker_buffer, worker_turn_list, tool_messages
+
+    async def _dispatch_worker_requests(
+        self, tool_requests: list[ToolRequest]
+    ) -> list[ToolResponse]:
+        """Execute worker or single-agent external tools concurrently."""
+        return await asyncio.gather(
+            *(self.tool_call(tool_request) for tool_request in tool_requests)
+        )
+
+    async def _format_worker_feedback(
+        self,
+        tool_requests: list[ToolRequest],
+        tool_responses: list[ToolResponse],
+        *,
+        turn_idx: int,
+        max_turns: int,
+    ) -> list[dict]:
+        """Format external tool responses for the next role turn.
+
+        Access summaries intentionally remain in this hook so a future graph
+        workflow can replace the feedback channel without changing external
+        tool execution.
+        """
+        tool_messages_text = []
+        access_summary_jobs = []
+        for idx, (tool_request, tool_response) in enumerate(
+            zip(tool_requests, tool_responses)
+        ):
+            # Include the original request and the result.
+            if tool_request.name == "search":
+                query = tool_request.arguments["query"]
+                tool_messages_text.append(
+                    get_search_tool_message(
+                        query=query,
+                        search_result=tool_response.text,
+                    )
+                )
+            elif tool_request.name == "access":
+                url = tool_request.arguments["url"]
+                info_to_extract = tool_request.arguments["info_to_extract"]
+                page_content = tool_response.text
+                if self.use_access_summary:
+                    tool_messages_text.append(None)
+                    coro = self.access_sumamry(info_to_extract, page_content)
+                    access_summary_jobs.append((idx, url, info_to_extract, coro))
+                else:
+                    tool_messages_text.append(
+                        get_access_tool_message(
+                            url=url,
+                            page_content=page_content,
+                        )
+                    )
+            else:
+                raise ValueError(f"Unknown tool request name: {tool_request.name}")
+
+        if self.use_access_summary and access_summary_jobs:
+            coros = [job[-1] for job in access_summary_jobs]
+            summaries = await asyncio.gather(*coros)
+            for job, summary in zip(access_summary_jobs, summaries):
+                idx, url, info_to_extract, _ = job
+                tool_messages_text[idx] = get_access_summary_tool_message(
+                    url=url,
+                    info_to_extract=info_to_extract,
+                    summary=summary,
+                )
+
+        turn_hint = get_next_turn_hint(
+            next_turn_idx=turn_idx + 2,
+            max_turns=max_turns,
+        )
+        return [
+            {
+                "role": "tool",
+                "content": "\n\n".join(tool_messages_text) + turn_hint,
+            }
+        ]
+
+    async def _finalize_trajectory(
+        self,
+        *,
+        role: str,
+        response_text: str,
+        turn_idx: int,
+        total_turn_list: list,
+        conv_id: str,
+    ) -> tuple[Optional[str], list]:
+        """Extract the role result and release conversation affinity.
+
+        The default implementation is the existing WideSeek-R2 finalization
+        path.  It is a hook because graph workflows will eventually finalize
+        through audit and deterministic rendering.
+        """
+        if role == "worker":
+            # Workers must return their final answer inside <answer>...</answer>;
+            # a missing tag yields None, which routes to the failed planner
+            # message.
+            answer_text = extract_final_answer(response_text, mode="tag")
+        else:
+            answer_text = response_text.split("<|im_end|>")[0]
+
+        total_turn_list.append(turn_idx + 1)
+        # Release this conversation's load from the affinity router (no-op
+        # unless the load-aware policy is active). Per-query exceptions abort
+        # the whole rollout, so the normal return path releases here.
+        self.release_affinity(conv_id)
+        return answer_text, total_turn_list
+
     async def worker_call(
         self,
         worker_request: ToolRequest,
@@ -281,8 +561,9 @@ class WideSeekR2AgentLoopWorker(MultiAgentLoopWorker):
         add_few_shot = self.cfg.agentloop.get("add_few_shot", True)
         max_workers_per_planner = self.cfg.agentloop.get("max_workers_per_planner", -1)
         max_toolcall_per_worker = self.cfg.agentloop.get("max_toolcall_per_worker", 5)
+        max_turns = _set_max_turns(self.cfg.agentloop, role)
 
-        message_history, tools = build_message_history_and_tools(
+        prompt_ids = self._build_role_context(
             origin_question=origin_question,
             role=role,
             add_few_shot=add_few_shot,
@@ -290,23 +571,20 @@ class WideSeekR2AgentLoopWorker(MultiAgentLoopWorker):
             max_toolcall_per_worker=max_toolcall_per_worker,
             main_task=main_task,
             answer_type=answer_type,
+            max_turns=max_turns,
         )
-        max_turns = _set_max_turns(self.cfg.agentloop, role)
-
-        turn_hint = get_first_turn_hint(max_turns=max_turns)
-        assert message_history[-1]["role"] == "user"
-        message_history[-1]["content"] += turn_hint
-
-        prompt_ids = self.tokenizer.apply_chat_template(
-            message_history, tokenize=True, add_generation_prompt=True, tools=tools
-        )
-        prompt_ids = prompt_ids[: self.max_total_len]
 
         response_text = ""
         sub_traj_num = 0
 
         turn_idx = -1
         for turn_idx in range(max_turns):
+            prompt_ids = await self._before_role_turn(
+                prompt_ids=prompt_ids,
+                role=role,
+                turn_idx=turn_idx,
+                conv_id=conv_id,
+            )
             max_resp_len = self.max_total_len - len(prompt_ids)
             if max_resp_len <= 0:
                 break
@@ -368,126 +646,39 @@ class WideSeekR2AgentLoopWorker(MultiAgentLoopWorker):
             if tool_requests == []:
                 break
 
-            # Handle tool calls based on role
-            tasks = []
-            tool_messages = []
+            # Handle tool calls based on role.
             worker_buffer = []
             worker_turn_list = []
             if role == "planner":
                 assert sub_traj_id == 0
                 # Planner fans out multiple sub-agents in parallel.
-                for i, tool_request in enumerate(tool_requests, start=1):
-                    tasks.append(
-                        self.worker_call(
-                            tool_request,
-                            origin_question,
-                            sub_traj_id + i + sub_traj_num,
-                        )
-                    )
-                sub_traj_num += len(tasks)
-                worker_results = await asyncio.gather(*tasks)
-
-                tool_messages_text = []
-                for idx, (
-                    worker_outputs_buffer,
-                    worker_summary,
-                    total_turn_list_worker,
-                ) in enumerate(worker_results):
-                    worker_buffer.extend(worker_outputs_buffer)
-                    worker_turn_list.extend(total_turn_list_worker)
-                    # Format tool response with both request and result.
-                    subtask_text = tool_requests[idx].arguments["subtask"]
-                    # The worker `<answer>` extraction result decides success:
-                    # a present summary -> result message, None -> failed message.
-                    if worker_summary is not None:
-                        tool_messages_text.append(
-                            get_planner_subtask_result_message(
-                                subtask_idx=idx + 1,
-                                subtask_text=subtask_text,
-                                worker_summary=worker_summary,
-                            )
-                        )
-                    else:
-                        tool_messages_text.append(
-                            get_planner_subtask_failed_message(
-                                subtask_idx=idx + 1,
-                                subtask_text=subtask_text,
-                            )
-                        )
-
-                turn_hint = get_next_turn_hint(
-                    next_turn_idx=turn_idx + 2,
-                    max_turns=max_turns,
+                sub_traj_num_before_dispatch = sub_traj_num
+                sub_traj_num += len(tool_requests)
+                worker_results = await self._dispatch_planner_requests(
+                    tool_requests,
+                    main_task=origin_question,
+                    sub_traj_id=sub_traj_id,
+                    sub_traj_num=sub_traj_num_before_dispatch,
                 )
-                tool_messages.append(
-                    {
-                        "role": "tool",
-                        "content": "\n\n".join(tool_messages_text) + turn_hint,
-                    }
+                (
+                    worker_buffer,
+                    worker_turn_list,
+                    tool_messages,
+                ) = self._format_planner_feedback(
+                    tool_requests,
+                    worker_results,
+                    turn_idx=turn_idx,
+                    max_turns=max_turns,
                 )
 
             else:
                 # Worker/single executes search/access tools in parallel.
-                for tool_request in tool_requests:
-                    tasks.append(self.tool_call(tool_request))
-                tool_responses: list[ToolResponse] = await asyncio.gather(*tasks)
-
-                tool_messages_text = []
-                access_summary_jobs = []
-                for idx, (tool_request, tool_response) in enumerate(
-                    zip(tool_requests, tool_responses)
-                ):
-                    # Include the original request and the result
-                    if tool_request.name == "search":
-                        query = tool_request.arguments["query"]
-                        tool_messages_text.append(
-                            get_search_tool_message(
-                                query=query,
-                                search_result=tool_response.text,
-                            )
-                        )
-                    elif tool_request.name == "access":
-                        url = tool_request.arguments["url"]
-                        info_to_extract = tool_request.arguments["info_to_extract"]
-                        page_content = tool_response.text
-                        if self.use_access_summary:
-                            tool_messages_text.append(None)
-                            coro = self.access_sumamry(info_to_extract, page_content)
-                            access_summary_jobs.append(
-                                (idx, url, info_to_extract, coro)
-                            )
-                        else:
-                            tool_messages_text.append(
-                                get_access_tool_message(
-                                    url=url,
-                                    page_content=page_content,
-                                )
-                            )
-                    else:
-                        raise ValueError(
-                            f"Unknown tool request name: {tool_request.name}"
-                        )
-
-                if self.use_access_summary and access_summary_jobs:
-                    coros = [job[-1] for job in access_summary_jobs]
-                    summaries = await asyncio.gather(*coros)
-                    for job, summary in zip(access_summary_jobs, summaries):
-                        idx, url, info_to_extract, _ = job
-                        tool_messages_text[idx] = get_access_summary_tool_message(
-                            url=url,
-                            info_to_extract=info_to_extract,
-                            summary=summary,
-                        )
-
-                turn_hint = get_next_turn_hint(
-                    next_turn_idx=turn_idx + 2,
+                tool_responses = await self._dispatch_worker_requests(tool_requests)
+                tool_messages = await self._format_worker_feedback(
+                    tool_requests,
+                    tool_responses,
+                    turn_idx=turn_idx,
                     max_turns=max_turns,
-                )
-                tool_messages.append(
-                    {
-                        "role": "tool",
-                        "content": "\n\n".join(tool_messages_text) + turn_hint,
-                    }
                 )
 
             # Tokenize tool responses
@@ -500,20 +691,13 @@ class WideSeekR2AgentLoopWorker(MultiAgentLoopWorker):
             output_buffer.extend(worker_buffer)
             total_turn_list.extend(worker_turn_list)
 
-        # Generate summary
-        if role == "worker":
-            # Workers must return their final answer inside <answer>...</answer>;
-            # a missing tag yields None, which routes to the failed planner message.
-            answer_text = extract_final_answer(response_text, mode="tag")
-        else:
-            answer_text = response_text.split("<|im_end|>")[0]
-
-        total_turn_list.append(turn_idx + 1)
-        # Release this conversation's load from the affinity router (no-op unless
-        # the load-aware policy is active). Per-query exceptions abort the whole
-        # rollout (asyncio.gather without return_exceptions), so a leak on the
-        # error path is moot; the normal return path always releases here.
-        self.release_affinity(conv_id)
+        answer_text, total_turn_list = await self._finalize_trajectory(
+            role=role,
+            response_text=response_text,
+            turn_idx=turn_idx,
+            total_turn_list=total_turn_list,
+            conv_id=conv_id,
+        )
         return output_buffer, answer_text, total_turn_list
 
     async def run_one_query(self, prompt_ids: list[int], *, answer) -> AgentLoopOutput:
@@ -587,7 +771,9 @@ class WideSeekR2AgentLoopWorker(MultiAgentLoopWorker):
                 "origin_question": origin_question,
                 "llm_reward": llm_reward,
                 "gisa_metrics": gisa_metrics,
-                "total_turn_list": total_turn_list if self.workflow == "mas" else None,
+                "total_turn_list": total_turn_list
+                if self.workflow in {"mas", "mas_graph"}
+                else None,
                 "instance_id": answer["instance_id"],
                 "num_valid_planner_turns": num_valid_planner_turns,
                 "num_valid_worker_turns": num_valid_worker_turns,

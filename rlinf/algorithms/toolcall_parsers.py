@@ -345,3 +345,185 @@ class WideSeekR2QwenToolCallParser(WideSeekQwenToolCallParser):
                 ToolRequest(name="subtask", arguments={"subtask": prompt})
             )
         return function_calls
+
+
+@register_toolcall_parser("wideseek_r2-graph-qwen")
+class WideSeekR2GraphQwenToolCallParser(WideSeekR2QwenToolCallParser):
+    """Structured parser for the Phase 1 ``mas_graph`` workflow.
+
+    Unlike the legacy parser, planner entries retain their action scope and
+    worker-local graph tools are parsed as first-class requests.  Invalid or
+    mixed phases are surfaced through ``last_error`` instead of silently
+    becoming an empty tool-call list.
+    """
+
+    planner_tools = {
+        "submit_task_plan",
+        "create_sub_agents",
+        "read_graph_summary",
+        "propose_finish",
+        "propose_plan_patch",
+    }
+    worker_tools = {
+        "search",
+        "access",
+        "read_evidence",
+        "submit_evidence",
+        "report_action_status",
+        "propose_next_actions",
+    }
+    graph_tools = {
+        "submit_task_plan",
+        "read_graph_summary",
+        "propose_finish",
+        "propose_plan_patch",
+        "read_evidence",
+        "submit_evidence",
+        "report_action_status",
+        "propose_next_actions",
+    }
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.last_error: str | None = None
+
+    def _error(self, message: str) -> None:
+        self.last_error = message
+
+    def _parse_graph_planner_calls(
+        self, tool_name: str, tool_arguments: dict, max_workers_per_planner: int
+    ) -> list[ToolRequest]:
+        if tool_name == "create_sub_agents":
+            sub_agents = tool_arguments.get("sub_agents", [])
+            if not isinstance(sub_agents, list):
+                self._error("create_sub_agents.sub_agents must be a list")
+                return []
+            if max_workers_per_planner >= 0:
+                sub_agents = sub_agents[:max_workers_per_planner]
+            requests = []
+            for index, sub_agent in enumerate(sub_agents):
+                if not isinstance(sub_agent, dict):
+                    self._error(f"sub_agents[{index}] must be an object")
+                    continue
+                prompt = sub_agent.get("prompt", "")
+                action_id = sub_agent.get("action_id", "")
+                if not isinstance(prompt, str) or not prompt:
+                    self._error(f"sub_agents[{index}].prompt is required")
+                    continue
+                if not isinstance(action_id, str) or not action_id:
+                    self._error(f"sub_agents[{index}].action_id is required")
+                    continue
+                requests.append(
+                    ToolRequest(
+                        name="subtask",
+                        arguments={
+                            "subtask": prompt,
+                            "action_id": action_id,
+                            "input_refs": sub_agent.get("input_refs", []),
+                            "expected_output": sub_agent.get("expected_output", {}),
+                        },
+                    )
+                )
+            return requests
+        if tool_name not in self.planner_tools:
+            self._error(f"Unknown planner graph tool: {tool_name!r}")
+            return []
+        if not isinstance(tool_arguments, dict):
+            self._error(f"Arguments for {tool_name!r} must be an object")
+            return []
+        return [ToolRequest(name=tool_name, arguments=tool_arguments)]
+
+    def _parse_graph_worker_calls(
+        self, tool_name: str, tool_arguments: dict, max_toolcall_per_worker: int
+    ) -> list[ToolRequest]:
+        if tool_name in {
+            "read_evidence",
+            "submit_evidence",
+            "report_action_status",
+            "propose_next_actions",
+        }:
+            if not isinstance(tool_arguments, dict):
+                self._error(f"Arguments for {tool_name!r} must be an object")
+                return []
+            return [ToolRequest(name=tool_name, arguments=tool_arguments)]
+        if tool_name in {"search", "access"}:
+            requests = super()._parse_worker_calls(
+                tool_name=tool_name,
+                tool_arguments=tool_arguments,
+                max_toolcall_per_worker=max_toolcall_per_worker,
+            )
+            if not requests:
+                self._error(f"Malformed {tool_name} arguments")
+            return requests
+        self._error(f"Unknown worker graph tool: {tool_name!r}")
+        return []
+
+    async def __call__(
+        self,
+        response_text: str,
+        *,
+        role: str,
+        max_workers_per_planner: int = 10,
+        max_toolcall_per_worker: int = 5,
+    ) -> tuple[str, list[ToolRequest]]:
+        self.last_error = None
+        has_start = self.tool_call_start_token in response_text
+        has_end = self.tool_call_end_token in response_text
+        if not has_start and not has_end:
+            return response_text, []
+        if has_start != has_end:
+            self._error("Tool call tags were incomplete")
+            return response_text, []
+        matches = self.tool_call_regex.findall(response_text)
+        if not matches:
+            self._error("Tool call tags were present but no complete call was found")
+            return response_text, []
+        requests: list[ToolRequest] = []
+        for match in matches:
+            try:
+                tool_call_json = json.loads(match.strip())
+            except Exception as exc:
+                self._error(f"Invalid tool-call JSON: {exc}")
+                return self.tool_call_regex.sub("", response_text), []
+            if not isinstance(tool_call_json, dict):
+                self._error("Tool call must be an object")
+                return self.tool_call_regex.sub("", response_text), []
+            tool_name = tool_call_json.get("name")
+            tool_arguments = tool_call_json.get("arguments", {})
+            if not isinstance(tool_name, str) or not isinstance(tool_arguments, dict):
+                self._error("Tool call requires string name and object arguments")
+                return self.tool_call_regex.sub("", response_text), []
+            if role == "planner":
+                parsed = self._parse_graph_planner_calls(
+                    tool_name, tool_arguments, max_workers_per_planner
+                )
+            elif role == "worker":
+                parsed = self._parse_graph_worker_calls(
+                    tool_name, tool_arguments, max_toolcall_per_worker
+                )
+            else:
+                self._error(f"mas_graph does not support role {role!r}")
+                parsed = []
+            if self.last_error:
+                return self.tool_call_regex.sub("", response_text), []
+            requests.extend(parsed)
+
+        # Apply the per-turn caps after aggregating multiple tags.  The legacy
+        # parser only received one call at a time, so applying the cap here is
+        # necessary to prevent a model from bypassing it by emitting several
+        # adjacent tool-call blocks.
+        if role == "planner" and max_workers_per_planner >= 0:
+            requests = requests[:max_workers_per_planner]
+        elif role == "worker":
+            requests = requests[:max_toolcall_per_worker]
+        if requests:
+            phases = {
+                "graph" if request.name in self.graph_tools else "external"
+                for request in requests
+                if request.name != "subtask"
+            }
+            if len(phases) > 1:
+                self._error("Mixed graph/external tool phases are not allowed")
+                requests = []
+        content = self.tool_call_regex.sub("", response_text)
+        return content, requests

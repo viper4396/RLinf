@@ -1,0 +1,13 @@
+defaults:
+  - base_train
+  - _self_
+
+agentloop:
+  workflow: mas_graph
+  toolcall_parser: wideseek_r2-graph-qwen
+  graph_memory:
+    enabled: true
+
+data:
+  type: wideseek_r2
+  answer_type: item
