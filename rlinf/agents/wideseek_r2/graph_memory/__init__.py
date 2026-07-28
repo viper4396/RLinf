@@ -14,6 +14,13 @@
 
 """Trajectory-local graph-memory implementation for WideSeek-R2."""
 
+from rlinf.agents.wideseek_r2.graph_memory.audit import AuditReport
+from rlinf.agents.wideseek_r2.graph_memory.embedding_index import (
+    DeterministicEmbeddingIndex,
+    EmbeddingMatch,
+)
+from rlinf.agents.wideseek_r2.graph_memory.payload_builder import PayloadBuildResult
+from rlinf.agents.wideseek_r2.graph_memory.renderer import RenderValidation
 from rlinf.agents.wideseek_r2.graph_memory.schema import (
     ActionNode,
     ActionState,
@@ -21,7 +28,11 @@ from rlinf.agents.wideseek_r2.graph_memory.schema import (
     EvidenceNode,
     EvidenceProposal,
     GraphConfig,
+    GraphEvent,
+    GraphEventType,
+    NodeProposal,
     TaskContract,
+    ToolResultRecord,
 )
 from rlinf.agents.wideseek_r2.graph_memory.state import (
     ActivationDAG,
@@ -36,8 +47,17 @@ __all__ = [
     "EvidenceKind",
     "EvidenceNode",
     "EvidenceProposal",
+    "GraphEvent",
+    "GraphEventType",
     "EvidenceGraph",
     "GraphConfig",
     "GraphRuntime",
+    "NodeProposal",
     "TaskContract",
+    "ToolResultRecord",
+    "AuditReport",
+    "DeterministicEmbeddingIndex",
+    "EmbeddingMatch",
+    "PayloadBuildResult",
+    "RenderValidation",
 ]

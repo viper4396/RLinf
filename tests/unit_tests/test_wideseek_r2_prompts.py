@@ -58,7 +58,7 @@ def test_planner_noshot_injects_selected_answer_type_strategy(
     _assert_only_strategy(system_prompt, answer_type)
     assert call_strategy in system_prompt
     assert "There is NO limit on the number of sub-agents" in system_prompt
-    assert "```markdown" in system_prompt
+    assert "A `markdown` code fence around the table is optional" in system_prompt
 
 
 @pytest.mark.parametrize(
@@ -82,7 +82,7 @@ def test_single_agent_noshot_injects_selected_answer_type_strategy(
     system_prompt = messages[0]["content"]
     _assert_only_strategy(system_prompt, answer_type)
     assert search_strategy in system_prompt
-    assert "```markdown" in system_prompt
+    assert "A `markdown` code fence around the table is optional" in system_prompt
 
 
 @pytest.mark.parametrize(
@@ -113,7 +113,8 @@ def test_markdown_set_and_list_prompts_require_pipe_tables(
 
     system_prompt = messages[0]["content"]
     assert "after closing `</think>`" in system_prompt
-    assert "output only one fenced Markdown pipe table" in system_prompt
+    assert "output only one Markdown pipe table" in system_prompt
+    assert "code fence around the table is optional" in system_prompt
     assert "| Item |" in system_prompt
     assert "each " + answer_type + " " in system_prompt
     assert order_instruction in system_prompt
@@ -137,7 +138,8 @@ def test_markdown_item_prompt_requires_exactly_one_item_row(prompt_builder: str)
         )
 
     system_prompt = messages[0]["content"]
-    assert "output only one fenced Markdown pipe table" in system_prompt
+    assert "output only one Markdown pipe table" in system_prompt
+    assert "code fence around the table is optional" in system_prompt
     assert "| Item |" in system_prompt
     assert "| the single answer |" in system_prompt
     assert "exactly one column named `Item` and exactly one data row" in system_prompt

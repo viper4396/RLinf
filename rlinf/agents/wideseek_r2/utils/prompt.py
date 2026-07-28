@@ -412,34 +412,26 @@ Your task is: {}
 # Instructions
 Provide a detailed answer and supporting information for this task."""
 
-MARKDOWN_ITEM_FORMAT_EN = """If you determine that no further external knowledge is required, then after closing `</think>` you MUST output only one fenced Markdown pipe table in this exact shape:
-```markdown
+MARKDOWN_ITEM_FORMAT_EN = """If you determine that no further external knowledge is required, then after closing `</think>` you MUST output only one Markdown pipe table in this exact shape:
 | Item |
 | :--- |
 | the single answer |
-```
-The table must have exactly one column named `Item` and exactly one data row containing the answer. Do NOT add alternatives or a second row. The fenced content must be a pipe table, NOT JSON. Do NOT output a JSON object or array, Python list, bullets, plain text, or additional prose."""
-MARKDOWN_SET_FORMAT_EN = """If you determine that no further external knowledge is required, then after closing `</think>` you MUST output only one fenced Markdown pipe table in this form:
-```markdown
+The table must have exactly one column named `Item` and exactly one data row containing the answer. Do NOT add alternatives or a second row. A `markdown` code fence around the table is optional. The answer itself must be a pipe table, NOT JSON. Do NOT output a JSON object or array, Python list, bullets, plain text, or additional prose."""
+MARKDOWN_SET_FORMAT_EN = """If you determine that no further external knowledge is required, then after closing `</think>` you MUST output only one Markdown pipe table in this form:
 | Item |
 | :--- |
 | first set member |
 | second set member |
-```
-Put each set member in its own row under the single `Item` column. Row order does not matter, and duplicate members must be removed. The fenced content must be a pipe table, NOT JSON. Do NOT output a JSON object or array, Python list, bullets, comma-separated text, or additional prose."""
-MARKDOWN_LIST_FORMAT_EN = """If you determine that no further external knowledge is required, then after closing `</think>` you MUST output only one fenced Markdown pipe table in this form:
-```markdown
+Put each set member in its own row under the single `Item` column. Row order does not matter, and duplicate members must be removed. A `markdown` code fence around the table is optional. The answer itself must be a pipe table, NOT JSON. Do NOT output a JSON object or array, Python list, bullets, comma-separated text, or additional prose."""
+MARKDOWN_LIST_FORMAT_EN = """If you determine that no further external knowledge is required, then after closing `</think>` you MUST output only one Markdown pipe table in this form:
 | Item |
 | :--- |
 | first list item |
 | second list item |
-```
-Put each list item in its own row under the single `Item` column, in the exact required order. Preserve meaningful duplicate items. The fenced content must be a pipe table, NOT JSON. Do NOT output a JSON object or array, Python list, bullets, comma-separated text, or additional prose."""
-MARKDOWN_TABLE_FORMAT_EN = """If you determine that no further external knowledge is required, then after closing `</think>` you MUST output only one fenced Markdown pipe table in this form:
-```markdown
+Put each list item in its own row under the single `Item` column, in the exact required order. Preserve meaningful duplicate items. A `markdown` code fence around the table is optional. The answer itself must be a pipe table, NOT JSON. Do NOT output a JSON object or array, Python list, bullets, comma-separated text, or additional prose."""
+MARKDOWN_TABLE_FORMAT_EN = """If you determine that no further external knowledge is required, then after closing `</think>` you MUST output only one Markdown pipe table in this form:
 {data_content}
-```
-Use the requested rows and columns, including the required header. The fenced content must be a pipe table, NOT JSON. Do NOT output a JSON object or array, Python list, bullets, plain text, or additional prose."""
+Use the requested rows and columns, including the required header. A `markdown` code fence around the table is optional. The answer itself must be a pipe table, NOT JSON. Do NOT output a JSON object or array, Python list, bullets, plain text, or additional prose."""
 
 
 LLM_JUDGE_PROMPT = """Question: {question}

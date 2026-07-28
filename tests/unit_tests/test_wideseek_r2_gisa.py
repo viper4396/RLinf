@@ -279,6 +279,16 @@ def test_item_markdown_output_parses_to_one_cell_table():
     assert answer.to_dict(orient="records") == [{"Item": "Chile"}]
 
 
+def test_bare_item_markdown_output_parses_when_fence_is_optional():
+    answer = reward.extract_final_answer(
+        "</think>\n\n| Item |\n| :--- |\n| Abigail Cowen |",
+        strict=False,
+    )
+
+    assert isinstance(answer, pd.DataFrame)
+    assert answer.to_dict(orient="records") == [{"Item": "Abigail Cowen"}]
+
+
 def test_non_gisa_item_still_uses_judge_model():
     calls = []
 

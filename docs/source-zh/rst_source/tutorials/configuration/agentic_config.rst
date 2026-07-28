@@ -161,12 +161,12 @@ JSONL 记录可以将 ``answer_type`` 设置为 ``item``、``set``、``list`` �
 调用 sub-agent，single-agent prompt 说明 search/access 的先后顺序，模型不再
 自行判断类型。
 
-所有主角色最终答案统一使用一个带围栏的 Markdown pipe table。``item`` 使用
-名为 ``Item`` 的单列且只能有一行数据；``set`` 和 ``list`` 使用相同单列，
-每个成员占一行；``table`` 使用题目要求的 schema。系统不再读取
-``answer_mode``、``is_markdown`` 或 ``is_hybrid``。如果记录缺少
-``answer_type``，则使用数据集级 ``data.answer_type``，后者默认是
-``table``；记录级配置始终优先。
+所有主角色最终答案统一使用一个 Markdown pipe table，表格外的
+``markdown`` 代码围栏可选。``item`` 使用名为 ``Item`` 的单列且只能有一行
+数据；``set`` 和 ``list`` 使用相同单列，每个成员占一行；``table`` 使用题目
+要求的 schema。系统不再读取 ``answer_mode``、``is_markdown`` 或
+``is_hybrid``。如果记录缺少 ``answer_type``，则使用数据集级
+``data.answer_type``，后者默认是 ``table``；记录级配置始终优先。
 
 对于 WideSeek-R2 GISA 数据，可按如下方式启用 GISA LLM-judge 评估：
 
@@ -199,6 +199,54 @@ cell F1 为满分；list 还要求 order score 为满分，table 还要求 row F
 judge-based ``pass@1``、``avg@k`` 和 ``pass@k``。缺少 ``answer_type`` 时
 默认按 ``table`` 处理，因此 ``set`` 和 ``list`` 记录必须显式标注类型；同质
 item 数据集应设置 ``data.answer_type: item``。
+
+WideSeek-R2 graph-memory v2（Phase 1/2/4）
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+现有的 ``mas_graph`` 工作流现在直接使用 v2 runtime；不会新增
+新的 v2 工作流。仍使用原有的 workflow 和 parser 名称：
+
+.. code:: yaml
+
+  agentloop:
+    workflow: mas_graph
+    toolcall_parser: wideseek_r2-graph-qwen
+    graph_memory:
+      enabled: true
+      schema_version: v2
+      condition_dsl_version: v2
+      entity_bootstrap_enabled: true
+      require_tool_provenance: true
+      allow_worker_read_mem: false
+
+每个 rollout 首先执行一次隔离的 Entity-only bootstrap call。Main 角色每个
+turn 只能使用一种工具模式：用 ``call_sub`` 创建动态子任务、用有上限的
+``read_mem`` 读取内存，或执行一次原子的 ``edit_mem`` transaction。Worker
+可以使用 ``search``/``access``，随后用 ``add_mem`` 提交 Source/Candidate；
+每个节点都必须关联 worker 自己真实的 tool result 和 content hash。Worker
+不会收到 ``read_mem``，也不能创建 Entity、Claim、Fact 或 Conflict 节点。
+
+runtime 同时维护 active graph、append-only Event Log 以及 pending
+Claim/Conflict queue。Phase 2 为每个动态 Action 生成确定性的 hashed-embedding
+Top-K 查询、有限的 Entity/Fact/Source BFS payload、focus refs、graph-version
+元数据和确定性去重。Worker 在 spawn 时收到这份不可变 payload，仍然不能调用
+``read_mem``。
+
+Phase 4 保留真实的 normal response，然后进入独立的 Audit 状态机。只有在
+pending Claim/Conflict、active Claim/Fact provenance、Source provenance、Action
+终态和 transaction 不变量全部通过时，结构化 ``AUDIT_PASS`` 才会被接受。Audit
+通过后创建只包含 active Entity/Fact 及一跳 Source provenance 的 Render Payload。
+Render 会机械检查 item/set/list/table 结构、payload ref 范围和 Markdown 格式；
+失败只进行有上限的 format retry，不会静默回到 Audit。
+
+重要的 graph-memory 配置键包括 ``max_events``、``max_read_tokens``、
+``entity_bootstrap_max_new_tokens``、``max_pending_claims`` 和
+``max_pending_conflicts``。Phase 2 增加 ``embedding_dim``、``payload_top_k``、
+``payload_max_distance``、``max_payload_nodes``、``max_payload_tokens`` 和
+``max_source_excerpt_tokens``；Phase 4 增加 ``max_audit_attempts``、
+``max_render_attempts``、``audit_enabled``、``render_enabled`` 和
+``format_retry_enabled``。``max_nodes``、``max_edges``、``max_actions``
+仍然是 graph 的硬上限。
 
 actor
 ~~~~~~~~~~~~~~~

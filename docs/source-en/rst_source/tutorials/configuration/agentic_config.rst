@@ -169,13 +169,13 @@ JSONL record may set ``answer_type`` to ``item``, ``set``, ``list``, or
 describe how to stage and fan out sub-agents, while single-agent prompts
 describe the search/access order. The model does not infer the type itself.
 
-All main-role final answers use exactly one fenced Markdown pipe table.
-``item`` uses one column named ``Item`` and exactly one data row; ``set`` and
-``list`` use the same column with one member per row; ``table`` uses the
-requested schema. ``answer_mode``, ``is_markdown``, and ``is_hybrid`` are no
-longer used. If a record omits ``answer_type``, ``data.answer_type`` supplies
-the dataset default, which itself defaults to ``table``. A record-level value
-always takes priority.
+All main-role final answers use exactly one Markdown pipe table. Wrapping the
+table in a ``markdown`` code fence is optional. ``item`` uses one column named
+``Item`` and exactly one data row; ``set`` and ``list`` use the same column
+with one member per row; ``table`` uses the requested schema. ``answer_mode``,
+``is_markdown``, and ``is_hybrid`` are no longer used. If a record omits
+``answer_type``, ``data.answer_type`` supplies the dataset default, which
+itself defaults to ``table``. A record-level value always takes priority.
 
 For WideSeek-R2 GISA data, enable GISA LLM-judge evaluation as follows:
 
@@ -211,6 +211,58 @@ whole-answer EM is now represented as judge-based ``pass@1``, ``avg@k``, and
 ``pass@k``. A missing ``answer_type`` defaults to ``table``, so ``set`` and
 ``list`` records must identify their type explicitly; homogeneous item datasets
 should set ``data.answer_type: item``.
+
+WideSeek-R2 graph-memory v2 (Phase 1/2/4)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The existing ``mas_graph`` workflow now uses the v2 runtime directly;
+there is no separate v2 workflow. Enable it with the existing workflow and
+parser names:
+
+.. code:: yaml
+
+  agentloop:
+    workflow: mas_graph
+    toolcall_parser: wideseek_r2-graph-qwen
+    graph_memory:
+      enabled: true
+      schema_version: v2
+      condition_dsl_version: v2
+      entity_bootstrap_enabled: true
+      require_tool_provenance: true
+      allow_worker_read_mem: false
+
+Phase 1 starts each rollout with an isolated Entity-only bootstrap call. The
+Main role can use one tool mode per turn: ``call_sub`` for dynamic subtasks,
+bounded ``read_mem``, or one atomic ``edit_mem`` transaction. Workers can use
+``search``/``access`` and then ``add_mem`` Source/Candidate nodes, with every
+node linked to the worker's real tool result and content hash. Workers never
+receive ``read_mem`` and cannot create Entity, Claim, Fact, or Conflict nodes.
+
+The runtime keeps an active graph plus an append-only Event Log and pending
+Claim/Conflict queues. Phase 2 materializes each dynamic Action with a
+deterministic hashed-embedding Top-K query, bounded Entity/Fact/Source BFS
+payload, focus references, graph-version metadata, and deterministic
+deduplication. Workers receive that immutable payload at spawn time and still
+cannot call ``read_mem``.
+
+Phase 4 keeps the actual normal response, then runs an independent Audit
+state machine. A structured ``AUDIT_PASS`` is accepted only when pending
+claims/conflicts, active Claim/Fact provenance, source provenance, action
+terminality, and transaction invariants all pass. A successful Audit creates a
+Render Payload containing only active Entity/Fact nodes and one-hop source
+provenance. Render output is mechanically checked for item/set/list/table
+shape, payload-reference scope, and Markdown format; failures use bounded
+format-only retries and never silently enter Audit again.
+
+Important graph-memory keys include ``max_events``, ``max_read_tokens``,
+``entity_bootstrap_max_new_tokens``, ``max_pending_claims``, and
+``max_pending_conflicts``. Phase 2 adds ``embedding_dim``, ``payload_top_k``,
+``payload_max_distance``, ``max_payload_nodes``, ``max_payload_tokens``, and
+``max_source_excerpt_tokens``. Phase 4 adds ``max_audit_attempts``,
+``max_render_attempts``, ``audit_enabled``, ``render_enabled``, and
+``format_retry_enabled``. ``max_nodes``, ``max_edges``, and ``max_actions``
+remain hard graph budgets.
 
 actor
 ~~~~~~~~~~~~~~~

@@ -349,38 +349,27 @@ class WideSeekR2QwenToolCallParser(WideSeekQwenToolCallParser):
 
 @register_toolcall_parser("wideseek_r2-graph-qwen")
 class WideSeekR2GraphQwenToolCallParser(WideSeekR2QwenToolCallParser):
-    """Structured parser for the Phase 1 ``mas_graph`` workflow.
+    """Structured parser for the v2 ``mas_graph`` workflow.
 
-    Unlike the legacy parser, planner entries retain their action scope and
-    worker-local graph tools are parsed as first-class requests.  Invalid or
-    mixed phases are surfaced through ``last_error`` instead of silently
-    becoming an empty tool-call list.
+    The registration name is intentionally unchanged so existing configs keep
+    using ``workflow: mas_graph``.  v2 changes the tool vocabulary and keeps
+    mode validation in this parser, before any external or graph side effect.
     """
 
     planner_tools = {
-        "submit_task_plan",
-        "create_sub_agents",
-        "read_graph_summary",
-        "propose_finish",
-        "propose_plan_patch",
+        "call_sub",
+        "read_mem",
+        "edit_mem",
     }
     worker_tools = {
         "search",
         "access",
-        "read_evidence",
-        "submit_evidence",
-        "report_action_status",
-        "propose_next_actions",
+        "add_mem",
     }
     graph_tools = {
-        "submit_task_plan",
-        "read_graph_summary",
-        "propose_finish",
-        "propose_plan_patch",
-        "read_evidence",
-        "submit_evidence",
-        "report_action_status",
-        "propose_next_actions",
+        "read_mem",
+        "edit_mem",
+        "add_mem",
     }
 
     def __init__(self) -> None:
@@ -393,34 +382,37 @@ class WideSeekR2GraphQwenToolCallParser(WideSeekR2QwenToolCallParser):
     def _parse_graph_planner_calls(
         self, tool_name: str, tool_arguments: dict, max_workers_per_planner: int
     ) -> list[ToolRequest]:
-        if tool_name == "create_sub_agents":
-            sub_agents = tool_arguments.get("sub_agents", [])
-            if not isinstance(sub_agents, list):
-                self._error("create_sub_agents.sub_agents must be a list")
+        if tool_name == "call_sub":
+            subtasks = tool_arguments.get(
+                "subtasks", tool_arguments.get("sub_agents", [])
+            )
+            if not isinstance(subtasks, list):
+                self._error("call_sub.subtasks must be a list")
                 return []
             if max_workers_per_planner >= 0:
-                sub_agents = sub_agents[:max_workers_per_planner]
+                subtasks = subtasks[:max_workers_per_planner]
             requests = []
-            for index, sub_agent in enumerate(sub_agents):
-                if not isinstance(sub_agent, dict):
-                    self._error(f"sub_agents[{index}] must be an object")
+            for index, subtask in enumerate(subtasks):
+                if not isinstance(subtask, dict):
+                    self._error(f"subtasks[{index}] must be an object")
                     continue
-                prompt = sub_agent.get("prompt", "")
-                action_id = sub_agent.get("action_id", "")
-                if not isinstance(prompt, str) or not prompt:
-                    self._error(f"sub_agents[{index}].prompt is required")
+                prompt = subtask.get("subtask", subtask.get("prompt", ""))
+                if not isinstance(prompt, str) or not prompt.strip():
+                    self._error(f"subtasks[{index}].subtask is required")
                     continue
-                if not isinstance(action_id, str) or not action_id:
-                    self._error(f"sub_agents[{index}].action_id is required")
+                focus_refs = subtask.get("focus_refs", [])
+                if not isinstance(focus_refs, list) or not all(
+                    isinstance(ref, str) for ref in focus_refs
+                ):
+                    self._error(f"subtasks[{index}].focus_refs must be a string list")
                     continue
                 requests.append(
                     ToolRequest(
                         name="subtask",
                         arguments={
-                            "subtask": prompt,
-                            "action_id": action_id,
-                            "input_refs": sub_agent.get("input_refs", []),
-                            "expected_output": sub_agent.get("expected_output", {}),
+                            "subtask": prompt.strip(),
+                            "focus_refs": focus_refs,
+                            "output_contract": subtask.get("output_contract", {}),
                         },
                     )
                 )
@@ -436,12 +428,7 @@ class WideSeekR2GraphQwenToolCallParser(WideSeekR2QwenToolCallParser):
     def _parse_graph_worker_calls(
         self, tool_name: str, tool_arguments: dict, max_toolcall_per_worker: int
     ) -> list[ToolRequest]:
-        if tool_name in {
-            "read_evidence",
-            "submit_evidence",
-            "report_action_status",
-            "propose_next_actions",
-        }:
+        if tool_name == "add_mem":
             if not isinstance(tool_arguments, dict):
                 self._error(f"Arguments for {tool_name!r} must be an object")
                 return []
@@ -508,22 +495,35 @@ class WideSeekR2GraphQwenToolCallParser(WideSeekR2QwenToolCallParser):
                 return self.tool_call_regex.sub("", response_text), []
             requests.extend(parsed)
 
-        # Apply the per-turn caps after aggregating multiple tags.  The legacy
-        # parser only received one call at a time, so applying the cap here is
-        # necessary to prevent a model from bypassing it by emitting several
-        # adjacent tool-call blocks.
-        if role == "planner" and max_workers_per_planner >= 0:
-            requests = requests[:max_workers_per_planner]
-        elif role == "worker":
-            requests = requests[:max_toolcall_per_worker]
-        if requests:
-            phases = {
-                "graph" if request.name in self.graph_tools else "external"
+        # Validate modes before applying caps, otherwise truncation could hide
+        # a mixed-mode call (for example add_mem followed by search).
+        if role == "planner":
+            modes = {
+                "call_sub" if request.name == "subtask" else request.name
                 for request in requests
-                if request.name != "subtask"
             }
-            if len(phases) > 1:
-                self._error("Mixed graph/external tool phases are not allowed")
+            if len(modes) > 1 or ("edit_mem" in modes and len(requests) != 1):
+                self._error("MIXED_TOOL_MODE: planner turn must use one tool mode")
                 requests = []
+        elif role == "worker":
+            modes = {
+                "research" if request.name in {"search", "access"} else "add_mem"
+                for request in requests
+            }
+            if len(modes) > 1 or ("add_mem" in modes and len(requests) != 1):
+                self._error("MIXED_TOOL_MODE: worker turn must use one tool mode")
+                requests = []
+        if self.last_error:
+            return self.tool_call_regex.sub("", response_text), []
+
+        # Apply per-turn caps after aggregating multiple tags.  A batch mode is
+        # still one logical call, while edit_mem/add_mem remain single-call modes.
+        if role == "planner" and max_workers_per_planner >= 0:
+            if any(request.name == "subtask" for request in requests):
+                requests = requests[:max_workers_per_planner]
+        elif role == "worker" and any(
+            request.name in {"search", "access"} for request in requests
+        ):
+            requests = requests[:max_toolcall_per_worker]
         content = self.tool_call_regex.sub("", response_text)
         return content, requests

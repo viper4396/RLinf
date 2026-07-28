@@ -63,13 +63,23 @@ class EvidenceStatus(str, Enum):
     INVALIDATED = "invalidated"
     OPEN = "open"
     RESOLVED = "resolved"
+    ACTIVE = "active"
+    PENDING = "pending"
+    VERIFYING = "verifying"
+    DISPUTED = "disputed"
+    INVESTIGATING = "investigating"
+    PROMOTED = "promoted"
+    RETIRED = "retired"
+    MERGED = "merged"
 
 
 class ActionState(str, Enum):
     """Scheduler state for an activation action."""
 
     DORMANT = "dormant"
+    MATERIALIZING_PAYLOAD = "materializing_payload"
     READY = "ready"
+    MISSING_CONTEXT = "missing_context"
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
@@ -266,12 +276,23 @@ class EvidenceNode:
     created_at_version: int = 0
     confidence: float | None = None
     tags: tuple[str, ...] = ()
+    active: bool = True
+    proposed_by_role: Literal["main", "subagent", "system"] = "system"
+    proposed_by_turn: int = 0
+    updated_at_version: int = 0
+    tool_result_refs: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "kind", EvidenceKind.coerce(self.kind))
         if not isinstance(self.status, EvidenceStatus):
             object.__setattr__(self, "status", EvidenceStatus(str(self.status).lower()))
         object.__setattr__(self, "tags", tuple(self.tags))
+        object.__setattr__(self, "tool_result_refs", tuple(self.tool_result_refs))
+        if self.proposed_by_role not in {"main", "subagent", "system"}:
+            raise ValueError(
+                f"Unsupported graph proposer role: {self.proposed_by_role!r}"
+            )
+        object.__setattr__(self, "active", bool(self.active))
 
     def with_status(
         self, status: EvidenceStatus, *, version: int | None = None
@@ -287,6 +308,17 @@ class EvidenceNode:
             created_at_version=self.created_at_version if version is None else version,
             confidence=self.confidence,
             tags=self.tags,
+            active=status
+            not in {
+                EvidenceStatus.RETIRED,
+                EvidenceStatus.REJECTED,
+                EvidenceStatus.INVALIDATED,
+                EvidenceStatus.MERGED,
+            },
+            proposed_by_role=self.proposed_by_role,
+            proposed_by_turn=self.proposed_by_turn,
+            updated_at_version=self.updated_at_version if version is None else version,
+            tool_result_refs=self.tool_result_refs,
         )
 
 
@@ -300,6 +332,9 @@ class EvidenceEdge:
     target_id: str
     created_by_action: str = "system"
     created_at_version: int = 0
+    created_by_role: Literal["main", "subagent", "system"] = "system"
+    proposed_by_turn: int = 0
+    active: bool = True
 
 
 @dataclass(frozen=True)
@@ -313,6 +348,7 @@ class NodeProposal:
     status: EvidenceStatus | str = EvidenceStatus.PROPOSED
     confidence: float | None = None
     tags: tuple[str, ...] = ()
+    tool_result_refs: tuple[str, ...] = ()
 
     def normalized_kind(self) -> EvidenceKind:
         return EvidenceKind.coerce(self.kind)
@@ -382,6 +418,9 @@ class EvidenceProposal:
     action_result: ActionResultProposal = field(default_factory=ActionResultProposal)
     proposal_id: str = field(default_factory=lambda: f"proposal:{uuid4().hex}")
     created_by_sub_traj: int = 0
+    created_by_role: Literal["main", "subagent", "system"] = "subagent"
+    main_turn: int = 0
+    tool_result_refs: tuple[str, ...] = ()
 
     @classmethod
     def from_dict(
@@ -399,6 +438,9 @@ class EvidenceProposal:
                 status=item.get("status", EvidenceStatus.PROPOSED.value),
                 confidence=item.get("confidence"),
                 tags=tuple(str(tag) for tag in _tuple(item.get("tags"))),
+                tool_result_refs=tuple(
+                    str(ref) for ref in _tuple(item.get("tool_result_refs"))
+                ),
             )
             for idx, item in enumerate(value.get("nodes", []))
         )
@@ -418,6 +460,11 @@ class EvidenceProposal:
             edges=edges,
             action_result=ActionResultProposal.from_dict(value.get("action_result")),
             created_by_sub_traj=int(value.get("created_by_sub_traj", 0)),
+            created_by_role=str(value.get("created_by_role", "subagent")),  # type: ignore[arg-type]
+            main_turn=int(value.get("main_turn", 0)),
+            tool_result_refs=tuple(
+                str(ref) for ref in _tuple(value.get("tool_result_refs"))
+            ),
         )
 
 
@@ -531,6 +578,18 @@ class PayloadNode:
     delivery_policy: DeliveryPolicy | str = DeliveryPolicy.ON_READY
     max_tokens: int = 512
     required: bool = True
+    # Phase 2 materialization fields.  They are optional so the retained v1
+    # plan/compiler schemas remain deserializable.
+    target_node_id: str | None = None
+    seed_ref: str | None = None
+    focus_refs: tuple[str, ...] = ()
+    evidence_refs: tuple[str, ...] = ()
+    graph_version: int = 0
+    token_count: int = 0
+    retrieval_metadata: dict[str, JsonValue] = field(default_factory=dict)
+    body: dict[str, JsonValue] = field(default_factory=dict)
+    page_index: int = 0
+    page_count: int = 1
 
     @classmethod
     def from_dict(cls, value: Any) -> "PayloadNode":
@@ -546,6 +605,18 @@ class PayloadNode:
             ),
             max_tokens=max(1, int(value.get("max_tokens", 512))),
             required=bool(value.get("required", True)),
+            target_node_id=value.get("target_node_id"),
+            seed_ref=value.get("seed_ref"),
+            focus_refs=tuple(str(item) for item in _tuple(value.get("focus_refs"))),
+            evidence_refs=tuple(
+                str(item) for item in _tuple(value.get("evidence_refs"))
+            ),
+            graph_version=int(value.get("graph_version", 0)),
+            token_count=max(0, int(value.get("token_count", 0))),
+            retrieval_metadata=dict(value.get("retrieval_metadata", {})),
+            body=dict(value.get("body", {})),
+            page_index=max(0, int(value.get("page_index", 0))),
+            page_count=max(1, int(value.get("page_count", 1))),
         )
 
 
@@ -581,6 +652,11 @@ class AuditNode:
     audit_id: str
     policy: dict[str, JsonValue] = field(default_factory=dict)
     state: str = "dormant"
+    attempt: int = 0
+    graph_version: int = 0
+    covered_action_seq: int = 0
+    payload_ids: tuple[str, ...] = ()
+    outcome: dict[str, JsonValue] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, value: Any) -> "AuditNode":
@@ -593,6 +669,11 @@ class AuditNode:
             audit_id=str(value.get("audit_id", value.get("id", ""))),
             policy=dict(value.get("policy", {})),
             state=str(value.get("state", "dormant")),
+            attempt=max(0, int(value.get("attempt", 0))),
+            graph_version=int(value.get("graph_version", 0)),
+            covered_action_seq=int(value.get("covered_action_seq", 0)),
+            payload_ids=tuple(str(item) for item in _tuple(value.get("payload_ids"))),
+            outcome=dict(value.get("outcome", {})),
         )
 
 
@@ -603,6 +684,12 @@ class RenderNode:
     render_id: str
     answer_kind: AnswerKind = "item"
     state: str = "dormant"
+    attempt: int = 0
+    graph_version: int = 0
+    payload_ids: tuple[str, ...] = ()
+    page_index: int = 0
+    page_count: int = 1
+    outcome: dict[str, JsonValue] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, value: Any, *, answer_kind: AnswerKind = "item") -> "RenderNode":
@@ -615,6 +702,12 @@ class RenderNode:
             render_id=str(value.get("render_id", value.get("id", ""))),
             answer_kind=str(value.get("answer_kind", answer_kind)),  # type: ignore[arg-type]
             state=str(value.get("state", "dormant")),
+            attempt=max(0, int(value.get("attempt", 0))),
+            graph_version=int(value.get("graph_version", 0)),
+            payload_ids=tuple(str(item) for item in _tuple(value.get("payload_ids"))),
+            page_index=max(0, int(value.get("page_index", 0))),
+            page_count=max(1, int(value.get("page_count", 1))),
+            outcome=dict(value.get("outcome", {})),
         )
 
 
@@ -730,6 +823,77 @@ class GraphDelta:
     conflict_ids: tuple[str, ...] = ()
 
 
+class GraphEventType(str, Enum):
+    """Append-only event types emitted by the Phase 1 graph."""
+
+    ADD_NODE = "add_node"
+    ADD_EDGE = "add_edge"
+    UPDATE_METADATA = "update_metadata"
+    MERGE_ENTITY = "merge_entity"
+    PROMOTE_CLAIM = "promote_claim"
+    RESOLVE_CONFLICT = "resolve_conflict"
+    RETIRE_NODE = "retire_node"
+    RETIRE_EDGE = "retire_edge"
+    POTENTIAL_CONFLICT = "potential_conflict"
+    BOOTSTRAP_ENTITY = "bootstrap_entity"
+    TOOL_RESULT = "tool_result"
+    CREATE_ACTION = "create_action"
+    MATERIALIZE_PAYLOAD = "materialize_payload"
+    CREATE_AUDIT = "create_audit"
+    AUDIT_OUTCOME = "audit_outcome"
+    CREATE_RENDER = "create_render"
+    FORMAT_RETRY = "format_retry"
+
+
+@dataclass(frozen=True)
+class GraphEvent:
+    """Immutable append-only record for one canonical graph mutation."""
+
+    event_id: str
+    event_type: GraphEventType | str
+    graph_version: int
+    main_turn: int = 0
+    actor_role: Literal["main", "subagent", "system"] = "system"
+    action_id: str | None = None
+    sub_traj_id: int = 0
+    node_ids: tuple[str, ...] = ()
+    edge_ids: tuple[str, ...] = ()
+    tool_result_refs: tuple[str, ...] = ()
+    payload: dict[str, JsonValue] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.event_type, GraphEventType):
+            object.__setattr__(
+                self, "event_type", GraphEventType(str(self.event_type).lower())
+            )
+        if self.actor_role not in {"main", "subagent", "system"}:
+            raise ValueError(f"Unsupported event actor role: {self.actor_role!r}")
+        object.__setattr__(self, "node_ids", tuple(str(item) for item in self.node_ids))
+        object.__setattr__(self, "edge_ids", tuple(str(item) for item in self.edge_ids))
+        object.__setattr__(
+            self,
+            "tool_result_refs",
+            tuple(str(item) for item in self.tool_result_refs),
+        )
+        object.__setattr__(self, "payload", dict(self.payload or {}))
+
+
+@dataclass(frozen=True)
+class ToolResultRecord:
+    """Bounded provenance metadata for one external search/access result."""
+
+    tool_result_id: str
+    tool_name: str
+    action_id: str
+    sub_traj_id: int
+    main_turn: int
+    result_hash: str
+    query: str | None = None
+    url: str | None = None
+    result: str = ""
+    success: bool = True
+
+
 @dataclass(frozen=True)
 class CommitResult:
     """Result of an atomic graph commit."""
@@ -763,11 +927,11 @@ class AuditResult:
 
 @dataclass(frozen=True)
 class GraphConfig:
-    """Runtime limits and verification policy for graph-memory MVP."""
+    """Runtime limits and verification policy for graph-memory v2."""
 
     enabled: bool = False
-    schema_version: str = "v1"
-    condition_dsl_version: str = "v1"
+    schema_version: str = "v2"
+    condition_dsl_version: str = "v2"
     max_nodes: int = 20_000
     max_edges: int = 60_000
     max_actions: int = 5_000
@@ -784,10 +948,39 @@ class GraphConfig:
     min_independent_sources: int = 1
     allow_worker_fact_proposal: bool = False
     deterministic_render: bool = True
+    eval_allow_direct_answer_fallback: bool = False
+    eval_direct_answer_fallback_max_tokens: int = 1_024
     reject_mixed_tool_phases: bool = True
     log_snapshot: bool = True
     max_snapshot_nodes: int = 2_000
     snapshot_include_source_excerpt: bool = False
+    max_events: int = 60_000
+    max_read_tokens: int = 2_048
+    entity_bootstrap_enabled: bool = True
+    entity_bootstrap_max_new_tokens: int = 512
+    require_tool_provenance: bool = True
+    allow_worker_read_mem: bool = False
+    require_claim_next_turn_verification: bool = True
+    max_pending_claims: int = 2_000
+    max_pending_conflicts: int = 2_000
+    # Phase 2 deterministic retrieval and payload budgets.
+    embedding_backend: str = "hash"
+    embedding_dim: int = 128
+    payload_top_k: int = 4
+    payload_max_distance: int = 1
+    max_payload_nodes: int = 64
+    max_payload_tokens: int = 2_048
+    max_source_excerpt_tokens: int = 256
+    payload_include_source_excerpt: bool = True
+    # Phase 4 independent audit/render budgets and safety switches.
+    audit_enabled: bool = True
+    render_enabled: bool = True
+    format_retry_enabled: bool = True
+    max_audit_attempts: int = 3
+    max_render_attempts: int = 3
+    audit_best_effort: bool = True
+    require_audit_pass: bool = True
+    max_render_page_rows: int = 32
 
     @classmethod
     def from_config(cls, value: Any) -> "GraphConfig":
@@ -812,6 +1005,21 @@ class GraphConfig:
             "action_retry_limit",
             "min_independent_sources",
             "max_snapshot_nodes",
+            "eval_direct_answer_fallback_max_tokens",
+            "max_events",
+            "max_read_tokens",
+            "entity_bootstrap_max_new_tokens",
+            "max_pending_claims",
+            "max_pending_conflicts",
+            "embedding_dim",
+            "payload_top_k",
+            "payload_max_distance",
+            "max_payload_nodes",
+            "max_payload_tokens",
+            "max_source_excerpt_tokens",
+            "max_audit_attempts",
+            "max_render_attempts",
+            "max_render_page_rows",
         ):
             fields[key] = int(fields[key])
         for key in (
@@ -819,9 +1027,21 @@ class GraphConfig:
             "require_source_for_verified_claim",
             "allow_worker_fact_proposal",
             "deterministic_render",
+            "eval_allow_direct_answer_fallback",
             "reject_mixed_tool_phases",
             "log_snapshot",
             "snapshot_include_source_excerpt",
+            "entity_bootstrap_enabled",
+            "require_tool_provenance",
+            "allow_worker_read_mem",
+            "require_claim_next_turn_verification",
+            "payload_include_source_excerpt",
+            "audit_enabled",
+            "render_enabled",
+            "format_retry_enabled",
+            "audit_best_effort",
+            "require_audit_pass",
         ):
             fields[key] = bool(fields[key])
+        fields["embedding_backend"] = str(fields["embedding_backend"])
         return cls(**fields)

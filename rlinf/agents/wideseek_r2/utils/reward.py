@@ -897,7 +897,8 @@ def extract_final_answer(text: str, mode: str = "markdown", strict=True):
     Args:
         text: Raw generated text that may include reasoning/tool wrappers.
         mode: Parsing mode (``tag`` for workers or ``markdown`` for main roles).
-        strict: For markdown mode, require fenced markdown blocks when True.
+        strict: For markdown mode, require a fenced Markdown block when True.
+            When False, accept either a fenced or bare pipe table.
 
     Returns:
         For ``tag``: extracted string or None.

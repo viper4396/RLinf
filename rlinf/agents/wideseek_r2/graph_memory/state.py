@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
+import json
 from collections import defaultdict, deque
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -38,11 +40,14 @@ from rlinf.agents.wideseek_r2.graph_memory.schema import (
     EvidenceStatus,
     GateNode,
     GraphConfig,
+    GraphEvent,
+    GraphEventType,
     JoinNode,
     PayloadNode,
     RenderNode,
     TaskContract,
     TaskPlanProposal,
+    ToolResultRecord,
 )
 
 
@@ -64,13 +69,32 @@ class EvidenceGraph:
         return f"{EvidenceKind.coerce(kind).value}:{canonical_key}"
 
     def get_by_canonical(
-        self, canonical_key: str, kind: EvidenceKind | str | None = None
+        self,
+        canonical_key: str,
+        kind: EvidenceKind | str | None = None,
+        *,
+        active_only: bool = True,
     ) -> EvidenceNode | None:
         if kind is not None:
             node_id = self.canonical_index.get(
                 self.canonical_lookup_key(kind, canonical_key)
             )
-            return self.nodes.get(node_id) if node_id else None
+            node = self.nodes.get(node_id) if node_id else None
+            if node is None and not active_only:
+                node = next(
+                    (
+                        candidate
+                        for candidate in self.nodes.values()
+                        if candidate.kind == EvidenceKind.coerce(kind)
+                        and candidate.canonical_key == canonical_key
+                    ),
+                    None,
+                )
+            if node is not None and (not active_only or node.active):
+                return node
+            if active_only and node is not None:
+                return None
+            return node
         matches = {
             node_id
             for key, node_id in self.canonical_index.items()
@@ -79,10 +103,22 @@ class EvidenceGraph:
         # A plain alias is only safe when the canonical key is unambiguous
         # across evidence kinds.  Typed lookups above remain authoritative.
         if len(matches) == 1:
-            return self.nodes[next(iter(matches))]
+            node = self.nodes[next(iter(matches))]
+            return node if not active_only or node.active else None
         if not matches:
             node_id = self.canonical_index.get(canonical_key)
-            return self.nodes.get(node_id) if node_id else None
+            node = self.nodes.get(node_id) if node_id else None
+            if node is None and not active_only:
+                candidates = [
+                    candidate
+                    for candidate in self.nodes.values()
+                    if candidate.canonical_key == canonical_key
+                ]
+                if len(candidates) == 1:
+                    node = candidates[0]
+            return (
+                node if node is not None and (not active_only or node.active) else None
+            )
         return None
 
     def add_node(self, node: EvidenceNode) -> tuple[EvidenceNode, bool]:
@@ -94,7 +130,20 @@ class EvidenceGraph:
         lookup_key = self.canonical_lookup_key(node.kind, node.canonical_key)
         existing_id = self.canonical_index.get(lookup_key)
         if existing_id is not None:
-            return self.nodes[existing_id], False
+            existing = self.nodes[existing_id]
+            if existing.active:
+                return existing, False
+            # Retired nodes remain in the append-only store, but their
+            # canonical key may be reused by a new active node.
+            self.canonical_index.pop(lookup_key, None)
+            if self.canonical_index.get(node.canonical_key) == existing_id:
+                self.canonical_index.pop(node.canonical_key, None)
+            node = EvidenceNode(
+                **{
+                    **node.__dict__,
+                    "node_id": f"{node.node_id}:rev{self.version + 1}",
+                }
+            )
         self.nodes[node.node_id] = node
         self.canonical_index[lookup_key] = node.node_id
         # A plain-key alias is useful for task-local references when there is
@@ -106,6 +155,24 @@ class EvidenceGraph:
         if node.node_id not in self.nodes:
             raise GraphStateError(f"Unknown evidence node {node.node_id!r}")
         self.nodes[node.node_id] = node
+        lookup_key = self.canonical_lookup_key(node.kind, node.canonical_key)
+        if node.active:
+            self.canonical_index[lookup_key] = node.node_id
+            self.canonical_index[node.canonical_key] = node.node_id
+        elif self.canonical_index.get(lookup_key) == node.node_id:
+            self.canonical_index.pop(lookup_key, None)
+            if self.canonical_index.get(node.canonical_key) == node.node_id:
+                self.canonical_index.pop(node.canonical_key, None)
+
+    def retire_node(self, node_id: str, *, version: int) -> EvidenceNode:
+        """Retire a node while retaining its tombstone and lineage."""
+
+        node = self.nodes.get(node_id)
+        if node is None:
+            raise GraphStateError(f"Unknown evidence node {node_id!r}")
+        retired = node.with_status(EvidenceStatus.RETIRED, version=version)
+        self.replace_node(retired)
+        return retired
 
     def add_edge(self, edge: EvidenceEdge) -> tuple[EvidenceEdge, bool]:
         if edge.edge_id in self.edges:
@@ -125,28 +192,62 @@ class EvidenceGraph:
         self.edges[edge.edge_id] = edge
         return edge, True
 
-    def iter_kind(self, kind: EvidenceKind | str) -> list[EvidenceNode]:
+    def iter_kind(
+        self, kind: EvidenceKind | str, *, active_only: bool = True
+    ) -> list[EvidenceNode]:
         kind = EvidenceKind.coerce(kind)
-        return [node for node in self.nodes.values() if node.kind == kind]
+        return [
+            node
+            for node in self.nodes.values()
+            if node.kind == kind and (not active_only or node.active)
+        ]
 
     def incoming(
-        self, target_id: str, relation: str | None = None
+        self,
+        target_id: str,
+        relation: str | None = None,
+        *,
+        active_only: bool = True,
     ) -> list[EvidenceEdge]:
         return [
             edge
             for edge in self.edges.values()
             if edge.target_id == target_id
             and (relation is None or edge.relation == relation)
+            and (not active_only or edge.active)
+            and (
+                not active_only
+                or (
+                    self.nodes.get(edge.source_id) is not None
+                    and self.nodes.get(edge.source_id).active
+                    and self.nodes.get(edge.target_id) is not None
+                    and self.nodes.get(edge.target_id).active
+                )
+            )
         ]
 
     def outgoing(
-        self, source_id: str, relation: str | None = None
+        self,
+        source_id: str,
+        relation: str | None = None,
+        *,
+        active_only: bool = True,
     ) -> list[EvidenceEdge]:
         return [
             edge
             for edge in self.edges.values()
             if edge.source_id == source_id
             and (relation is None or edge.relation == relation)
+            and (not active_only or edge.active)
+            and (
+                not active_only
+                or (
+                    self.nodes.get(edge.source_id) is not None
+                    and self.nodes.get(edge.source_id).active
+                    and self.nodes.get(edge.target_id) is not None
+                    and self.nodes.get(edge.target_id).active
+                )
+            )
         ]
 
     def facts_for_claim(self, claim_id: str) -> list[EvidenceNode]:
@@ -415,6 +516,16 @@ class GraphRuntime:
     action_acl: dict[str, set[str]] = field(default_factory=lambda: defaultdict(set))
     action_acl_expiry: dict[str, int] = field(default_factory=dict)
     action_results: dict[str, dict[str, Any]] = field(default_factory=dict)
+    event_log: list[GraphEvent] = field(default_factory=list)
+    tool_results: dict[str, ToolResultRecord] = field(default_factory=dict)
+    pending_claim_ids: set[str] = field(default_factory=set)
+    pending_conflict_ids: set[str] = field(default_factory=set)
+    main_turn: int = 0
+    action_sequence: int = 0
+    tool_result_sequence: int = 0
+    bootstrap_entities: tuple[str, ...] = ()
+    bootstrap_metadata: dict[str, Any] = field(default_factory=dict)
+    answer_source: str = "none"
     graph_local_results: dict[int, str] = field(default_factory=dict)
     covered_partitions: set[str] = field(default_factory=set)
     remaining_budget: int = 0
@@ -424,6 +535,24 @@ class GraphRuntime:
     phase: str | None = None
     phase_history: list[str] = field(default_factory=list)
     last_error: str | None = None
+    # Phase 2 retrieval state is rebuilt from the active graph at Action
+    # creation time; it is never exposed as a worker read permission.
+    embedding_index: Any | None = None
+    payload_metadata: dict[str, Any] = field(default_factory=dict)
+    workflow_phase: str = "normal"
+    audit_attempt: int = 0
+    render_attempt: int = 0
+    audit_records: list[dict[str, Any]] = field(default_factory=list)
+    render_records: list[dict[str, Any]] = field(default_factory=list)
+    audit_payload: dict[str, Any] = field(default_factory=dict)
+    render_payload: dict[str, Any] = field(default_factory=dict)
+    render_payload_ids: tuple[str, ...] = ()
+    render_answer: str = ""
+    render_page_index: int = 0
+    render_page_answers: list[str] = field(default_factory=list)
+    last_normal_response: str = ""
+    terminal_failure: str | None = None
+    pending_memory_transaction: bool = False
 
     # These aliases let the condition evaluator work with plain enum values
     # without importing ActionState in every call site.
@@ -453,7 +582,13 @@ class GraphRuntime:
         format_requirements: dict[str, Any] | None = None,
         budget: int | None = None,
     ) -> "GraphRuntime":
-        """Create an empty, trajectory-local graph and fixed DAG skeleton."""
+        """Create an empty, trajectory-local Phase 1 graph.
+
+        The v2 runtime intentionally starts without a task-plan compiler,
+        Gate, Join, Audit, or Render node.  The legacy skeleton remains
+        available through the explicitly retained v1 compatibility helper so
+        older low-level callers can be migrated independently.
+        """
 
         normalized_type = str(answer_type or "table").lower()
         if normalized_type not in {"item", "set", "list", "table"}:
@@ -468,7 +603,8 @@ class GraphRuntime:
             format_requirements=format_requirements or {},
             budget=budget,
         )
-        runtime._bootstrap_activation_skeleton()
+        if runtime.config.schema_version == "v1":
+            runtime._bootstrap_activation_skeleton()
         return runtime
 
     def _bootstrap_activation_skeleton(self) -> None:
@@ -577,9 +713,338 @@ class GraphRuntime:
         self.phase = phase
         self.phase_history.append(phase)
 
-    def begin_turn(self) -> None:
+    @property
+    def active_graph(self) -> EvidenceGraph:
+        """Return an active-only projection of this trajectory's graph."""
+
+        active = EvidenceGraph(version=self.evidence_graph.version)
+        for node in self.evidence_graph.nodes.values():
+            if node.active:
+                active.add_node(node)
+        for edge in self.evidence_graph.edges.values():
+            if (
+                edge.active
+                and edge.source_id in active.nodes
+                and edge.target_id in active.nodes
+            ):
+                active.add_edge(edge)
+        return active
+
+    def begin_turn(self, turn: int | None = None, role: str | None = None) -> None:
+        """Reset turn-local tool state and advance the main-turn counter."""
+
+        if turn is not None:
+            self.main_turn = max(self.main_turn, int(turn))
         _current_phase_ctx.set(None)
         self.phase = None
+        if role is not None:
+            self.phase_history.append(f"turn:{self.main_turn}:{role}")
+
+    def create_action(
+        self,
+        objective: str,
+        *,
+        focus_refs: list[str] | tuple[str, ...] = (),
+        output_contract: dict[str, Any] | None = None,
+        priority: int = 0,
+    ) -> ActionNode:
+        """Create one flat Action and materialize its Phase 2 payload.
+
+        Actions are deliberately flat in Phase 1: there are no planner-owned
+        predecessor, Gate, or Join references.  The action's focus refs are
+        metadata only and never grant a worker graph-read permission.
+        """
+
+        if len(self.activation_dag.actions) >= self.config.max_actions:
+            raise GraphStateError("Graph action budget is exhausted")
+        if len(self.event_log) + 2 > self.config.max_events:
+            raise GraphStateError("Graph event-log budget is exhausted")
+        self.action_sequence += 1
+        action_id = f"action:{self.main_turn}:{self.action_sequence}"
+        action = ActionNode(
+            action_id=action_id,
+            objective=str(objective),
+            output_contract=copy.deepcopy(output_contract or {}),
+            priority=int(priority),
+            state=ActionState.MATERIALIZING_PAYLOAD,
+            metadata={
+                "focus_refs": tuple(str(ref) for ref in focus_refs),
+                "phase": "v2_phase2",
+                "main_turn": self.main_turn,
+                "graph_version": self.version,
+            },
+        )
+        self.activation_dag.add_node(action)
+        self._append_event(
+            GraphEventType.CREATE_ACTION,
+            actor_role="main",
+            action_id=action_id,
+            payload={"operation": "create_action", "objective": action.objective},
+        )
+        action = self.materialize_action_payload(
+            action_id,
+            subtask=str(objective),
+            focus_refs=tuple(str(ref) for ref in focus_refs),
+        )
+        return action
+
+    def materialize_action_payload(
+        self,
+        action_id: str,
+        *,
+        subtask: str,
+        focus_refs: tuple[str, ...] = (),
+    ) -> ActionNode:
+        """Attach an immutable, bounded Phase 2 payload to an Action."""
+
+        from rlinf.agents.wideseek_r2.graph_memory.embedding_index import (
+            DeterministicEmbeddingIndex,
+        )
+        from rlinf.agents.wideseek_r2.graph_memory.payload_builder import (
+            materialize_action_payloads,
+        )
+
+        action = self.activation_dag.actions.get(action_id)
+        if action is None:
+            raise GraphStateError(f"Unknown graph action {action_id!r}")
+        if self.embedding_index is None:
+            self.embedding_index = DeterministicEmbeddingIndex(
+                self.config.embedding_dim
+            )
+        result = materialize_action_payloads(
+            self,
+            action_id=action_id,
+            subtask=subtask,
+            focus_refs=focus_refs,
+            index=self.embedding_index,
+        )
+        # A rollout can legitimately begin before Entity bootstrap produces a
+        # node.  Preserve the external research Action with a query-only
+        # payload; unresolved focus refs are still a hard MISSING_CONTEXT once
+        # active graph context exists.
+        has_semantic_context = any(
+            node.active and node.kind.value in {"entity", "fact"}
+            for node in self.evidence_graph.nodes.values()
+        )
+        if not result.payloads and not has_semantic_context:
+            query = f"{self.question}\nCurrent subtask: {subtask}"
+            fallback = PayloadNode(
+                payload_id=f"payload:{action_id}:query",
+                selector={"query_only": True},
+                projection={},
+                max_tokens=min(
+                    self.config.max_payload_tokens, self.config.max_read_tokens
+                ),
+                required=True,
+                seed_ref=None,
+                graph_version=self.version,
+                token_count=max(1, len(query) // 4),
+                retrieval_metadata={
+                    "query": query,
+                    "query_only": True,
+                    "missing_context": list(result.missing_context),
+                },
+                body={"graph_version": self.version, "query": query, "nodes": []},
+            )
+            result = type(result)(
+                payloads=(fallback,),
+                metadata={"query_only": True, **result.metadata},
+            )
+        if result.missing_context:
+            updated = ActionNode(
+                **{
+                    **action.__dict__,
+                    "state": ActionState.MISSING_CONTEXT,
+                    "metadata": {
+                        **action.metadata,
+                        "payload_graph_version": self.version,
+                        "missing_context": list(result.missing_context),
+                    },
+                }
+            )
+            self.activation_dag.replace_node(updated)
+            self.action_results[action_id] = {
+                "status": "missing_context",
+                "missing_context": list(result.missing_context),
+            }
+            self._append_event(
+                GraphEventType.MATERIALIZE_PAYLOAD,
+                actor_role="main",
+                action_id=action_id,
+                payload={
+                    "status": "missing_context",
+                    "missing": list(result.missing_context),
+                },
+            )
+            return updated
+        for payload in result.payloads:
+            if payload.payload_id not in self.activation_dag.nodes:
+                self.activation_dag.add_node(payload)
+        updated = ActionNode(
+            **{
+                **action.__dict__,
+                "state": ActionState.READY,
+                "payload_ids": tuple(payload.payload_id for payload in result.payloads),
+                "metadata": {
+                    **action.metadata,
+                    "payload_graph_version": self.version,
+                    "payload_metadata": result.metadata,
+                },
+            }
+        )
+        self.activation_dag.replace_node(updated)
+        self.payload_metadata[action_id] = copy.deepcopy(result.metadata)
+        self._append_event(
+            GraphEventType.MATERIALIZE_PAYLOAD,
+            actor_role="main",
+            action_id=action_id,
+            node_ids=tuple(payload.payload_id for payload in result.payloads),
+            payload={
+                "status": "ready",
+                "payload_ids": [payload.payload_id for payload in result.payloads],
+                "graph_version": self.version,
+                "metadata": result.metadata,
+            },
+        )
+        return updated
+
+    def _append_event(
+        self,
+        event_type: GraphEventType | str,
+        *,
+        actor_role: str = "system",
+        action_id: str | None = None,
+        sub_traj_id: int = 0,
+        node_ids: tuple[str, ...] = (),
+        edge_ids: tuple[str, ...] = (),
+        tool_result_refs: tuple[str, ...] = (),
+        payload: dict[str, Any] | None = None,
+    ) -> GraphEvent:
+        """Append a bounded event without changing graph version."""
+
+        if len(self.event_log) >= self.config.max_events:
+            raise GraphStateError("Graph event-log budget is exhausted")
+        event = GraphEvent(
+            event_id=f"event:{uuid4().hex}",
+            event_type=event_type,
+            graph_version=self.version,
+            main_turn=self.main_turn,
+            actor_role=actor_role,  # type: ignore[arg-type]
+            action_id=action_id,
+            sub_traj_id=sub_traj_id,
+            node_ids=node_ids,
+            edge_ids=edge_ids,
+            tool_result_refs=tool_result_refs,
+            payload=payload or {},
+        )
+        self.event_log.append(event)
+        return event
+
+    def record_tool_result(
+        self,
+        *,
+        tool_name: str,
+        action_id: str,
+        sub_traj_id: int,
+        result: str,
+        query: str | None = None,
+        url: str | None = None,
+        success: bool = True,
+    ) -> ToolResultRecord:
+        """Store a raw tool result and return its stable in-trajectory ref."""
+
+        if len(self.event_log) >= self.config.max_events:
+            raise GraphStateError("Graph event-log budget is exhausted")
+        self.tool_result_sequence += 1
+        result_text = str(result)
+        result_hash = hashlib.sha256(result_text.encode("utf-8")).hexdigest()
+        result_id = f"tool:{self.main_turn}:{sub_traj_id}:{self.tool_result_sequence}"
+        record = ToolResultRecord(
+            tool_result_id=result_id,
+            tool_name=str(tool_name),
+            action_id=str(action_id),
+            sub_traj_id=int(sub_traj_id),
+            main_turn=self.main_turn,
+            result_hash=result_hash,
+            query=query,
+            url=url,
+            result=result_text,
+            success=bool(success),
+        )
+        self.tool_results[result_id] = record
+        self._append_event(
+            GraphEventType.TOOL_RESULT,
+            actor_role="subagent",
+            action_id=action_id,
+            sub_traj_id=sub_traj_id,
+            tool_result_refs=(result_id,),
+            payload={
+                "tool_name": tool_name,
+                "result_hash": result_hash,
+                "query": query,
+                "url": url,
+                "success": bool(success),
+            },
+        )
+        return record
+
+    def tool_result_refs_for_action(self, action_id: str, sub_traj_id: int) -> set[str]:
+        """Return result refs owned by the current action/sub-trajectory."""
+
+        return {
+            result_id
+            for result_id, record in self.tool_results.items()
+            if record.action_id == action_id and record.sub_traj_id == sub_traj_id
+        }
+
+    def read_mem(
+        self,
+        *,
+        refs: list[str] | tuple[str, ...] = (),
+        kinds: list[str] | tuple[str, ...] = (),
+        include_retired: bool = False,
+        max_tokens: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Read a bounded active-memory projection for the Main agent."""
+
+        requested_refs = {str(ref) for ref in refs}
+        requested_kinds = {EvidenceKind.coerce(kind) for kind in kinds}
+        nodes = []
+        for node in self.evidence_graph.nodes.values():
+            if not include_retired and not node.active:
+                continue
+            if requested_kinds and node.kind not in requested_kinds:
+                continue
+            if requested_refs:
+                aliases = {node.node_id, node.canonical_key}
+                if not aliases.intersection(requested_refs):
+                    continue
+            nodes.append(node)
+        nodes.sort(key=lambda item: (item.created_at_version, item.node_id))
+        result = []
+        budget = min(
+            max(1, int(max_tokens or self.config.max_read_tokens)),
+            self.config.max_read_tokens,
+        )
+        used = 0
+        for node in nodes:
+            item = {
+                "node_id": node.node_id,
+                "kind": node.kind.value,
+                "canonical_key": node.canonical_key,
+                "status": node.status.value,
+                "active": node.active,
+                "payload": copy.deepcopy(node.payload),
+                "proposed_by_role": node.proposed_by_role,
+                "proposed_by_turn": node.proposed_by_turn,
+                "tool_result_refs": list(node.tool_result_refs),
+            }
+            item_tokens = max(1, len(json.dumps(item, ensure_ascii=False)) // 4)
+            if result and used + item_tokens > budget:
+                break
+            result.append(item)
+            used += item_tokens
+        return result
 
     def task_context(self) -> dict[str, Any]:
         """Return the non-secret bootstrap context exposed to the planner."""
@@ -884,6 +1349,31 @@ class GraphRuntime:
 
         return await commit_evidence(self, proposal)
 
+    async def add_mem(self, proposal: Any):
+        """Commit a Subagent-owned Phase 1 ``add_mem`` proposal."""
+
+        from rlinf.agents.wideseek_r2.graph_memory.validator import commit_add_mem
+
+        return await commit_add_mem(self, proposal)
+
+    async def edit_mem(
+        self,
+        *,
+        base_version: int,
+        operations: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+        proposal_id: str = "edit:unknown",
+    ):
+        """Apply a Main-owned Phase 1 ``edit_mem`` transaction."""
+
+        from rlinf.agents.wideseek_r2.graph_memory.validator import commit_edit_mem
+
+        return await commit_edit_mem(
+            self,
+            base_version=base_version,
+            operations=operations,
+            proposal_id=proposal_id,
+        )
+
     def read_evidence(
         self,
         refs: list[str] | tuple[str, ...],
@@ -946,6 +1436,29 @@ class GraphRuntime:
                 )
             )
 
+    def start_audit(self, response_text: str = "") -> dict[str, Any]:
+        """Create the Phase 4 Audit node for the current graph version."""
+
+        from rlinf.agents.wideseek_r2.graph_memory.audit import start_audit
+
+        return start_audit(self, response_text)
+
+    def audit_outcome(self, *, model_pass: bool, response_text: str = "") -> Any:
+        """Record model Audit intent and mechanical terminal invariants."""
+
+        from rlinf.agents.wideseek_r2.graph_memory.audit import record_audit_outcome
+
+        return record_audit_outcome(
+            self, model_pass=model_pass, response_text=response_text
+        )
+
+    def start_render(self) -> dict[str, Any]:
+        """Create the Phase 4 Render node and immutable pages."""
+
+        from rlinf.agents.wideseek_r2.graph_memory.renderer import start_render
+
+        return start_render(self)
+
     def summary(self) -> dict[str, Any]:
         """Return a bounded graph summary suitable for a planner message."""
 
@@ -974,23 +1487,67 @@ class GraphRuntime:
                     for action_id, action in self.activation_dag.actions.items()
                     if action.state == ActionState.BLOCKED
                 ),
+                "missing_context": sorted(
+                    action_id
+                    for action_id, action in self.activation_dag.actions.items()
+                    if action.state == ActionState.MISSING_CONTEXT
+                ),
             },
             "evidence_counts": {
-                kind.value: len(self.evidence_graph.iter_kind(kind))
+                kind.value: len(self.evidence_graph.iter_kind(kind, active_only=True))
+                for kind in EvidenceKind
+            },
+            "retired_evidence_counts": {
+                kind.value: len(self.evidence_graph.iter_kind(kind, active_only=False))
+                - len(self.evidence_graph.iter_kind(kind, active_only=True))
                 for kind in EvidenceKind
             },
             "open_conflicts": [
                 node.node_id
                 for node in self.evidence_graph.iter_kind(EvidenceKind.CONFLICT)
-                if node.status in {EvidenceStatus.OPEN, EvidenceStatus.CONFLICTED}
+                if node.active
+                and node.status in {EvidenceStatus.OPEN, EvidenceStatus.CONFLICTED}
             ],
-            "recent_events": sum(len(queue) for queue in self.event_queues.values()),
+            "pending_claims": sorted(self.pending_claim_ids),
+            "pending_conflicts": sorted(self.pending_conflict_ids),
+            "event_log_size": len(self.event_log),
+            "tool_result_count": len(self.tool_results),
+            "bootstrap_entities": list(self.bootstrap_entities),
+            "activation_events": sum(
+                len(queue) for queue in self.event_queues.values()
+            ),
+            "payloads": {
+                "count": len(self.activation_dag.payloads),
+                "nodes": sum(
+                    len(payload.evidence_refs)
+                    for payload in self.activation_dag.payloads.values()
+                ),
+                "graph_versions": sorted(
+                    {
+                        payload.graph_version
+                        for payload in self.activation_dag.payloads.values()
+                    }
+                ),
+            },
+            "workflow": {
+                "phase": self.workflow_phase,
+                "audit_attempt": self.audit_attempt,
+                "render_attempt": self.render_attempt,
+                "terminal_failure": self.terminal_failure,
+            },
+            "recent_events": (
+                len(self.event_log[-self.config.max_delta_events_per_turn :])
+                if self.config.max_delta_events_per_turn > 0
+                else 0
+            ),
         }
 
     def snapshot(self, *, max_nodes: int | None = None) -> dict[str, Any]:
         """Return a bounded, ground-truth-free debug snapshot."""
 
         limit = max_nodes or self.config.max_snapshot_nodes
+        event_limit = self.config.max_delta_events_per_turn
+        event_log = self.event_log[-event_limit:] if event_limit > 0 else []
         nodes = list(self.evidence_graph.nodes.values())[:limit]
         return {
             "graph_version": self.version,
@@ -1004,7 +1561,15 @@ class GraphRuntime:
             "contract": self.contract,
             "evidence_nodes": nodes,
             "evidence_edges": list(self.evidence_graph.edges.values())[: limit * 2],
+            "event_log": event_log,
             "activation": self.summary()["frontier"],
+            "workflow": {
+                "phase": self.workflow_phase,
+                "audit_attempt": self.audit_attempt,
+                "render_attempt": self.render_attempt,
+                "audit_records": copy.deepcopy(self.audit_records[-3:]),
+                "render_records": copy.deepcopy(self.render_records[-3:]),
+            },
         }
 
     def context_token(self):

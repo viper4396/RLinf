@@ -88,8 +88,8 @@ agentloop:
   workflow: mas
   graph_memory:
     enabled: false
-    schema_version: v1
-    condition_dsl_version: v1
+    schema_version: v2
+    condition_dsl_version: v2
     max_nodes: 20000
     max_edges: 60000
     max_actions: 5000
@@ -106,10 +106,37 @@ agentloop:
     min_independent_sources: 1
     allow_worker_fact_proposal: false
     deterministic_render: true
+    eval_allow_direct_answer_fallback: false
+    eval_direct_answer_fallback_max_tokens: 1024
     reject_mixed_tool_phases: true
     log_snapshot: true
     max_snapshot_nodes: 2000
     snapshot_include_source_excerpt: false
+    max_events: 60000
+    max_read_tokens: 2048
+    entity_bootstrap_enabled: true
+    entity_bootstrap_max_new_tokens: 512
+    require_tool_provenance: true
+    allow_worker_read_mem: false
+    require_claim_next_turn_verification: true
+    max_pending_claims: 2000
+    max_pending_conflicts: 2000
+    embedding_backend: hash
+    embedding_dim: 128
+    payload_top_k: 4
+    payload_max_distance: 1
+    max_payload_nodes: 64
+    max_payload_tokens: 2048
+    max_source_excerpt_tokens: 256
+    payload_include_source_excerpt: true
+    audit_enabled: true
+    render_enabled: true
+    format_retry_enabled: true
+    max_audit_attempts: 3
+    max_render_attempts: 3
+    audit_best_effort: true
+    require_audit_pass: true
+    max_render_page_rows: 32
   max_planner_turns: 10
   max_worker_turns: 20
   max_sa_turns: 50

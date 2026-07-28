@@ -117,7 +117,9 @@ def test_bootstrap_is_empty_and_ground_truth_free():
     assert runtime.evidence_graph.nodes == {}
     assert "answer" not in runtime.task_context()
     assert "reward" not in runtime.task_context()
-    assert runtime.activation_dag.actions["action:plan_task"].state == ActionState.READY
+    assert runtime.activation_dag.actions == {}
+    assert runtime.activation_dag.gates == {}
+    assert runtime.activation_dag.joins == {}
 
 
 def test_item_two_hop_activation_happens_once():

@@ -7,11 +7,15 @@ Brief for AI coding agents working on RLinf. For full contribution flow, code st
 ## Experimental machines
 
 Use these SSH aliases as the default remote experiment machines. Check active jobs
-before launching anything; the last observed snapshot showed both machines in use.
+before launching anything; the last observed snapshot showed the previously listed
+machines in use.
 
 - `WS-R2` (`172.27.2.37`): primary RL/Ray machine with 8x H100 80GB. The last
   snapshot showed an active WideSeek-R2 evaluation, Ray and SGLang workers,
   Qdrant, and retrieval services on ports `18001` and `8003`.
+- `WS-R2-A800` (`183.233.148.6`, SSH port `40431`): additional remote
+  experiment machine. Inspect active jobs and available resources over SSH before
+  allocating GPUs.
 - `judge_machine` (`172.27.195.196`): judge/inference machine with 8x H100
   80GB. The last snapshot showed a Qwen3.6-27B SGLang DP8 service, Qdrant, and
   a retrieval service on port `8000`; no Ray cluster was detected.

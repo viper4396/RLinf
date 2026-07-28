@@ -19,14 +19,13 @@ def test_graph_parser_preserves_structured_action_scope():
         parser = WideSeekR2GraphQwenToolCallParser()
         _, requests = await parser(
             _call(
-                "create_sub_agents",
+                "call_sub",
                 {
-                    "sub_agents": [
+                    "subtasks": [
                         {
-                            "action_id": "action:hop_1",
-                            "prompt": "Find the intermediate entity",
-                            "input_refs": ["entity:root"],
-                            "expected_output": {"node_kinds": ["claim"]},
+                            "subtask": "Find the intermediate entity",
+                            "focus_refs": ["entity:root"],
+                            "output_contract": {"node_kinds": ["candidate"]},
                         }
                     ]
                 },
@@ -34,8 +33,8 @@ def test_graph_parser_preserves_structured_action_scope():
             role="planner",
         )
         assert requests[0].name == "subtask"
-        assert requests[0].arguments["action_id"] == "action:hop_1"
-        assert requests[0].arguments["input_refs"] == ["entity:root"]
+        assert "action_id" not in requests[0].arguments
+        assert requests[0].arguments["focus_refs"] == ["entity:root"]
         assert parser.last_error is None
 
     asyncio.run(run())
@@ -55,15 +54,15 @@ def test_graph_parser_rejects_mixed_multi_tag_phases():
     async def run():
         parser = WideSeekR2GraphQwenToolCallParser()
         response = _call(
-            "read_evidence",
-            {"refs": ["fact:one"]},
+            "add_mem",
+            {"base_version": 0, "nodes": [], "edges": []},
         ) + _call(
             "search",
             {"queries": [{"query": "country"}]},
         )
         _, requests = await parser(response, role="worker")
         assert requests == []
-        assert parser.last_error == "Mixed graph/external tool phases are not allowed"
+        assert parser.last_error.startswith("MIXED_TOOL_MODE:")
 
     asyncio.run(run())
 
@@ -72,7 +71,7 @@ def test_graph_parser_reports_incomplete_tags():
     async def run():
         parser = WideSeekR2GraphQwenToolCallParser()
         _, requests = await parser(
-            'prefix <tool_call>{"name": "read_evidence"}', role="worker"
+            'prefix <tool_call>{"name": "add_mem"}', role="worker"
         )
         assert requests == []
         assert parser.last_error == "Tool call tags were incomplete"

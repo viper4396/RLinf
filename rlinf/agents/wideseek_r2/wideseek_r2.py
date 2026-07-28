@@ -463,6 +463,22 @@ class WideSeekR2AgentLoopWorker(MultiAgentLoopWorker):
         self.release_affinity(conv_id)
         return answer_text, total_turn_list
 
+    async def _after_role_loop(
+        self,
+        *,
+        prompt_ids: list[int],
+        response_text: str,
+        role: str,
+        sub_traj_id: int,
+        turn_idx: int,
+        conv_id: str,
+        output_buffer: list[AgentLoopOutput],
+    ) -> tuple[str, int]:
+        """Optionally add a workflow-specific terminal generation."""
+
+        del prompt_ids, role, sub_traj_id, conv_id, output_buffer
+        return response_text, turn_idx
+
     async def worker_call(
         self,
         worker_request: ToolRequest,
@@ -691,6 +707,15 @@ class WideSeekR2AgentLoopWorker(MultiAgentLoopWorker):
             output_buffer.extend(worker_buffer)
             total_turn_list.extend(worker_turn_list)
 
+        response_text, turn_idx = await self._after_role_loop(
+            prompt_ids=prompt_ids,
+            response_text=response_text,
+            role=role,
+            sub_traj_id=sub_traj_id,
+            turn_idx=turn_idx,
+            conv_id=conv_id,
+            output_buffer=output_buffer,
+        )
         answer_text, total_turn_list = await self._finalize_trajectory(
             role=role,
             response_text=response_text,
@@ -730,7 +755,9 @@ class WideSeekR2AgentLoopWorker(MultiAgentLoopWorker):
             answer_type=answer_type,
         )
 
-        final_answer_extract = extract_final_answer(answer_text, mode="markdown")
+        final_answer_extract = extract_final_answer(
+            answer_text, mode="markdown", strict=False
+        )
 
         # credit assignment
         norm_column = self.cfg.data.get("norm_column", False)
