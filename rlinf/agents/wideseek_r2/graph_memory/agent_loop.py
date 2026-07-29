@@ -33,6 +33,7 @@ from rlinf.agents.wideseek_r2.graph_memory.audit import (
 )
 from rlinf.agents.wideseek_r2.graph_memory.credit import graph_credit_metrics
 from rlinf.agents.wideseek_r2.graph_memory.prompts import (
+    GRAPH_ITEM_PLANNER_GUIDANCE,
     GRAPH_PLANNER_GUIDANCE,
     GRAPH_WORKER_GUIDANCE,
 )
@@ -175,6 +176,8 @@ class WideSeekR2GraphAgentLoopWorker(WideSeekR2AgentLoopWorker):
         guidance = (
             GRAPH_PLANNER_GUIDANCE if role == "planner" else GRAPH_WORKER_GUIDANCE
         )
+        if role == "planner" and str(answer_type or "").lower() == "item":
+            guidance += "\n\n" + GRAPH_ITEM_PLANNER_GUIDANCE
         message_history[0]["content"] += "\n\n" + guidance
         graph_tools = get_graph_tools_description(
             role,
@@ -958,14 +961,17 @@ class WideSeekR2GraphAgentLoopWorker(WideSeekR2AgentLoopWorker):
                     ),
                 )
 
+        allow_best_effort = (
+            runtime.config.audit_best_effort and not runtime.config.require_audit_pass
+        )
         if runtime.workflow_phase == "done" and runtime.render_answer:
             response_text = runtime.render_answer
-        elif runtime.last_normal_response and runtime.config.audit_best_effort:
+        elif runtime.last_normal_response and allow_best_effort:
             response_text = runtime.last_normal_response
-        elif runtime.terminal_failure:
-            response_text = (
-                runtime.last_normal_response if runtime.config.audit_best_effort else ""
-            )
+        elif runtime.terminal_failure or runtime.config.require_audit_pass:
+            response_text = runtime.last_normal_response if allow_best_effort else ""
+            if runtime.terminal_failure is None:
+                runtime.terminal_failure = "AUDIT_REQUIRED"
         answer_text, total_turn_list = await self._finalize_trajectory(
             role="planner",
             response_text=response_text,
@@ -1143,7 +1149,7 @@ class WideSeekR2GraphAgentLoopWorker(WideSeekR2AgentLoopWorker):
         total_turn_list: list,
         conv_id: str,
     ):
-        """Finalize a role while preserving best-effort audit failures."""
+        """Finalize a role while honoring the configured audit policy."""
 
         if role != "planner":
             return await super()._finalize_trajectory(
@@ -1159,10 +1165,12 @@ class WideSeekR2GraphAgentLoopWorker(WideSeekR2AgentLoopWorker):
         else:
             answer_text = response_text.split("<|im_end|>")[0]
             if self.runtime.terminal_failure:
+                allow_best_effort = (
+                    self.runtime.config.audit_best_effort
+                    and not self.runtime.config.require_audit_pass
+                )
                 self.runtime.answer_source = (
-                    "audit_failed_best_effort"
-                    if self.runtime.config.audit_best_effort
-                    else "audit_failed"
+                    "audit_failed_best_effort" if allow_best_effort else "audit_failed"
                 )
             else:
                 self.runtime.answer_source = "main_response"

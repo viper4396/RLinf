@@ -238,6 +238,87 @@ model路径填入 `examples/agent/searchr1/config/eval_qwen2.5.yaml`
 
 运行 `bash examples/agent/searchr1/run_eval.sh` 启动测试。
 
+使用 Serper、Jina 和外部 Judge 评测 BrowseComp
+------------------------------------------------
+
+``eval_browsecomp_online.yaml`` 用于在包含 ``question`` 和 ``answer`` 字段的原始
+BrowseComp JSONL 上评测 Search-R1 checkpoint。``searchr1`` dataset adapter 会应用
+原始 ``local-rag`` ChatML prompt。Search worker 通过 Serper 检索，使用 Jina 抽取
+排名靠前的网页，并按配置的 benchmark mirror pattern 过滤结果 URL。主 accuracy 使用
+外部 OpenAI-compatible judge，同时 ``eval/exact_match`` 保留 Search-R1 的归一化
+exact-match 分数。
+
+必须在启动 Ray 之前导出 API key 和代理变量，因为 Ray worker 会继承启动时捕获的环境：
+
+.. code-block:: bash
+
+   export SERPER_API_KEY=...
+   export JINA_API_KEY=...
+   export http_proxy=...
+   export https_proxy=...
+   export RLINF_NODE_RANK=0
+   ray start --head
+
+示例配置使用
+``/mnt/public/suheng/data/browsecomp_padded1280.jsonl``、
+``/mnt/public/suheng/model/search_r1``，以及
+``http://172.27.22.136:30000`` 上的 judge。先运行 8 条 smoke test：
+
+.. code-block:: bash
+
+   bash examples/agent/searchr1/run_eval.sh eval_browsecomp_online \
+     data.data_size=8 data.val_rollout_batch_size=8 \
+     runner.experiment_name=searchr1-browsecomp-online-smoke8
+
+Smoke test 成功后再运行全部 1280 条：
+
+.. code-block:: bash
+
+   bash examples/agent/searchr1/run_eval.sh eval_browsecomp_online
+
+结果保存在
+``/mnt/public/suheng/searchr1_runs/<experiment_name>/eval_results.json``。
+顶层 ``accuracy`` 和 ``eval/judge_accuracy`` 使用 judge 等价性评分；
+``eval/exact_match`` 报告归一化 exact match。每条 trajectory 会同时保存两种分数和
+judge response。
+
+GISA 结构化答案评测
+-------------------
+
+``eval_gisa_online.yaml`` 使用相同的 Serper 和 Jina 在线工具，在
+``/mnt/public/suheng/data/gisa_full373.jsonl`` 上评测 Search-R1 checkpoint。
+GISA 数据会保留每条样本的 ``answer_type``（``table``、``set``、``list`` 或
+``item``）、``is_markdown`` 和 ``unique_columns`` 元数据。最终答案必须位于
+``<answer>...</answer>`` 内；结构化答案使用一个 fenced Markdown table。
+
+GISA 使用与 BrowseComp 相同的 OpenAI-compatible judge endpoint，但复用
+WideSeek-R2 的语义结构化答案评分器，分别判断 item、cell、row key 和完整 row 后再聚合。
+它报告 ``gisa/cell_f1``、``gisa/exact_match``、``gisa/pass@1``、
+``gisa/format_rate``、``gisa/table_row_f1`` 和 ``gisa/list_order_score``，
+以及按 answer type 拆分的指标。示例使用
+``http://172.27.22.136:30000`` 和 ``Qwen3-30B-A3B-Instruct-2507``。
+
+先运行 8 条 smoke test：
+
+.. code-block:: bash
+
+   bash examples/agent/searchr1/run_eval.sh eval_gisa_online \
+     data.data_size=8 data.val_rollout_batch_size=8 \
+     runner.experiment_name=searchr1-gisa-online-smoke8
+
+Smoke test 成功后再评测全部 373 条：
+
+.. code-block:: bash
+
+   bash examples/agent/searchr1/run_eval.sh eval_gisa_online
+
+``agentloop.context_safety_margin`` 确保每次请求的 prompt 与 completion token
+总数严格小于模型上下文上限。每个 batch 完成后，runner 会在实验目录中原子更新
+``eval_results.partial.json``，因此后续 batch 即使失败，已完成的轨迹仍会保留。
+
+结果保存在
+``/mnt/public/suheng/searchr1_runs/<experiment_name>/eval_results.json``。
+
 冻结 Teacher Planner 的 Shadow A/B
 ----------------------------------
 

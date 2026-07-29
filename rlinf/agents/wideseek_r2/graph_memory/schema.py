@@ -981,6 +981,9 @@ class GraphConfig:
     audit_best_effort: bool = True
     require_audit_pass: bool = True
     max_render_page_rows: int = 32
+    # Phase 5 item-task contract.
+    item_require_terminal_fact: bool = True
+    item_terminal_tag: str = "terminal"
 
     @classmethod
     def from_config(cls, value: Any) -> "GraphConfig":
@@ -1041,7 +1044,9 @@ class GraphConfig:
             "format_retry_enabled",
             "audit_best_effort",
             "require_audit_pass",
+            "item_require_terminal_fact",
         ):
             fields[key] = bool(fields[key])
         fields["embedding_backend"] = str(fields["embedding_backend"])
+        fields["item_terminal_tag"] = str(fields["item_terminal_tag"])
         return cls(**fields)

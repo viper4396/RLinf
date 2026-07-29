@@ -23,6 +23,7 @@ from transformers import AutoTokenizer
 from rlinf.data.datasets.item import DatasetItem
 from rlinf.data.datasets.reasoning import ReasoningDataset
 from rlinf.data.datasets.rstar2 import Rstar2Dataset
+from rlinf.data.datasets.searchr1 import SearchR1Dataset
 from rlinf.data.datasets.vlm import VLMDatasetRegistry
 from rlinf.data.datasets.wideseek_r1 import WideSeekR1Dataset
 from rlinf.data.datasets.wideseek_r2 import WideSeekR2Dataset
@@ -49,6 +50,7 @@ def create_rl_dataset(
         "wideseek_r1": WideSeekR1Dataset,
         "wideseek_r2": WideSeekR2Dataset,
         "rstar2": Rstar2Dataset,
+        "searchr1": SearchR1Dataset,
     }
     if config.data.type in dataset_type_map:
         datast_cls = dataset_type_map[config.data.type]

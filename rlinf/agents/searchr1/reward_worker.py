@@ -12,13 +12,60 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from omegaconf import DictConfig
 
-from rlinf.algorithms.searchr1_scoring import compute_score
+from rlinf.agents.searchr1.judge import JudgeRecord, SearchR1JudgeClient
+from rlinf.agents.searchr1.teacher_planner import extract_searchr1_question
+from rlinf.agents.wideseek_r1.utils.reward import extract_final_answer
+from rlinf.agents.wideseek_r2.utils.reward import (
+    evaluate_gisa_with_llm_judge,
+    verify_answer_with_llm_judge,
+)
+from rlinf.algorithms.searchr1_scoring import compute_score, extract_solution
 from rlinf.data.io_struct import DynamicRolloutResult
 from rlinf.scheduler import Channel, Worker
+
+
+async def score_searchr1_gisa_response(
+    response_text: str,
+    answer: dict[str, Any],
+    question: str,
+    judge_llm_generator: Callable[[list[dict[str, str]]], Awaitable[str]],
+) -> tuple[float, float, bool, dict[str, float]]:
+    """Score one Search-R1 response using the GISA semantic LLM judge."""
+    answer_payload = extract_solution(response_text)
+    if answer_payload is None:
+        return 0.0, 0.0, False, {}
+
+    answer_type = str(answer.get("answer_type", "table"))
+    if answer_type == "item":
+        score = await verify_answer_with_llm_judge(
+            question=question,
+            predicted_answer=answer_payload.strip(),
+            correct_answer=answer.get("answer"),
+            judge_llm_generator=judge_llm_generator,
+            answer_type="item",
+        )
+        metrics = {"cell_f1": float(score), "pass": float(score)}
+        return float(score), float(score), True, metrics
+
+    prediction = extract_final_answer(
+        answer_payload,
+        mode="markdown",
+        strict=False,
+    )
+    score, format_ok, metrics = await evaluate_gisa_with_llm_judge(
+        question=question,
+        extract_answer=prediction,
+        label_answer=answer,
+        judge_llm_generator=judge_llm_generator,
+    )
+    pass_score = float(metrics.get("pass", 0.0))
+    return float(score), pass_score, format_ok, metrics
 
 
 def assign_searchr1_rewards(
@@ -27,6 +74,11 @@ def assign_searchr1_rewards(
     *,
     reward_scale: float = 1.0,
     expose_reference: bool = False,
+    judge_scores: list[float | None] | None = None,
+    judge_responses: list[str] | None = None,
+    gisa_scores: list[float] | None = None,
+    gisa_metrics: list[dict[str, float]] | None = None,
+    gisa_format_ok: list[bool] | None = None,
 ) -> list[float]:
     """Score trajectories and place each final reward on its terminal turn.
 
@@ -47,10 +99,40 @@ def assign_searchr1_rewards(
     if response_texts is None or len(response_texts) != rollout_result.group_size:
         raise ValueError("Search-R1 reward requires one response_text per trajectory")
 
-    final_scores = [
-        float(compute_score(text, answer, do_print=False)) * reward_scale
-        for text in response_texts
-    ]
+    is_gisa = isinstance(answer, dict) and bool(answer.get("is_gisa", False))
+    if is_gisa:
+        if judge_scores is not None:
+            raise ValueError("Search-R1 GISA scoring cannot use the binary judge")
+        if (
+            gisa_scores is None
+            or gisa_metrics is None
+            or gisa_format_ok is None
+            or len(gisa_scores) != rollout_result.group_size
+            or len(gisa_metrics) != rollout_result.group_size
+            or len(gisa_format_ok) != rollout_result.group_size
+        ):
+            raise ValueError(
+                "Search-R1 GISA scores, metrics, and format flags must align "
+                "with the trajectory group"
+            )
+        final_scores = [float(score) * reward_scale for score in gisa_scores]
+        em_scores = [
+            float(metrics.get("pass", 0.0)) * reward_scale for metrics in gisa_metrics
+        ]
+    else:
+        em_scores = [
+            float(compute_score(text, answer, do_print=False)) * reward_scale
+            for text in response_texts
+        ]
+        if judge_scores is not None and len(judge_scores) != rollout_result.group_size:
+            raise ValueError("Search-R1 judge scores must align with trajectory group")
+        final_scores = [
+            em_score if judge_score is None else float(judge_score) * reward_scale
+            for em_score, judge_score in zip(
+                em_scores,
+                judge_scores or [None] * rollout_result.group_size,
+            )
+        ]
     turn_ids = rollout_result.extra_fields_train.get(
         "planner_turn_idx", list(range(rollout_result.num_sequence))
     )
@@ -84,6 +166,13 @@ def assign_searchr1_rewards(
     rollout_result.rewards = rewards
     extra_fields_traj["llm_reward"] = final_scores
     extra_fields_traj["R_final"] = final_scores
+    extra_fields_traj["em_reward"] = em_scores
+    if gisa_metrics is not None:
+        extra_fields_traj["gisa_metrics"] = gisa_metrics
+        extra_fields_traj["gisa_format_ok"] = gisa_format_ok
+    if judge_scores is not None:
+        extra_fields_traj["judge_reward"] = judge_scores
+        extra_fields_traj["judge_response"] = judge_responses
     rollout_result.extra_fields_traj = extra_fields_traj
     rollout_result.extra_fields_group = rollout_result.extra_fields_group or {}
     if expose_reference:
@@ -102,12 +191,48 @@ class SearchR1RewardWorker(Worker):
         reward_cfg = cfg.get("reward", {})
         self.reward_scale = float(reward_cfg.get("reward_scale", 1.0))
         self.expose_reference = cfg.runner.task_type == "reasoning_eval"
+        self.is_gisa = bool(cfg.data.get("is_gisa", False))
+        judge_cfg = reward_cfg.get("judge", {})
+        self.use_judge = bool(judge_cfg.get("enabled", False))
+        if self.is_gisa and not self.use_judge:
+            raise ValueError(
+                "Search-R1 GISA semantic scoring requires reward.judge.enabled=true"
+            )
+        self.judge_client = SearchR1JudgeClient(cfg) if self.use_judge else None
 
     def init_worker(self) -> None:
         """Initialize the stateless rule-based reward worker."""
 
+    async def _score_gisa_pending(
+        self,
+        pending: list[tuple[DynamicRolloutResult, dict[str, Any]]],
+    ) -> list[tuple[float, float, bool, dict[str, float]]]:
+        """Score one reward batch with a shared judge session and semaphore."""
+        if self.judge_client is None:
+            raise ValueError("Search-R1 GISA requires an initialized judge client")
+
+        async with self.judge_client.generator() as judge_generate:
+            coroutines = []
+            for rollout_result, answer in pending:
+                extra_fields_traj = rollout_result.extra_fields_traj or {}
+                response_texts = extra_fields_traj.get("response_text", [])
+                prompt_texts = extra_fields_traj.get(
+                    "prompt_text", [""] * rollout_result.group_size
+                )
+                question = str(answer.get("question") or "")
+                for prompt_text, response_text in zip(prompt_texts, response_texts):
+                    coroutines.append(
+                        score_searchr1_gisa_response(
+                            response_text,
+                            answer,
+                            question or extract_searchr1_question(prompt_text),
+                            judge_generate,
+                        )
+                    )
+            return await asyncio.gather(*coroutines)
+
     @Worker.timer("compute_rewards")
-    def compute_rewards(
+    async def compute_rewards(
         self,
         input_channel: Channel,
         output_channel: Channel,
@@ -133,6 +258,7 @@ class SearchR1RewardWorker(Worker):
                 references[reference_id] = answer
 
         consumed_ids: set[str] = set()
+        pending: list[tuple[DynamicRolloutResult, Any]] = []
         while len(consumed_ids) < total_batch_size:
             rollout_result: DynamicRolloutResult = input_channel.get()
             extra_fields_group = rollout_result.extra_fields_group or {}
@@ -144,11 +270,84 @@ class SearchR1RewardWorker(Worker):
             if reference_id in consumed_ids:
                 raise ValueError(f"Duplicate Search-R1 rollout ID: {reference_id}")
 
+            consumed_ids.add(reference_id)
+            if self.judge_client is None:
+                assign_searchr1_rewards(
+                    rollout_result,
+                    references[reference_id],
+                    reward_scale=self.reward_scale,
+                    expose_reference=self.expose_reference,
+                )
+                output_channel.put(rollout_result, async_op=True)
+                continue
+            pending.append((rollout_result, references[reference_id]))
+
+        judge_outputs: list[tuple[float | None, str]] = []
+        gisa_outputs: list[tuple[float, float, bool, dict[str, float]]] = []
+        if self.is_gisa:
+            gisa_outputs = await self._score_gisa_pending(pending)
+        elif self.judge_client is not None:
+            judge_records = []
+            for rollout_result, answer in pending:
+                extra_fields_traj = rollout_result.extra_fields_traj or {}
+                response_texts = extra_fields_traj.get("response_text", [])
+                prompt_texts = extra_fields_traj.get(
+                    "prompt_text", [""] * rollout_result.group_size
+                )
+                for prompt_text, response_text in zip(prompt_texts, response_texts):
+                    judge_records.append(
+                        JudgeRecord(
+                            question=extract_searchr1_question(prompt_text),
+                            predicted_answer=extract_solution(response_text),
+                            correct_answer=(
+                                answer[0]
+                                if isinstance(answer, list) and len(answer) == 1
+                                else answer
+                            ),
+                        )
+                    )
+            judge_outputs = await self.judge_client.score_many(judge_records)
+
+        judge_offset = 0
+        gisa_offset = 0
+        for rollout_result, answer in pending:
+            group_judgements = (
+                judge_outputs[judge_offset : judge_offset + rollout_result.group_size]
+                if judge_outputs
+                else []
+            )
+            judge_offset += rollout_result.group_size
+            group_gisa = (
+                gisa_outputs[gisa_offset : gisa_offset + rollout_result.group_size]
+                if gisa_outputs
+                else []
+            )
+            gisa_offset += rollout_result.group_size
             assign_searchr1_rewards(
                 rollout_result,
-                references[reference_id],
+                answer,
                 reward_scale=self.reward_scale,
                 expose_reference=self.expose_reference,
+                judge_scores=(
+                    [score for score, _ in group_judgements]
+                    if group_judgements
+                    else None
+                ),
+                judge_responses=(
+                    [response for _, response in group_judgements]
+                    if group_judgements
+                    else None
+                ),
+                gisa_scores=(
+                    [score for score, _, _, _ in group_gisa] if group_gisa else None
+                ),
+                gisa_metrics=(
+                    [metrics for _, _, _, metrics in group_gisa] if group_gisa else None
+                ),
+                gisa_format_ok=(
+                    [format_ok for _, _, format_ok, _ in group_gisa]
+                    if group_gisa
+                    else None
+                ),
             )
-            consumed_ids.add(reference_id)
             output_channel.put(rollout_result, async_op=True)

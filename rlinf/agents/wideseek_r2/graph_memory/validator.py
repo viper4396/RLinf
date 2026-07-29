@@ -850,8 +850,13 @@ class GraphValidator:
             "value": claim.payload.get("value", claim.payload.get("object")),
         }
         fact_tags = list(claim.tags)
-        if claim.payload.get("terminal") or "terminal" in fact_tags:
-            fact_tags.append("terminal")
+        terminal_tag = runtime.config.item_terminal_tag
+        if (
+            claim.payload.get("terminal")
+            or "terminal" in fact_tags
+            or terminal_tag in fact_tags
+        ):
+            fact_tags.append(terminal_tag)
         fact = EvidenceNode(
             node_id=_stable_id("evidence:fact", fact_key),
             kind=EvidenceKind.FACT,

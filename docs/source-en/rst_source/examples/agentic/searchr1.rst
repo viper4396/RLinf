@@ -247,6 +247,93 @@ Modify the evaluation dataset path:
 
 Run `bash examples/agent/searchr1/run_eval.sh` to start evaluation.
 
+BrowseComp with Serper, Jina, and an external judge
+----------------------------------------------------
+
+``eval_browsecomp_online.yaml`` evaluates a Search-R1 checkpoint on raw
+BrowseComp JSONL records with ``question`` and ``answer`` fields. The
+``searchr1`` dataset adapter applies the original ``local-rag`` ChatML prompt.
+The search worker queries Serper, enriches the highest-ranked pages through
+Jina, and filters result URLs matching the configured benchmark-mirror
+patterns. The main accuracy uses the external OpenAI-compatible judge, while
+``eval/exact_match`` retains the normalized Search-R1 exact-match score.
+
+Export the API keys and proxy variables before starting Ray, because Ray
+workers inherit the environment captured at startup:
+
+.. code-block:: bash
+
+   export SERPER_API_KEY=...
+   export JINA_API_KEY=...
+   export http_proxy=...
+   export https_proxy=...
+   export RLINF_NODE_RANK=0
+   ray start --head
+
+The example config uses
+``/mnt/public/suheng/data/browsecomp_padded1280.jsonl``,
+``/mnt/public/suheng/model/search_r1``, and the judge at
+``http://172.27.22.136:30000``. Run an eight-sample smoke test first:
+
+.. code-block:: bash
+
+   bash examples/agent/searchr1/run_eval.sh eval_browsecomp_online \
+     data.data_size=8 data.val_rollout_batch_size=8 \
+     runner.experiment_name=searchr1-browsecomp-online-smoke8
+
+After the smoke test succeeds, run all 1280 records:
+
+.. code-block:: bash
+
+   bash examples/agent/searchr1/run_eval.sh eval_browsecomp_online
+
+Results are saved to
+``/mnt/public/suheng/searchr1_runs/<experiment_name>/eval_results.json``.
+The top-level ``accuracy`` and ``eval/judge_accuracy`` use judge equivalence;
+``eval/exact_match`` reports normalized exact match. Per-trajectory output
+retains both scores and the judge response.
+
+GISA structured-answer evaluation
+---------------------------------
+
+``eval_gisa_online.yaml`` evaluates the Search-R1 checkpoint on
+``/mnt/public/suheng/data/gisa_full373.jsonl`` with the same Serper and Jina
+online tools. GISA records preserve their per-example ``answer_type``
+(``table``, ``set``, ``list``, or ``item``), ``is_markdown``, and
+``unique_columns`` metadata. The final answer must remain inside
+``<answer>...</answer>``; structured answers use one fenced Markdown table.
+
+GISA uses the same OpenAI-compatible judge endpoint as BrowseComp, but applies
+the semantic structured-answer scorer shared with WideSeek-R2. It judges
+items, cells, row keys, and complete rows before aggregation, and reports
+``gisa/cell_f1``, ``gisa/exact_match``, ``gisa/pass@1``,
+``gisa/format_rate``, ``gisa/table_row_f1``, and
+``gisa/list_order_score``, plus per-answer-type metrics. The example points to
+``http://172.27.22.136:30000`` and
+``Qwen3-30B-A3B-Instruct-2507``.
+
+Run an eight-sample smoke test first:
+
+.. code-block:: bash
+
+   bash examples/agent/searchr1/run_eval.sh eval_gisa_online \
+     data.data_size=8 data.val_rollout_batch_size=8 \
+     runner.experiment_name=searchr1-gisa-online-smoke8
+
+After the smoke test succeeds, evaluate all 373 records:
+
+.. code-block:: bash
+
+   bash examples/agent/searchr1/run_eval.sh eval_gisa_online
+
+``agentloop.context_safety_margin`` keeps each prompt-plus-completion request
+strictly below the model context limit. After every completed batch, the runner
+atomically updates ``eval_results.partial.json`` in the experiment directory so
+completed trajectories remain available if a later batch fails.
+
+Results are saved to
+``/mnt/public/suheng/searchr1_runs/<experiment_name>/eval_results.json``.
+
 Frozen Teacher-Planner Shadow A/B
 ---------------------------------
 

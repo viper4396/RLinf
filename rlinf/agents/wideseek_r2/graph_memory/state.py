@@ -563,6 +563,17 @@ class GraphRuntime:
         self.answer_type = str(self.answer_type or "table").lower()
         self.language = str(self.language or "en")
         self.format_requirements = copy.deepcopy(self.format_requirements or {})
+        if self.answer_type == "item":
+            from rlinf.agents.wideseek_r2.graph_memory.item import (
+                normalize_item_format_requirements,
+            )
+
+            self.format_requirements.setdefault(
+                "terminal_tag", self.config.item_terminal_tag
+            )
+            self.format_requirements = normalize_item_format_requirements(
+                self.format_requirements
+            )
         if self.budget is not None:
             self.budget = max(0, min(int(self.budget), self.config.max_actions))
             self.remaining_budget = min(max(0, self.remaining_budget), self.budget)

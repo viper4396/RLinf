@@ -212,8 +212,8 @@ whole-answer EM is now represented as judge-based ``pass@1``, ``avg@k``, and
 ``list`` records must identify their type explicitly; homogeneous item datasets
 should set ``data.answer_type: item``.
 
-WideSeek-R2 graph-memory v2 (Phase 1/2/4)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+WideSeek-R2 graph-memory v2 (Phase 1/2/4/5 item)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 The existing ``mas_graph`` workflow now uses the v2 runtime directly;
 there is no separate v2 workflow. Enable it with the existing workflow and
@@ -246,14 +246,23 @@ payload, focus references, graph-version metadata, and deterministic
 deduplication. Workers receive that immutable payload at spawn time and still
 cannot call ``read_mem``.
 
+For the Phase 5 ``item`` contract, the planner starts without an initial plan
+and dispatches only the current dependency hop. The next ``call_sub`` receives
+the resolved Entity/Fact references through ``focus_refs``. The final Claim
+must be promoted to one explicitly marked terminal Fact with a non-empty value
+and active source provenance; Audit rejects missing or multiple terminal Facts.
+
 Phase 4 keeps the actual normal response, then runs an independent Audit
 state machine. A structured ``AUDIT_PASS`` is accepted only when pending
 claims/conflicts, active Claim/Fact provenance, source provenance, action
 terminality, and transaction invariants all pass. A successful Audit creates a
 Render Payload containing only active Entity/Fact nodes and one-hop source
 provenance. Render output is mechanically checked for item/set/list/table
-shape, payload-reference scope, and Markdown format; failures use bounded
-format-only retries and never silently enter Audit again.
+shape, payload-reference scope, and Markdown format; for ``item`` it contains
+exactly one ``Item`` row sourced from the terminal Fact. Failures use bounded
+format-only retries and never silently enter Audit again. With
+``require_audit_pass: true``, an audit failure cannot fall back to the
+unverified normal response.
 
 Important graph-memory keys include ``max_events``, ``max_read_tokens``,
 ``entity_bootstrap_max_new_tokens``, ``max_pending_claims``, and
@@ -261,8 +270,9 @@ Important graph-memory keys include ``max_events``, ``max_read_tokens``,
 ``payload_max_distance``, ``max_payload_nodes``, ``max_payload_tokens``, and
 ``max_source_excerpt_tokens``. Phase 4 adds ``max_audit_attempts``,
 ``max_render_attempts``, ``audit_enabled``, ``render_enabled``, and
-``format_retry_enabled``. ``max_nodes``, ``max_edges``, and ``max_actions``
-remain hard graph budgets.
+``format_retry_enabled``. Phase 5 item support adds
+``item_require_terminal_fact`` and ``item_terminal_tag``. ``max_nodes``,
+``max_edges``, and ``max_actions`` remain hard graph budgets.
 
 actor
 ~~~~~~~~~~~~~~~

@@ -13,9 +13,11 @@
 # limitations under the License.
 
 import asyncio
+import inspect
 import json
 import re
 from collections import defaultdict
+from pathlib import Path
 
 import pytest
 import torch
@@ -26,8 +28,18 @@ from rlinf.agents.searchr1.eval_diagnostics import (
     build_abc_acceptance_metrics,
     build_label_only_diagnostics,
 )
+from rlinf.agents.searchr1.eval_runner import (
+    Searchr1AgentEvalRunner,
+    build_searchr1_gisa_metrics,
+)
+from rlinf.agents.searchr1.judge import parse_judge_response
+from rlinf.agents.searchr1.online_search import SearchR1OnlineSearchClient
 from rlinf.agents.searchr1.reference_runner import SearchR1ReferenceRunnerMixin
-from rlinf.agents.searchr1.reward_worker import assign_searchr1_rewards
+from rlinf.agents.searchr1.reward_worker import (
+    SearchR1RewardWorker,
+    assign_searchr1_rewards,
+    score_searchr1_gisa_response,
+)
 from rlinf.agents.searchr1.searchr1_agent_loop import (
     Searchr1AgentLoopWorker,
     classify_controller_binding_failure,
@@ -57,8 +69,10 @@ from rlinf.agents.searchr1.teacher_planner import (
 )
 from rlinf.algorithms.advantages import compute_grpo_dynamic_advantages
 from rlinf.algorithms.toolcall_parsers import Searchr1QwenToolCallParser
+from rlinf.data.datasets.searchr1 import SearchR1Dataset, format_searchr1_prompt
 from rlinf.data.io_struct import DynamicRolloutResult
 from rlinf.data.tool_call.tool_io_struct import ToolRequest, ToolResponse
+from rlinf.runners.reasoning_eval_runner import ReasoningEvalRunner
 from rlinf.workers.agent.agent_loop import AgentLoopOutput, MultiAgentLoopOutput
 
 
@@ -70,16 +84,50 @@ class _CaptureChannel:
         self.items.append(value)
 
 
+class _QueueChannel(_CaptureChannel):
+    def get(self):
+        return self.items.pop(0)
+
+
 class _DummyReferenceRunner(SearchR1ReferenceRunnerMixin):
     pass
 
 
+def test_reasoning_eval_dataloader_keeps_partial_final_batch():
+    runner = ReasoningEvalRunner.__new__(ReasoningEvalRunner)
+    runner.cfg = OmegaConf.create(
+        {
+            "data": {
+                "num_workers": 0,
+                "val_rollout_batch_size": 2,
+                "validation_shuffle": False,
+            },
+            "algorithm": {"group_size": 1},
+        }
+    )
+    runner.reward = None
+
+    runner._build_dataloader(
+        list(range(5)),
+        collate_fn=lambda items: items,
+    )
+
+    assert len(runner.val_dataloader) == 3
+    assert [len(batch) for batch in runner.val_dataloader] == [2, 2, 1]
+
+
 class _CharacterTokenizer:
+    eos_token_id = 0
+    is_fast = True
+
     def encode(self, text, add_special_tokens=False):
         return [ord(character) for character in text]
 
     def decode(self, token_ids):
         return "".join(chr(token_id) for token_id in token_ids)
+
+    def batch_encode_plus(self, texts):
+        return {"input_ids": [self.encode(text) for text in texts]}
 
 
 def _multihop_plan() -> TeacherPlan:
@@ -267,6 +315,373 @@ def test_assign_reward_only_to_each_trajectory_terminal_turn():
     assert rollout_result.extra_fields_group["answer"] == ["Paris"]
 
 
+def test_assign_reward_uses_judge_and_retains_exact_match():
+    rollout_result = DynamicRolloutResult(
+        num_sequence=1,
+        group_size=1,
+        idx_to_traj=[0],
+        input_ids=[[1]],
+        prompt_lengths=[0],
+        response_lengths=[1],
+        is_end=[True],
+        rewards=[0.0],
+        extra_fields_train={"planner_turn_idx": [0], "is_terminal": [True]},
+        extra_fields_traj={"response_text": ["<answer>1988 to 1996</answer>"]},
+        extra_fields_group={"reference_id": "opaque-reference-id"},
+    )
+
+    scores = assign_searchr1_rewards(
+        rollout_result,
+        ["1988-96"],
+        judge_scores=[1.0],
+        judge_responses=["Correct"],
+    )
+
+    assert scores == [1.0]
+    assert rollout_result.extra_fields_traj["em_reward"] == [0.0]
+    assert rollout_result.extra_fields_traj["judge_reward"] == [1.0]
+    assert rollout_result.extra_fields_traj["judge_response"] == ["Correct"]
+
+
+def test_assign_reward_uses_gisa_cell_f1_and_retains_exact_match():
+    label = {
+        "answer": (
+            "```markdown\n| Name | Country |\n| --- | --- |\n"
+            "| Alice | Chile |\n| Bob | Bolivia |\n```"
+        ),
+        "answer_type": "table",
+        "is_markdown": True,
+        "is_gisa": True,
+        "unique_columns": ["Name"],
+    }
+    exact = label["answer"]
+    partial = exact.replace("Bolivia", "Peru")
+    rollout_result = DynamicRolloutResult(
+        num_sequence=2,
+        group_size=2,
+        idx_to_traj=[0, 1],
+        input_ids=[[1], [2]],
+        prompt_lengths=[0, 0],
+        response_lengths=[1, 1],
+        is_end=[True, True],
+        rewards=[0.0, 0.0],
+        extra_fields_train={
+            "planner_turn_idx": [0, 0],
+            "is_terminal": [True, True],
+        },
+        extra_fields_traj={
+            "response_text": [
+                f"<answer>{exact}</answer>",
+                f"<answer>{partial}</answer>",
+            ]
+        },
+        extra_fields_group={"reference_id": "opaque-reference-id"},
+    )
+
+    scores = assign_searchr1_rewards(
+        rollout_result,
+        label,
+        gisa_scores=[1.0, 0.75],
+        gisa_metrics=[
+            {"cell_f1": 1.0, "row_f1": 1.0, "pass": 1.0},
+            {"cell_f1": 0.75, "row_f1": 0.5, "pass": 0.0},
+        ],
+        gisa_format_ok=[True, True],
+    )
+
+    assert scores == pytest.approx([1.0, 0.75])
+    assert rollout_result.extra_fields_traj["em_reward"] == [1.0, 0.0]
+    assert rollout_result.extra_fields_traj["gisa_format_ok"] == [True, True]
+    assert rollout_result.extra_fields_traj["gisa_metrics"][1] == {
+        "cell_f1": pytest.approx(0.75),
+        "row_f1": pytest.approx(0.5),
+        "pass": 0.0,
+    }
+
+
+def test_searchr1_gisa_missing_answer_tag_is_format_failure():
+    label = {
+        "answer": "Chile",
+        "answer_type": "item",
+        "is_markdown": False,
+        "is_gisa": True,
+    }
+
+    async def judge(_messages):
+        raise AssertionError("Missing answer tags must not call the judge")
+
+    result = asyncio.run(
+        score_searchr1_gisa_response("Chile", label, "Name a country.", judge)
+    )
+
+    assert result == (0.0, 0.0, False, {})
+
+
+def test_searchr1_gisa_item_uses_semantic_llm_judge():
+    calls = []
+
+    async def judge(messages):
+        calls.append(messages)
+        return "Correct"
+
+    result = asyncio.run(
+        score_searchr1_gisa_response(
+            "<answer>1988 to 1996</answer>",
+            {
+                "answer": "1988-96",
+                "answer_type": "item",
+                "is_markdown": False,
+                "is_gisa": True,
+            },
+            "When did it run?",
+            judge,
+        )
+    )
+
+    assert result == (
+        1.0,
+        1.0,
+        True,
+        {"cell_f1": 1.0, "pass": 1.0},
+    )
+    assert len(calls) == 1
+
+
+def test_searchr1_gisa_reward_worker_awaits_judge_inside_running_event_loop():
+    label = {
+        "answer": "1988-96",
+        "answer_type": "item",
+        "is_markdown": False,
+        "is_gisa": True,
+        "question": "When did it run?",
+    }
+    rollout_result = DynamicRolloutResult(
+        num_sequence=1,
+        group_size=1,
+        idx_to_traj=[0],
+        input_ids=[[1]],
+        prompt_lengths=[0],
+        response_lengths=[1],
+        is_end=[True],
+        rewards=[0.0],
+        extra_fields_train={"planner_turn_idx": [0], "is_terminal": [True]},
+        extra_fields_traj={
+            "prompt_text": ["When did it run?"],
+            "response_text": ["<answer>1988 to 1996</answer>"],
+        },
+        extra_fields_group={"reference_id": "gisa-1"},
+    )
+    worker = SearchR1RewardWorker.__new__(SearchR1RewardWorker)
+    worker.cfg = OmegaConf.create({"data": {"rollout_batch_size": 1}})
+    worker.reward_scale = 1.0
+    worker.expose_reference = True
+    worker.is_gisa = True
+    worker.judge_client = object()
+
+    async def score_pending(pending):
+        assert pending == [(rollout_result, label)]
+        return [(1.0, 1.0, True, {"cell_f1": 1.0, "pass": 1.0})]
+
+    worker._score_gisa_pending = score_pending
+    input_channel = _QueueChannel()
+    input_channel.items.append(rollout_result)
+    output_channel = _CaptureChannel()
+    reference_channel = _QueueChannel()
+    reference_channel.items.append({"reference_ids": ["gisa-1"], "answers": [label]})
+
+    async def run():
+        compute_rewards = inspect.unwrap(SearchR1RewardWorker.compute_rewards)
+        await compute_rewards(
+            worker,
+            input_channel,
+            output_channel,
+            reference_channel,
+            total_batch_size=1,
+        )
+
+    asyncio.run(run())
+
+    assert output_channel.items == [rollout_result]
+    assert rollout_result.extra_fields_traj["gisa_metrics"] == [
+        {"cell_f1": 1.0, "pass": 1.0}
+    ]
+
+
+def test_searchr1_prompt_wraps_raw_browsecomp_question():
+    prompt = format_searchr1_prompt("Who wrote the book?")
+
+    assert prompt.startswith("<|im_start|>system\n")
+    assert "Question: Who wrote the book?" in prompt
+    assert prompt.endswith("<|im_start|>assistant\n<think>")
+    assert extract_searchr1_question(prompt) == "Who wrote the book?"
+
+
+def test_searchr1_gisa_dataset_preserves_structural_metadata(tmp_path):
+    data_path = tmp_path / "gisa.jsonl"
+    data_path.write_text(
+        json.dumps(
+            {
+                "id": "gisa-1",
+                "question": "List the countries.",
+                "answer": (
+                    "```markdown\n| country |\n| --- |\n| Chile |\n| Bolivia |\n```"
+                ),
+                "answer_type": "list",
+                "is_markdown": True,
+                "unique_columns": ["country"],
+                "question_type": "stable",
+                "topic": "geography",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    cfg = OmegaConf.create(
+        {
+            "data": {
+                "max_prompt_length": 2048,
+                "prompt_key": "question",
+                "answer_key": "answer",
+                "apply_chat_template": False,
+                "filter_prompt_by_length": False,
+                "is_gisa": True,
+                "unique_columns": "unique_columns",
+            }
+        }
+    )
+
+    item = SearchR1Dataset(
+        str(data_path),
+        cfg,
+        _CharacterTokenizer(),
+    )[0]
+
+    assert item.answer == {
+        "answer": ("```markdown\n| country |\n| --- |\n| Chile |\n| Bolivia |\n```"),
+        "answer_type": "list",
+        "is_markdown": True,
+        "is_gisa": True,
+        "instance_id": "gisa-1",
+        "unique_columns": ["country"],
+        "question_type": "stable",
+        "topic": "geography",
+        "question": "List the countries.",
+    }
+    assert "one fenced Markdown table representing a list answer" in item.prompt_text
+    assert "one column named Item" in item.prompt_text
+
+
+def test_searchr1_gisa_metric_aggregation():
+    context = {
+        "gisa_count": 4,
+        "gisa_cell_f1_sum": 2.5,
+        "gisa_exact_match_sum": 2.0,
+        "gisa_format_sum": 3.0,
+        "gisa_row_f1_sum": 0.75,
+        "gisa_row_f1_count": 1,
+        "gisa_order_score_sum": 0.5,
+        "gisa_order_score_count": 1,
+        "gisa_type_counts": {"table": 1, "list": 1, "item": 2},
+        "gisa_type_cell_f1_sums": {"table": 0.5, "list": 0.5, "item": 1.5},
+        "gisa_type_exact_match_sums": {"table": 0.0, "list": 0.0, "item": 2.0},
+        "gisa_type_format_sums": {"table": 1.0, "list": 1.0, "item": 1.0},
+    }
+
+    metrics = build_searchr1_gisa_metrics(context)
+
+    assert metrics["gisa/cell_f1"] == pytest.approx(0.625)
+    assert metrics["gisa/exact_match"] == pytest.approx(0.5)
+    assert metrics["gisa/pass@1"] == pytest.approx(0.5)
+    assert metrics["gisa/format_rate"] == pytest.approx(0.75)
+    assert metrics["gisa/table_row_f1"] == pytest.approx(0.75)
+    assert metrics["gisa/list_order_score"] == pytest.approx(0.5)
+    assert metrics["gisa/type/item/cell_f1"] == pytest.approx(0.75)
+
+
+def test_searchr1_partial_results_checkpoint_is_atomic_and_complete(tmp_path):
+    runner = Searchr1AgentEvalRunner.__new__(Searchr1AgentEvalRunner)
+    runner.cfg = OmegaConf.create(
+        {
+            "runner": {
+                "output_dir": str(tmp_path),
+                "experiment_name": "partial-test",
+            },
+            "data": {"val_data_paths": ["/data/gisa.jsonl"]},
+        }
+    )
+    runner.val_dataset = [1, 2, 3]
+    runner.accumulated_results = [{"index": 0, "reward": 0.5}]
+
+    output_path = runner._save_partial_results(next_batch_idx=1)
+    payload = json.loads(Path(output_path).read_text(encoding="utf-8"))
+
+    assert payload["summary"] == {
+        "dataset_size": 3,
+        "completed_count": 1,
+        "next_batch_idx": 1,
+        "experiment_name": "partial-test",
+        "data_paths": ["/data/gisa.jsonl"],
+    }
+    assert payload["results"] == runner.accumulated_results
+    assert not Path(f"{output_path}.tmp").exists()
+
+
+@pytest.mark.parametrize(
+    ("response", "expected"),
+    [
+        ("Correct", 1.0),
+        ("Incorrect", 0.0),
+        ("The answer is correct.", 1.0),
+        ("unclear", None),
+    ],
+)
+def test_parse_searchr1_judge_response(response, expected):
+    assert parse_judge_response(response) == expected
+
+
+def test_online_search_filters_benchmark_mirrors_and_enriches_pages(monkeypatch):
+    monkeypatch.setenv("SERPER_API_KEY", "serper-test")
+    monkeypatch.setenv("JINA_API_KEY", "jina-test")
+    cfg = OmegaConf.create(
+        {
+            "tools": {
+                "search": {
+                    "topk": 2,
+                    "jina_topk": 1,
+                    "blocked_url_patterns": ["browsecomp"],
+                }
+            }
+        }
+    )
+    client = SearchR1OnlineSearchClient(cfg)
+    assert client._is_blocked(
+        {
+            "link": "https://example.test/browsecomp-answers",
+            "title": "dataset",
+        }
+    )
+
+    async def fake_search(query, topk):
+        return [
+            {
+                "link": "https://example.test/source",
+                "title": "Source",
+                "snippet": "Relevant snippet",
+            }
+        ]
+
+    async def fake_access(url):
+        return "Fetched page"
+
+    monkeypatch.setattr(client, "_serper_search", fake_search)
+    monkeypatch.setattr(client, "_jina_access", fake_access)
+    results = asyncio.run(client.query_async({"queries": ["question"], "topk": 2}))
+
+    assert results[0]["urls"] == ["https://example.test/source"]
+    assert "Relevant snippet" in results[0]["documents"][0]
+    assert "Fetched page" in results[0]["documents"][0]
+
+
 def test_terminal_only_reward_produces_one_trajectory_advantage():
     rewards = torch.tensor([[0.0], [1.0], [0.0], [0.0]])
     advantages, _ = compute_grpo_dynamic_advantages(
@@ -323,9 +738,11 @@ def test_searchr1_parser_repairs_common_search_tag_errors():
 
     _, malformed_open = asyncio.run(parser("<search query>capital of France</search>"))
     _, missing_close = asyncio.run(parser("<search>capital of France"))
+    _, missing_angle = asyncio.run(parser("=search>capital of France</search>"))
 
     assert malformed_open[0].arguments["keyword"] == "capital of France"
     assert missing_close[0].arguments["keyword"] == "capital of France"
+    assert missing_angle[0].arguments["keyword"] == "capital of France"
 
 
 def test_generate_tool_response_records_exact_policy_visible_evidence():
@@ -1008,6 +1425,61 @@ def _run_scripted_trajectory(max_turns, responses):
     return worker, asyncio.run(
         worker.run_one_query(worker.tokenizer.encode("question"), answer="opaque-id")
     )
+
+
+def test_searchr1_generation_reserves_context_safety_margin():
+    worker = Searchr1AgentLoopWorker.__new__(Searchr1AgentLoopWorker)
+    worker.cfg = OmegaConf.create({"agentloop": {"max_turns": 1}})
+    worker.max_prompt_len = 100
+    worker.max_total_len = 100
+    worker.max_resp_len = 100
+    worker.max_new_tokens_per_turn = 100
+    worker.context_safety_margin = 16
+    worker.print_outputs = False
+    worker.return_logprobs = False
+    worker.tokenizer = _CharacterTokenizer()
+    requested_tokens = []
+
+    async def generate(prompt_ids, sampling_params=None):
+        requested_tokens.append(sampling_params["max_new_tokens"])
+        assert len(prompt_ids) + sampling_params["max_new_tokens"] <= 84
+        return {"output_ids": worker.tokenizer.encode("<answer>Paris</answer>")}
+
+    worker.generate = generate
+    output = asyncio.run(
+        worker.run_one_query(worker.tokenizer.encode("q" * 80), answer="opaque-id")
+    )
+
+    assert requested_tokens == [4]
+    assert len(output.single_turn_outputs) == 1
+
+
+def test_searchr1_generation_error_becomes_terminal_result():
+    worker = Searchr1AgentLoopWorker.__new__(Searchr1AgentLoopWorker)
+    worker.cfg = OmegaConf.create({"agentloop": {"max_turns": 1}})
+    worker.max_prompt_len = 100
+    worker.max_total_len = 200
+    worker.max_resp_len = 100
+    worker.max_new_tokens_per_turn = 100
+    worker.context_safety_margin = 16
+    worker.print_outputs = False
+    worker.return_logprobs = False
+    worker.tokenizer = _CharacterTokenizer()
+
+    async def generate(_prompt_ids, sampling_params=None):
+        del sampling_params
+        raise RuntimeError("Rollout generation failed: context overflow")
+
+    worker.generate = generate
+    output = asyncio.run(
+        worker.run_one_query(worker.tokenizer.encode("question"), answer="opaque-id")
+    )
+
+    assert len(output.single_turn_outputs) == 1
+    terminal = output.single_turn_outputs[0]
+    assert terminal.is_end is True
+    assert terminal.response_text == ""
+    assert "context overflow" in terminal.extra_fields["generation_error"]
 
 
 def test_one_search_then_answer_runs_end_to_end_with_terminal_reward():

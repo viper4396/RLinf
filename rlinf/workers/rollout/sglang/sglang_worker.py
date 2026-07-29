@@ -480,11 +480,22 @@ class SGLangWorker(Worker):
             for key, value in sampling_params.items():
                 final_sampling_params[key] = value
 
-        result = await self._engine.async_generate(
-            input_ids=prompt_ids,
-            sampling_params=final_sampling_params,
-            return_logprob=self._return_logprobs,
-        )
+        try:
+            result = await self._engine.async_generate(
+                input_ids=prompt_ids,
+                sampling_params=final_sampling_params,
+                return_logprob=self._return_logprobs,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            result_dict = {
+                "generation_error": f"{type(error).__name__}: {error}",
+            }
+            await output_channel.put(
+                result_dict, key=channel_key, async_op=True
+            ).async_wait()
+            return
         # sglang will trim matched stop in result text, so we should only return output_ids
         result_dict = {
             "output_ids": result["output_ids"],

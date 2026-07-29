@@ -22,6 +22,10 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from rlinf.agents.wideseek_r2.graph_memory.item import (
+    item_terminal_facts,
+    item_value,
+)
 from rlinf.agents.wideseek_r2.graph_memory.schema import (
     AuditResult,
     EvidenceKind,
@@ -52,6 +56,8 @@ class RenderValidation:
 
 
 def _terminal_facts(runtime: Any) -> list[Any]:
+    if runtime.config.item_require_terminal_fact:
+        return item_terminal_facts(runtime)
     graph = runtime.evidence_graph
     contract = runtime.contract
     facts = [
@@ -287,6 +293,8 @@ def build_render_payload(runtime: Any) -> dict[str, Any]:
         ),
         key=lambda node: node.node_id,
     )
+    if runtime.answer_type == "item" and runtime.config.item_require_terminal_fact:
+        facts = item_terminal_facts(runtime)
     entities: dict[str, Any] = {}
     sources: dict[str, Any] = {}
     allowed_refs: set[str] = set()
@@ -318,9 +326,13 @@ def build_render_payload(runtime: Any) -> dict[str, Any]:
             ):
                 sources[source.node_id] = _render_node_card(runtime, source)
                 allowed_refs.add(source.node_id)
-        value = fact.payload.get(
-            runtime.format_requirements.get("value_field", "value"),
-            fact.payload.get("value", fact.payload.get("object", "")),
+        value = (
+            item_value(runtime, fact)
+            if runtime.answer_type == "item"
+            else fact.payload.get(
+                runtime.format_requirements.get("value_field", "value"),
+                fact.payload.get("value", fact.payload.get("object", "")),
+            )
         )
         rows.append(
             {
@@ -504,6 +516,25 @@ def validate_render_answer(response_text: str, runtime: Any) -> RenderValidation
         return RenderValidation(
             False, "ITEM_CARDINALITY", "Item output requires one row"
         )
+    if runtime.answer_type == "item":
+        expected_item_rows = runtime.render_payload.get("rows", ())
+        if runtime.config.item_require_terminal_fact and len(expected_item_rows) != 1:
+            return RenderValidation(
+                False,
+                "ITEM_EVIDENCE_CARDINALITY",
+                "Item Render Payload must contain exactly one terminal Fact",
+                len(frame),
+                columns,
+            )
+        value = str(frame.iat[0, 0]).strip()
+        if not value or value.casefold() in {"nan", "none"}:
+            return RenderValidation(
+                False,
+                "EMPTY_ITEM",
+                "Item output requires a non-empty value",
+                len(frame),
+                columns,
+            )
     if runtime.answer_type == "set":
         values = [
             tuple(str(value).strip().casefold() for value in row)

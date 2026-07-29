@@ -19,6 +19,14 @@ from rlinf.agents.wideseek_r2.graph_memory.embedding_index import (
     DeterministicEmbeddingIndex,
     EmbeddingMatch,
 )
+from rlinf.agents.wideseek_r2.graph_memory.item import (
+    ITEM_TERMINAL_TAG,
+    ItemCompletion,
+    check_item_completion,
+    item_terminal_facts,
+    item_value,
+    normalize_item_format_requirements,
+)
 from rlinf.agents.wideseek_r2.graph_memory.payload_builder import PayloadBuildResult
 from rlinf.agents.wideseek_r2.graph_memory.renderer import RenderValidation
 from rlinf.agents.wideseek_r2.graph_memory.schema import (
@@ -58,6 +66,12 @@ __all__ = [
     "AuditReport",
     "DeterministicEmbeddingIndex",
     "EmbeddingMatch",
+    "ITEM_TERMINAL_TAG",
+    "ItemCompletion",
+    "check_item_completion",
+    "item_terminal_facts",
+    "item_value",
+    "normalize_item_format_requirements",
     "PayloadBuildResult",
     "RenderValidation",
 ]

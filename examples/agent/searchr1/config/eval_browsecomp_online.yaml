@@ -1,0 +1,136 @@
+defaults:
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    rollout,reward: all
+
+runner:
+  task_type: reasoning_eval
+  logger:
+    log_path: ${runner.output_dir}/${runner.experiment_name}
+    project_name: rlinf
+    experiment_name: ${runner.experiment_name}
+    logger_backends: ["tensorboard"]
+  max_epochs: 1
+  max_steps: -1
+  val_check_interval: -1
+  save_interval: -1
+  seq_length: 32768
+  resume_dir: null
+  experiment_name: searchr1-browsecomp-online
+  output_dir: /mnt/public/suheng/searchr1_runs
+
+algorithm:
+  group_size: 1
+  rollout_batch_size_per_gpu: null
+  logprob_forward_micro_batch_size: 1
+  val_rollout_batch_size_per_gpu: 4
+  shuffle_rollout: false
+  sampling_params:
+    do_sample: true
+    temperature: 0.6
+    top_k: -1
+    top_p: 0.95
+    repetition_penalty: 1.0
+    max_new_tokens: 4096
+    min_new_tokens: 1
+    stop: ["</search>", "</answer>", "<|im_end|>"]
+
+data:
+  type: searchr1
+  max_prompt_length: 4096
+  filter_prompt_by_length: true
+  rollout_batch_size: 32
+  val_rollout_batch_size: 32
+  num_workers: 2
+  prompt_key: question
+  answer_key: answer
+  apply_chat_template: false
+  shuffle: false
+  validation_shuffle: false
+  seed: 1234
+  val_data_paths:
+    - /mnt/public/suheng/data/browsecomp_padded1280.jsonl
+  data_size: -1
+
+agentloop:
+  group_name: AgentLoopGroup
+  toolcall_parser: searchr1-qwen
+  max_turns: 10
+  max_new_tokens_per_turn: 4096
+  max_tool_response_length: 1800
+  tool_response_truncate_side: right
+  print_outputs: false
+  is_dynamic_rollout_batch: true
+
+tools:
+  search:
+    online: true
+    use_jina: true
+    topk: 5
+    jina_topk: 2
+    jina_page_chars: 6000
+    max_concurrency: 20
+    jina_max_concurrency: 10
+    max_retries: 3
+    retry_delay: 1.0
+    search_oversample: 5
+    blocked_url_patterns:
+      - browsecomp
+      - browse_comp
+      - browse-comp
+
+rollout:
+  group_name: RolloutGroup
+  gpu_memory_utilization: 0.75
+  model:
+    model_path: /mnt/public/suheng/model/search_r1
+    model_type: qwen2.5
+    precision: fp16
+  enforce_eager: false
+  distributed_executor_backend: mp
+  disable_log_stats: false
+  detokenize: true
+  padding: null
+  eos: null
+  return_logprobs: false
+  rollout_backend: sglang
+  sglang:
+    attention_backend: triton
+    decode_log_interval: 500000
+    use_torch_compile: false
+    torch_compile_max_bs: 64
+  vllm:
+    attention_backend: FLASH_ATTN
+    enable_chunked_prefill: true
+    enable_prefix_caching: true
+    enable_flash_infer_sampler: true
+    max_num_batched_tokens: null
+    torch_profiler_dir: null
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  max_running_requests: 64
+  cuda_graph_max_bs: 64
+  validate_weight: false
+  validate_save_dir: null
+  print_outputs: false
+
+reward:
+  group_name: RewardGroup
+  use_reward_model: false
+  reward_type: searchr1
+  reward_scale: 1.0
+  judge:
+    enabled: true
+    endpoint: http://172.27.22.136:30000
+    model: Qwen3-30B-A3B-Instruct-2507
+    max_concurrency: 16
+    max_retries: 2
+    timeout: 120

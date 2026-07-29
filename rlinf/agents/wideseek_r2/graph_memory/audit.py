@@ -13,6 +13,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from rlinf.agents.wideseek_r2.graph_memory.item import check_item_completion
 from rlinf.agents.wideseek_r2.graph_memory.schema import (
     ActionState,
     AuditNode,
@@ -166,6 +167,23 @@ def terminal_invariants(runtime: Any) -> tuple[bool, dict[str, Any]]:
             "nonterminal_actions": nonterminal_actions,
         },
     }
+    if runtime.answer_type == "item" and runtime.config.item_require_terminal_fact:
+        item_completion = check_item_completion(runtime)
+        invariants.update(
+            {
+                "item_has_terminal_fact": "item_terminal_fact"
+                not in item_completion.missing,
+                "item_unique_terminal_fact": "item_unique_terminal_fact"
+                not in item_completion.missing,
+                "item_terminal_value_present": "item_terminal_value"
+                not in item_completion.missing,
+            }
+        )
+        invariants["details"]["item_terminal_fact_refs"] = list(
+            item_completion.terminal_refs
+        )
+        invariants["details"]["item_terminal_values"] = list(item_completion.values)
+        invariants["details"]["item_missing"] = list(item_completion.missing)
     passed = all(value for key, value in invariants.items() if key != "details")
     return passed, invariants
 
@@ -221,6 +239,18 @@ def build_audit_payload(runtime: Any, response_text: str = "") -> dict[str, Any]
         "active_fact_coverage": covered,
         "pending_memory_transaction": runtime.pending_memory_transaction,
     }
+    if runtime.answer_type == "item":
+        item_completion = check_item_completion(runtime)
+        payload["item_completion"] = {
+            "required": runtime.config.item_require_terminal_fact,
+            "terminal_fact_refs": list(item_completion.terminal_refs),
+            "values": list(item_completion.values),
+            "missing": list(item_completion.missing),
+            "instruction": (
+                "The final item must be exactly one non-empty value from the "
+                "source-backed verified terminal Fact."
+            ),
+        }
     return payload
 
 

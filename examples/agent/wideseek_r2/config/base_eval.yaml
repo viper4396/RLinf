@@ -137,6 +137,8 @@ agentloop:
     audit_best_effort: true
     require_audit_pass: true
     max_render_page_rows: 32
+    item_require_terminal_fact: true
+    item_terminal_tag: terminal
   max_planner_turns: 10
   max_worker_turns: 20
   max_sa_turns: 50

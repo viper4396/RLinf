@@ -19,6 +19,7 @@ from typing import Any
 import aiohttp
 from omegaconf import DictConfig
 
+from rlinf.agents.searchr1.online_search import SearchR1OnlineSearchClient
 from rlinf.data.tool_call.tool_io_struct import ToolChannelRequest, ToolChannelResponse
 from rlinf.scheduler import Channel
 from rlinf.workers.agent.tool_worker import ToolWorker
@@ -34,9 +35,7 @@ class AsyncSearchClient:
             1, int(self.cfg.tools.search.get("max_concurrency", 16))
         )
         self.max_retries = max(1, int(self.cfg.tools.search.get("max_retries", 3)))
-        self.retry_delay = max(
-            0.0, float(self.cfg.tools.search.get("retry_delay", 5))
-        )
+        self.retry_delay = max(0.0, float(self.cfg.tools.search.get("retry_delay", 5)))
         print(self.server_addr)
 
     async def start(self):
@@ -108,7 +107,12 @@ class SearchToolWorker(ToolWorker):
         self.dummy_mode = self.cfg.tools.search.get("dummy_mode", False)
         self.request_processor_task = None
         self.active_tasks: set[asyncio.Task[Any]] = set()
-        self.search_client = AsyncSearchClient(cfg=self.cfg)
+        self.use_online_search = bool(self.cfg.tools.search.get("online", False))
+        self.search_client = (
+            SearchR1OnlineSearchClient(cfg=self.cfg)
+            if self.use_online_search
+            else AsyncSearchClient(cfg=self.cfg)
+        )
 
     def init_worker(self, input_channel: Channel, output_channel: Channel):
         self.input_channel = input_channel

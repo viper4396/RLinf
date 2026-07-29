@@ -489,6 +489,21 @@ class Searchr1AgentLoopWorker(MultiAgentLoopWorker):
         self.max_prompt_len = int(self.cfg.data.max_prompt_length)
         self.max_total_len = int(self.cfg.runner.seq_length)
         self.max_resp_len = max(1, self.max_total_len - self.max_prompt_len)
+        self.max_new_tokens_per_turn = int(
+            self.cfg.agentloop.get(
+                "max_new_tokens_per_turn",
+                self.cfg.algorithm.sampling_params.get(
+                    "max_new_tokens", self.max_resp_len
+                ),
+            )
+        )
+        if self.max_new_tokens_per_turn < 1:
+            raise ValueError("max_new_tokens_per_turn must be positive")
+        self.context_safety_margin = int(
+            self.cfg.agentloop.get("context_safety_margin", 16)
+        )
+        if self.context_safety_margin < 1:
+            raise ValueError("context_safety_margin must be positive")
         self.max_tool_response_length = int(
             self.cfg.agentloop.get("max_tool_response_length", 500)
         )
@@ -1052,6 +1067,7 @@ class Searchr1AgentLoopWorker(MultiAgentLoopWorker):
         controller_binding_alias_used = False
         controller_binding_attempts = 0
         controller_binding_error = None
+        generation_error = None
         generated_token_count = 0
         if controller_applied and controller_phase == _CONTROLLER_PHASE_HOP:
             plan: TeacherPlan = generate_context["controller_plan"]
@@ -1088,7 +1104,10 @@ class Searchr1AgentLoopWorker(MultiAgentLoopWorker):
                 )
         max_resp_len = min(
             self.max_resp_len,
-            max_total_len - len(generation_prompt_ids),
+            getattr(self, "max_new_tokens_per_turn", self.max_resp_len),
+            max_total_len
+            - len(generation_prompt_ids)
+            - getattr(self, "context_safety_margin", 1),
         )
         if max_resp_len <= 0:
             previous_output = generate_context.get("last_llm_output")
@@ -1129,15 +1148,25 @@ class Searchr1AgentLoopWorker(MultiAgentLoopWorker):
                     )
                     max_resp_len = min(
                         self.max_resp_len,
-                        max_total_len - len(generation_prompt_ids),
+                        getattr(self, "max_new_tokens_per_turn", self.max_resp_len),
+                        max_total_len
+                        - len(generation_prompt_ids)
+                        - getattr(self, "context_safety_margin", 1),
                     )
                     if max_resp_len <= 0:
                         controller_binding_error = "binding retry exceeds token budget"
                         break
-                generate_result = await self.generate(
-                    generation_prompt_ids,
-                    sampling_params={"max_new_tokens": max_resp_len},
-                )
+                try:
+                    generate_result = await self.generate(
+                        generation_prompt_ids,
+                        sampling_params={"max_new_tokens": max_resp_len},
+                    )
+                except RuntimeError as error:
+                    generation_error = str(error)
+                    controller_binding_error = generation_error
+                    llm_response_ids = []
+                    llm_response_text = ""
+                    break
                 llm_response_ids = generate_result["output_ids"][:max_resp_len]
                 generated_token_count += len(llm_response_ids)
                 decoded_response_text = self.tokenizer.decode(llm_response_ids)
@@ -1176,19 +1205,25 @@ class Searchr1AgentLoopWorker(MultiAgentLoopWorker):
             if not controller_binding_valid:
                 llm_response_text = controller_raw_response_text or ""
         elif not controller_generated:
-            generate_result = await self.generate(
-                generation_prompt_ids,
-                sampling_params={"max_new_tokens": max_resp_len},
-            )
-            llm_response_ids = generate_result["output_ids"][:max_resp_len]
-            generated_token_count += len(llm_response_ids)
-            decoded_response_text = self.tokenizer.decode(llm_response_ids)
-            llm_response_text = decoded_response_text
-            if controller_generation_prefix is not None:
-                controller_raw_response_text = (
-                    controller_generation_prefix + decoded_response_text
+            try:
+                generate_result = await self.generate(
+                    generation_prompt_ids,
+                    sampling_params={"max_new_tokens": max_resp_len},
                 )
-                llm_response_text = controller_raw_response_text
+            except RuntimeError as error:
+                generation_error = str(error)
+                llm_response_ids = []
+                llm_response_text = ""
+            else:
+                llm_response_ids = generate_result["output_ids"][:max_resp_len]
+                generated_token_count += len(llm_response_ids)
+                decoded_response_text = self.tokenizer.decode(llm_response_ids)
+                llm_response_text = decoded_response_text
+                if controller_generation_prefix is not None:
+                    controller_raw_response_text = (
+                        controller_generation_prefix + decoded_response_text
+                    )
+                    llm_response_text = controller_raw_response_text
 
         if controller_applied and controller_phase == _CONTROLLER_PHASE_SYNTHESIS:
             (
@@ -1241,6 +1276,7 @@ class Searchr1AgentLoopWorker(MultiAgentLoopWorker):
                 "controller_binding_alias_used": controller_binding_alias_used,
                 "controller_binding_attempts": controller_binding_attempts,
                 "controller_binding_error": controller_binding_error,
+                "generation_error": generation_error,
                 "generated_token_count": generated_token_count,
                 "controller_synthesis_answer_source": controller_synthesis_answer_source,
                 "controller_synthesis_format_repaired": controller_synthesis_format_repaired,
@@ -1282,6 +1318,9 @@ class Searchr1AgentLoopWorker(MultiAgentLoopWorker):
                 len(generate_context["controller_completed_step_ids"])
                 == len(generate_context["controller_plan"].steps)
             )
+            return False, None, None, llm_output
+
+        if generation_error is not None:
             return False, None, None, llm_output
 
         if len(llm_response_ids) == max_resp_len and not controller_applied:

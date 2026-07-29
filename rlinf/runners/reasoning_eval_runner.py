@@ -99,10 +99,6 @@ class ReasoningEvalRunner:
         )  # Prefer config value if set
         if self.val_batch_size is None:
             self.val_batch_size = len(self.val_dataset)
-        else:
-            assert len(self.val_dataset) % self.val_batch_size == 0, (
-                f"Validation dataset size {len(self.val_dataset)} is not divisible by val_batch_size {self.val_batch_size}"
-            )
         self.total_batch_size = self.val_batch_size * self.cfg.algorithm.get(
             "group_size", 1
         )

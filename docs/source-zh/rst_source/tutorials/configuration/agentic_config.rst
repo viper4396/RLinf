@@ -200,8 +200,8 @@ judge-based ``pass@1``、``avg@k`` 和 ``pass@k``。缺少 ``answer_type`` 时
 默认按 ``table`` 处理，因此 ``set`` 和 ``list`` 记录必须显式标注类型；同质
 item 数据集应设置 ``data.answer_type: item``。
 
-WideSeek-R2 graph-memory v2（Phase 1/2/4）
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+WideSeek-R2 graph-memory v2（Phase 1/2/4/5 item）
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 现有的 ``mas_graph`` 工作流现在直接使用 v2 runtime；不会新增
 新的 v2 工作流。仍使用原有的 workflow 和 parser 名称：
@@ -232,12 +232,20 @@ Top-K 查询、有限的 Entity/Fact/Source BFS payload、focus refs、graph-ver
 元数据和确定性去重。Worker 在 spawn 时收到这份不可变 payload，仍然不能调用
 ``read_mem``。
 
+对于 Phase 5 的 ``item`` contract，planner 不预先生成初始 plan，而是每次只调度
+当前未解决的 dependency hop。下一次 ``call_sub`` 通过 ``focus_refs`` 接收已解析的
+Entity/Fact 引用。最终 Claim 必须在提升为 Fact 前显式标记 terminal；最终 item 必须
+由一个且仅一个、值非空且具有 active Source provenance 的 terminal Fact 支持，缺失或
+多个 terminal Fact 都会被 Audit 拒绝。
+
 Phase 4 保留真实的 normal response，然后进入独立的 Audit 状态机。只有在
 pending Claim/Conflict、active Claim/Fact provenance、Source provenance、Action
 终态和 transaction 不变量全部通过时，结构化 ``AUDIT_PASS`` 才会被接受。Audit
 通过后创建只包含 active Entity/Fact 及一跳 Source provenance 的 Render Payload。
 Render 会机械检查 item/set/list/table 结构、payload ref 范围和 Markdown 格式；
-失败只进行有上限的 format retry，不会静默回到 Audit。
+对于 ``item``，Render Payload 只包含 terminal Fact，并且输出必须恰好有一行
+``Item``。失败只进行有上限的 format retry，不会静默回到 Audit。设置
+``require_audit_pass: true`` 后，Audit 失败也不会回退到未经审核的 normal response。
 
 重要的 graph-memory 配置键包括 ``max_events``、``max_read_tokens``、
 ``entity_bootstrap_max_new_tokens``、``max_pending_claims`` 和
@@ -245,8 +253,9 @@ Render 会机械检查 item/set/list/table 结构、payload ref 范围和 Markdo
 ``payload_max_distance``、``max_payload_nodes``、``max_payload_tokens`` 和
 ``max_source_excerpt_tokens``；Phase 4 增加 ``max_audit_attempts``、
 ``max_render_attempts``、``audit_enabled``、``render_enabled`` 和
-``format_retry_enabled``。``max_nodes``、``max_edges``、``max_actions``
-仍然是 graph 的硬上限。
+``format_retry_enabled``；Phase 5 item 增加
+``item_require_terminal_fact`` 和 ``item_terminal_tag``。``max_nodes``、
+``max_edges``、``max_actions`` 仍然是 graph 的硬上限。
 
 actor
 ~~~~~~~~~~~~~~~

@@ -71,7 +71,7 @@ class Searchr1QwenToolCallParser:
         self.tool_call_end_token: str = "</search>"
         self.tool_call_regex = re.compile(r"<search>(.*?)</search>", re.DOTALL)
         self.repairable_tool_call_regex = re.compile(
-            r"<search(?:\s+[^>]*)?>(.*?)(?:</search>|(?=<answer>)|$)",
+            r"(?:<search(?:\s+[^>]*)?>|=search>)(.*?)(?:</search>|(?=<answer>)|$)",
             re.DOTALL,
         )
 
@@ -79,9 +79,10 @@ class Searchr1QwenToolCallParser:
         matches = self.tool_call_regex.findall(response_text)
         parser = self.tool_call_regex
         if not matches:
-            # Recover common model slips such as ``<search query>...`` and a
-            # missing closing tag. The agent loop still records these calls as
-            # format-invalid so training/evaluation can distinguish repairs.
+            # Recover common model slips such as ``<search query>...``,
+            # ``=search>...``, and a missing closing tag. The agent loop still
+            # records these calls as format-invalid so evaluation can
+            # distinguish repairs.
             matches = self.repairable_tool_call_regex.findall(response_text)
             parser = self.repairable_tool_call_regex
         function_calls = []

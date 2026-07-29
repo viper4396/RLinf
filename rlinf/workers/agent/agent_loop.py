@@ -192,9 +192,9 @@ class AgentLoopWorker(Worker):
             ):
                 if session_id not in self._conv_rank:
                     # first turn of this conversation -> load-aware placement
-                    self._conv_rank[session_id] = await self._affinity_router.assign.remote(
+                    self._conv_rank[
                         session_id
-                    )
+                    ] = await self._affinity_router.assign.remote(session_id)
                 else:
                     # a subsequent turn -> grow this conversation's load weight
                     self._affinity_router.bump.remote(session_id)
@@ -216,6 +216,8 @@ class AgentLoopWorker(Worker):
         result = await self.generate_output_channel.get(
             channel_key, async_op=True
         ).async_wait()
+        if generation_error := result.get("generation_error"):
+            raise RuntimeError(f"Rollout generation failed: {generation_error}")
         return result
 
     def release_affinity(self, session_id: Optional[str]) -> None:

@@ -90,6 +90,7 @@ def _grounded_runtime() -> GraphRuntime:
             "predicate": "leader",
             "object": "Ada",
             "value": "Ada",
+            "terminal": True,
             "claim_ref": claim.node_id,
             "source_refs": [source.node_id],
         },
@@ -194,7 +195,11 @@ def test_phase4_unresolved_claim_blocks_audit_and_payload_is_bounded():
 
 
 def test_phase4_empty_graph_can_pass_mechanical_invariants():
-    runtime = _runtime()
+    runtime = GraphRuntime.bootstrap(
+        question="What is Acme?",
+        answer_type="table",
+        config={"enabled": True, "schema_version": "v2"},
+    )
     start_audit(runtime)
     report = record_audit_outcome(runtime, model_pass=True, response_text="AUDIT_PASS")
     assert report.passed
@@ -242,7 +247,7 @@ class _StubGraphWorker(WideSeekR2GraphAgentLoopWorker):
 
 
 def test_phase4_agent_loop_preserves_response_then_runs_audit_and_render():
-    runtime = _runtime()
+    runtime = _grounded_runtime()
     worker = _StubGraphWorker(
         [
             "normal response",
@@ -262,3 +267,18 @@ def test_phase4_agent_loop_preserves_response_then_runs_audit_and_render():
     assert runtime.answer_source == "render_response"
     assert runtime.audit_attempt == 1
     assert runtime.render_attempt == 1
+
+
+def test_item_strict_audit_does_not_fall_back_to_normal_response():
+    runtime = _runtime(max_audit_attempts=1)
+    worker = _StubGraphWorker(["unsupported normal response", "AUDIT_PASS"])
+    token = runtime.context_token()
+    try:
+        _output, answer, _turns, _turn_idx = asyncio.run(
+            worker._run_graph_planner_role("Who leads Acme?", 0, "item")
+        )
+    finally:
+        runtime.reset_context(token)
+    assert answer == ""
+    assert runtime.answer_source == "audit_failed"
+    assert runtime.terminal_failure == "AUDIT_REJECTED"

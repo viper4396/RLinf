@@ -145,7 +145,7 @@ class AgentEvalRunner(ReasoningEvalRunner):
 
         # Initialize progress bar
         eval_pbar = tqdm(
-            total=len(self.val_dataloader) * self.total_batch_size,
+            total=len(self.val_dataset) * self.cfg.algorithm.get("group_size", 1),
             desc="Evaluation",
             ncols=100,
         )

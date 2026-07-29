@@ -49,6 +49,40 @@ if typing.TYPE_CHECKING:
 logging.getLogger().setLevel(logging.INFO)
 
 
+def build_searchr1_gisa_metrics(context: dict[str, Any]) -> dict[str, float]:
+    """Aggregate Search-R1 GISA structural metrics from evaluation state."""
+    gisa_count = int(context.get("gisa_count", 0))
+    if not gisa_count:
+        return {}
+
+    metrics = {
+        "gisa/cell_f1": context["gisa_cell_f1_sum"] / gisa_count,
+        "gisa/exact_match": context["gisa_exact_match_sum"] / gisa_count,
+        "gisa/format_rate": context["gisa_format_sum"] / gisa_count,
+    }
+    metrics["gisa/pass@1"] = metrics["gisa/exact_match"]
+    if context["gisa_row_f1_count"]:
+        metrics["gisa/table_row_f1"] = (
+            context["gisa_row_f1_sum"] / context["gisa_row_f1_count"]
+        )
+    if context["gisa_order_score_count"]:
+        metrics["gisa/list_order_score"] = (
+            context["gisa_order_score_sum"] / context["gisa_order_score_count"]
+        )
+    for answer_type, type_count in context["gisa_type_counts"].items():
+        prefix = f"gisa/type/{answer_type}"
+        metrics[f"{prefix}/cell_f1"] = (
+            context["gisa_type_cell_f1_sums"][answer_type] / type_count
+        )
+        metrics[f"{prefix}/exact_match"] = (
+            context["gisa_type_exact_match_sums"][answer_type] / type_count
+        )
+        metrics[f"{prefix}/format_rate"] = (
+            context["gisa_type_format_sums"][answer_type] / type_count
+        )
+    return metrics
+
+
 def _sha256_json(value: Any) -> str:
     """Hash a JSON-compatible value using one canonical representation."""
     payload = json.dumps(
@@ -263,6 +297,31 @@ class Searchr1AgentEvalRunner(SearchR1ReferenceRunnerMixin, AgentEvalRunner):
         logging.info(f"Evaluation results saved to: {output_file}")
         return output_file
 
+    def _save_partial_results(self, next_batch_idx: int) -> str:
+        """Atomically checkpoint completed batches for failure recovery."""
+        output_dir = os.path.join(
+            self.cfg.runner.output_dir, self.cfg.runner.experiment_name
+        )
+        local_mkdir_safe(output_dir)
+        output_file = os.path.join(output_dir, "eval_results.partial.json")
+        temporary_file = f"{output_file}.tmp"
+        payload = {
+            "summary": {
+                "dataset_size": len(self.val_dataset),
+                "completed_count": len(self.accumulated_results),
+                "next_batch_idx": next_batch_idx,
+                "experiment_name": self.cfg.runner.experiment_name,
+                "data_paths": OmegaConf.to_container(
+                    self.cfg.data.val_data_paths, resolve=True
+                ),
+            },
+            "results": self.accumulated_results,
+        }
+        with open(temporary_file, "w", encoding="utf-8") as file:
+            json.dump(payload, file, ensure_ascii=False, indent=2)
+        os.replace(temporary_file, output_file)
+        return output_file
+
     def update(
         self,
         context: dict,
@@ -280,11 +339,12 @@ class Searchr1AgentEvalRunner(SearchR1ReferenceRunnerMixin, AgentEvalRunner):
         """
         recv_batch_size = 0
         group_size = self.cfg.algorithm.get("group_size", 1)
+        expected_batch_size = len(batch["answer"]) * group_size
 
         correct_count = 0
         total_count = 0
 
-        while recv_batch_size < self.total_batch_size:
+        while recv_batch_size < expected_batch_size:
             rollout_result: DynamicRolloutResult = input_channel.get()
             eval_pbar.update(group_size)
             recv_batch_size += group_size
@@ -295,6 +355,11 @@ class Searchr1AgentEvalRunner(SearchR1ReferenceRunnerMixin, AgentEvalRunner):
 
             answer = extra_fields_group.get("answer", None)
             llm_rewards = extra_fields_traj.get("llm_reward", [0.0])
+            em_rewards = extra_fields_traj.get("em_reward", llm_rewards)
+            judge_rewards = extra_fields_traj.get("judge_reward")
+            judge_responses = extra_fields_traj.get("judge_response")
+            gisa_metrics_values = extra_fields_traj.get("gisa_metrics")
+            gisa_format_values = extra_fields_traj.get("gisa_format_ok")
             response_texts = extra_fields_traj.get("response_text", [None])
             prompt_texts = extra_fields_traj.get("prompt_text", [None])
             turns_list = extra_fields_traj.get("turns", [[]])
@@ -350,8 +415,24 @@ class Searchr1AgentEvalRunner(SearchR1ReferenceRunnerMixin, AgentEvalRunner):
                 if hasattr(reward, "item"):
                     reward = reward.item()
                 reward = float(reward)
+                em_reward = float(em_rewards[trajectory_idx])
+                judge_reward = (
+                    judge_rewards[trajectory_idx] if judge_rewards is not None else None
+                )
                 mode = str(guidance_modes[trajectory_idx])
                 turns = turns_list[trajectory_idx]
+                is_gisa = isinstance(answer, dict) and bool(
+                    answer.get("is_gisa", False)
+                )
+                gisa_metrics = (
+                    gisa_metrics_values[trajectory_idx]
+                    if gisa_metrics_values is not None
+                    else {}
+                )
+                gisa_format_ok = bool(
+                    gisa_format_values is not None
+                    and gisa_format_values[trajectory_idx]
+                )
                 first_query = next(
                     (
                         turn.get("search_query")
@@ -364,15 +445,23 @@ class Searchr1AgentEvalRunner(SearchR1ReferenceRunnerMixin, AgentEvalRunner):
                     str(turn.get("visible_evidence") or "") for turn in turns
                 )
                 answer_hit = (
-                    float(subem_check(visible_evidence, answer))
-                    if answer is not None and visible_evidence
-                    else 0.0
+                    0.0
+                    if is_gisa
+                    else (
+                        float(subem_check(visible_evidence, answer))
+                        if answer is not None and visible_evidence
+                        else 0.0
+                    )
                 )
                 final_answer = extract_solution(response_texts[trajectory_idx] or "")
                 diagnostic_subem = (
-                    float(subem_check(final_answer, answer))
-                    if answer is not None and final_answer is not None
-                    else 0.0
+                    0.0
+                    if is_gisa
+                    else (
+                        float(subem_check(final_answer, answer))
+                        if answer is not None and final_answer is not None
+                        else 0.0
+                    )
                 )
                 first_search_turn = next(
                     (turn for turn in turns if turn.get("is_search")), None
@@ -522,7 +611,38 @@ class Searchr1AgentEvalRunner(SearchR1ReferenceRunnerMixin, AgentEvalRunner):
                     unresolved_placeholders
                 )
 
-                is_correct = reward > 0
+                if is_gisa:
+                    answer_type = str(answer.get("answer_type", "table"))
+                    gisa_exact_match = float(
+                        gisa_metrics.get(
+                            "pass",
+                            gisa_metrics.get("exact_match", 0.0),
+                        )
+                    )
+                    gisa_cell_f1 = float(gisa_metrics.get("cell_f1", reward))
+                    context["gisa_count"] += 1
+                    context["gisa_cell_f1_sum"] += gisa_cell_f1
+                    context["gisa_exact_match_sum"] += gisa_exact_match
+                    context["gisa_format_sum"] += float(gisa_format_ok)
+                    context["gisa_type_counts"][answer_type] += 1
+                    context["gisa_type_cell_f1_sums"][answer_type] += gisa_cell_f1
+                    context["gisa_type_exact_match_sums"][answer_type] += (
+                        gisa_exact_match
+                    )
+                    context["gisa_type_format_sums"][answer_type] += float(
+                        gisa_format_ok
+                    )
+                    if "row_f1" in gisa_metrics:
+                        context["gisa_row_f1_sum"] += float(gisa_metrics["row_f1"])
+                        context["gisa_row_f1_count"] += 1
+                    if "order_score" in gisa_metrics:
+                        context["gisa_order_score_sum"] += float(
+                            gisa_metrics["order_score"]
+                        )
+                        context["gisa_order_score_count"] += 1
+                    is_correct = gisa_exact_match == 1.0
+                else:
+                    is_correct = reward > 0
                 correct_count += int(is_correct)
                 total_count += 1
                 result_entry = {
@@ -534,6 +654,15 @@ class Searchr1AgentEvalRunner(SearchR1ReferenceRunnerMixin, AgentEvalRunner):
                     "answer": answer,
                     "guidance_mode": mode,
                     "reward": reward,
+                    "em_reward": em_reward,
+                    "judge_reward": judge_reward,
+                    "judge_response": (
+                        judge_responses[trajectory_idx]
+                        if judge_responses is not None
+                        else None
+                    ),
+                    "gisa_metrics": gisa_metrics if is_gisa else None,
+                    "gisa_format_ok": gisa_format_ok if is_gisa else None,
                     "is_correct": is_correct,
                     "answer_hit": bool(answer_hit),
                     "diagnostic_subem": bool(diagnostic_subem),
@@ -547,6 +676,10 @@ class Searchr1AgentEvalRunner(SearchR1ReferenceRunnerMixin, AgentEvalRunner):
                         values[trajectory_idx] if values is not None else None
                     )
                 self.accumulated_results.append(result_entry)
+                context["em_reward_sum"] += em_reward
+                if judge_reward is not None:
+                    context["judge_reward_sum"] += float(judge_reward)
+                    context["judge_reward_count"] += 1
 
                 plan_id = result_entry["teacher_plan_id"]
                 if plan_id is not None:
@@ -600,8 +733,7 @@ class Searchr1AgentEvalRunner(SearchR1ReferenceRunnerMixin, AgentEvalRunner):
         logging.info(f"  Batch accuracy: {accuracy:.4f}")
         logging.info(f"  Total accumulated samples: {len(self.accumulated_results)}")
 
-        batch_correct = int(accuracy * total_count)
-        context["total_correct"] += batch_correct
+        context["total_correct"] += correct_count
         context["total_samples"] += total_count
         context["batch_accuracy"] = accuracy
 
@@ -629,6 +761,21 @@ class Searchr1AgentEvalRunner(SearchR1ReferenceRunnerMixin, AgentEvalRunner):
             "total_correct": 0,
             "total_samples": 0,
             "total_questions": 0,
+            "em_reward_sum": 0.0,
+            "judge_reward_sum": 0.0,
+            "judge_reward_count": 0,
+            "gisa_count": 0,
+            "gisa_cell_f1_sum": 0.0,
+            "gisa_exact_match_sum": 0.0,
+            "gisa_format_sum": 0.0,
+            "gisa_row_f1_sum": 0.0,
+            "gisa_row_f1_count": 0,
+            "gisa_order_score_sum": 0.0,
+            "gisa_order_score_count": 0,
+            "gisa_type_counts": defaultdict(int),
+            "gisa_type_cell_f1_sums": defaultdict(float),
+            "gisa_type_exact_match_sums": defaultdict(float),
+            "gisa_type_format_sums": defaultdict(float),
             "mode_reward_sums": defaultdict(float),
             "mode_answer_hit_sums": defaultdict(float),
             "mode_subem_sums": defaultdict(float),
@@ -692,6 +839,14 @@ class Searchr1AgentEvalRunner(SearchR1ReferenceRunnerMixin, AgentEvalRunner):
         for metric_name, metric_value in context["time_metric_sums"].items():
             shadow_metrics[f"time/{metric_name}_seconds"] = float(metric_value)
         shadow_metrics.update(build_abc_acceptance_metrics(shadow_metrics))
+        shadow_metrics["eval/exact_match"] = (
+            context["em_reward_sum"] / total_samples if total_samples else 0.0
+        )
+        if context["judge_reward_count"]:
+            shadow_metrics["eval/judge_accuracy"] = (
+                context["judge_reward_sum"] / context["judge_reward_count"]
+            )
+        shadow_metrics.update(build_searchr1_gisa_metrics(context))
         # Final summary
         final_accuracy = total_correct / total_samples if total_samples > 0 else 0.0
         logging.info("\n" + "=" * 80)
@@ -739,3 +894,4 @@ class Searchr1AgentEvalRunner(SearchR1ReferenceRunnerMixin, AgentEvalRunner):
                 "rollout_time": f"{time_metrics.get('rollout', 0):.2f}s",
             }
         )
+        self._save_partial_results(self.global_steps + 1)
