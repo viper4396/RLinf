@@ -63,3 +63,4 @@ RLinf 支持多种模型训练后端，每种后端都有自己的初始化逻�
    new_model_sft
    mbridge
    weight_syncer
+   azr_baseline

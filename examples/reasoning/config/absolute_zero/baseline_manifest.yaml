@@ -1,0 +1,379 @@
+schema_version: 1
+phase: 0
+created_at_utc: '2026-08-15T03:27:16.565874+00:00'
+status: baseline_pending
+contract:
+  name: azr-paper-reinforce-plus-plus
+  behavior_source: AZR origin/paper@41ed983
+  training_semantics:
+    advantage: reinforce_plus_plus
+    critic: false
+    policy_loss: ppo_clipped_actor
+    proposal_rollout_n: 1
+    difficulty_rollout_n: 8
+    formal_solve_rollout_n: 1
+    difficulty_trajectories_trainable: false
+    problem_types:
+    - code_i
+    - code_o
+    - code_f
+  comparison_rule: Differences must be attributable to code, environment, or random
+    sampling.
+repositories:
+  azr:
+    name: AZR
+    path: /home/super3/AZR
+    reference: origin/paper
+    expected_commit: 41ed983cdf541cfcd2f963f33c055d50074f3c90
+    resolved_reference_commit: 41ed983cdf541cfcd2f963f33c055d50074f3c90
+    working_tree_commit: 484afa480c8f6fd77faa3d35451f24f287f58ee1
+    working_tree_dirty: false
+    clean_required: true
+    matches_expected_commit: true
+    source_files:
+    - path: scripts/selfplay/coder3b.sh
+      sha256: 93d9d73236b48425798f79ffef8fdac1ec7549a5111ca4f5582489b38e1498d6
+    - path: absolute_zero_reasoner/configs/azr_ppo_trainer.yaml
+      sha256: fe9e971f39f700ffb1c5a2bf5c423f9152e5a5d9cc6d09cd77628d7cc100a056
+  rlinf:
+    name: RLinf
+    path: /home/super3/RLinf
+    reference: a099ff4a2d46ca1fa4d15cf10164a180fbecad16
+    expected_commit: a099ff4a2d46ca1fa4d15cf10164a180fbecad16
+    resolved_reference_commit: a099ff4a2d46ca1fa4d15cf10164a180fbecad16
+    working_tree_commit: 9e856ffb30f85fa94acbda4ee5130e7fdb449e94
+    working_tree_dirty: true
+    clean_required: true
+    matches_expected_commit: true
+model:
+  id: Qwen/Qwen2.5-Coder-3B
+  checkpoint:
+    required: true
+    relative_path: null
+    observed_path: null
+    exists: false
+    sha256: null
+    expected_sha256: null
+    matches_expected: null
+  revision: null
+  revision_must_be_frozen_before_run: true
+configuration:
+  path: /home/super3/RLinf/examples/reasoning/config/absolute_zero/baseline_config.yaml
+  sha256: 9fa47cbd3549f2bde113898d009aaa4650709ead38253a30d28313bb35b368ee
+  resolved:
+    schema_version: 1
+    source:
+      repository: LeapLabTHU/Absolute-Zero-Reasoner
+      revision: 41ed983cdf541cfcd2f963f33c055d50074f3c90
+      script: scripts/selfplay/coder3b.sh
+      base_config: absolute_zero_reasoner/configs/azr_ppo_trainer.yaml
+    data:
+      shuffle: true
+      train_files: data/code_reason/test_answer.parquet
+      val_files: data/code_reason/test_answer.parquet
+      prompt_key: prompt
+      train_batch_size: 64
+      val_batch_size: 1312
+      max_prompt_length: 6144
+      max_validation_prompt_length: 6144
+      max_response_length: 8096
+      return_raw_input_ids: false
+      return_raw_chat: false
+    model:
+      path: Qwen/Qwen2.5-Coder-3B
+      pretrained_tokenizer: true
+      use_remove_padding: true
+      enable_gradient_checkpointing: true
+    actor:
+      strategy: fsdp
+      learning_rate: 1.0e-06
+      ppo_mini_batch_size: 128
+      ppo_micro_batch_size_per_gpu: 16
+      ppo_max_token_len_per_gpu: 16384
+      use_dynamic_bsz: false
+      grad_clip: 1.0
+      clip_ratio: 0.2
+      entropy_coeff: 0.001
+      use_kl_loss: false
+      kl_loss_coef: 0.0
+      kl_loss_type: low_var_kl
+      ppo_epochs: 1
+      shuffle: false
+      ulysses_sequence_parallel_size: 2
+      param_offload: false
+      grad_offload: false
+      optimizer_offload: false
+    reference:
+      include_ref: false
+      param_offload: true
+      log_prob_micro_batch_size_per_gpu: 64
+    rollout:
+      backend: vllm
+      dtype: bfloat16
+      top_k: -1
+      top_p: 1.0
+      tensor_parallel_size: 2
+      log_prob_micro_batch_size_per_gpu: 64
+      max_num_batched_tokens: 16384
+      max_num_seqs: 1024
+      gpu_memory_utilization: 0.4
+      enforce_eager: false
+      free_cache_engine: false
+      load_format: dummy_dtensor
+      enable_chunked_prefill: true
+      disable_log_stats: true
+      n: 1
+      temperature: 1.0
+    algorithm:
+      advantage: reinforce_plus_plus
+      gamma: 1.0
+      lam: 1.0
+      kl_penalty: kl
+      kl_controller: fixed
+      kl_coefficient: 0.0
+      critic: false
+    reward:
+      extraction_type: answer_conditional
+      math_metric: math_verify
+      difficulty_samples: 8
+      code_f_reward_type: binary
+      generation_accuracy_conversion: one_minus
+      intrinsic_combine_method: sum
+      format_reward: true
+      reject_multiple_functions: true
+      reject_test_input_in_code: false
+      f_replace_location: not_first
+      remove_input_from_snippet: false
+      include_references: true
+      use_original_code_as_ref: true
+      remove_comments: false
+      remove_after_return: false
+      remove_print: false
+      complexity_reward:
+        enabled: false
+        coefficient: 0.0
+        maximum: 0.0
+      mean_edit_distance_reward:
+        enabled: false
+        coefficient: 0.0
+        maximum: 0.0
+      halstead_reward:
+        enabled: false
+        coefficient: 0.0
+        maximum: 0.0
+      answer_diversity_reward:
+        enabled: false
+        coefficient: 0.0
+        maximum: 0.0
+        hierarchical: false
+    program_pool:
+      problem_types:
+      - code_i
+      - code_o
+      - code_f
+      prediction_mix_strategy: max_new
+      generation_probability_strategy: uniform
+      update_iteration: 1
+      past_epoch_window: 1
+      seed_batch_factor: 4
+      pretrain_pred_steps: -1
+      valid_program_filter: all
+      max_programs: 16384
+      batched_estimate: false
+      content_max_length: 8096
+      composite_start_step: -1
+      composite_chance: 0.0
+      composite_function_n_min: 0
+      composite_function_n_max: 0
+      num_inputs_for_code_f: 10
+      executor: qwq
+      executor_max_workers: 1
+      executor_cleanup_frequency: 1
+      ast_check: true
+      execute_max_timeout_seconds: 10
+      random_print_max_programs: 3
+      banned_keywords_for_errors_and_exceptions:
+      - raise
+      train_propose: true
+    seed_data:
+      io: data/3b_coder_seed_io.jsonl
+      error: data/3b_coder_error_seed_io.jsonl
+      error_required_for_paper_problem_types: false
+      code_f: data/3b_coder_code_f_seed_io.jsonl
+      output_io: data/3b_coder_seed_io.jsonl
+      output_error: data/3b_coder_error_seed_io.jsonl
+      output_code_f: data/3b_coder_code_f_seed_io.jsonl
+    trainer:
+      project_name: azr
+      experiment_name: azr_coder3b
+      nnodes: 1
+      gpus_per_node: 2
+      save_frequency: 10
+      test_frequency: 10
+      critic_warmup: 0
+      total_epochs: 30
+      resume_mode: auto
+      debug: false
+      val_generations_to_log_to_wandb: 0
+      wandb_run_id: null
+      logger:
+      - console
+      - wandb
+      val_before_train: false
+      remove_previous_checkpoint: true
+      delete_local_checkpoint_after_load: true
+    environment:
+      VLLM_ATTENTION_BACKEND: FLASH_ATTN
+      RAY_memory_monitor_refresh_ms: '0'
+      RAY_LOGGING_LEVEL: DEBUG
+      HYDRA_FULL_ERROR: '1'
+    short_baseline:
+      minimum_steps: 20
+      maximum_steps: 100
+      expected_trace_fields:
+      - global_step
+      - proposal_responses
+      - difficulty_solve_responses
+      - formal_solve_responses
+      - proposal_rewards
+      - solve_rewards
+      - valid_programs
+      - program_pool_size
+artifacts:
+  seed_io:
+    required: true
+    relative_path: data/3b_coder_seed_io.jsonl
+    observed_path: /home/super3/AZR/data/3b_coder_seed_io.jsonl
+    exists: true
+    sha256: efd31390d4adc560423e83068101aad2fc13ffce47237289eb2cb235e1db6dc6
+    expected_sha256: efd31390d4adc560423e83068101aad2fc13ffce47237289eb2cb235e1db6dc6
+    matches_expected: true
+    size_bytes: 228333
+  seed_error:
+    required: false
+    relative_path: data/3b_coder_error_seed_io.jsonl
+    observed_path: /home/super3/AZR/data/3b_coder_error_seed_io.jsonl
+    exists: false
+    sha256: null
+    expected_sha256: null
+    matches_expected: null
+  seed_code_f:
+    required: true
+    relative_path: data/3b_coder_code_f_seed_io.jsonl
+    observed_path: /home/super3/AZR/data/3b_coder_code_f_seed_io.jsonl
+    exists: true
+    sha256: 81f9aae8cb0549620c83e9c329f3200339315f20111bc1b4a12f8f97b6ad208b
+    expected_sha256: 81f9aae8cb0549620c83e9c329f3200339315f20111bc1b4a12f8f97b6ad208b
+    matches_expected: true
+    size_bytes: 469059
+  validation_dataset:
+    required: true
+    relative_path: data/code_reason/test_answer.parquet
+    observed_path: /home/super3/AZR/data/code_reason/test_answer.parquet
+    exists: false
+    sha256: null
+    expected_sha256: null
+    matches_expected: null
+  model_checkpoint:
+    required: true
+    relative_path: null
+    observed_path: null
+    exists: false
+    sha256: null
+    expected_sha256: null
+    matches_expected: null
+  fixed_examples:
+    required: true
+    relative_path: fixed_examples.jsonl
+    observed_path: /home/super3/RLinf/examples/reasoning/config/absolute_zero/fixed_examples.jsonl
+    exists: true
+    sha256: 24fd5822dc94e083ed47fa7e2640eef20cf94f56641fe3f94f89393e18f7aac0
+    expected_sha256: null
+    matches_expected: null
+    size_bytes: 49198
+  short_run_trace: &id001
+    required: true
+    relative_path: baseline_trace.jsonl
+    observed_path: null
+    exists: false
+    sha256: null
+    expected_sha256: null
+    matches_expected: null
+fixed_examples:
+  path: /home/super3/RLinf/examples/reasoning/config/absolute_zero/fixed_examples.jsonl
+  sha256: 24fd5822dc94e083ed47fa7e2640eef20cf94f56641fe3f94f89393e18f7aac0
+  requested_counts:
+    code_i: 20
+    code_o: 20
+    code_f: 10
+  observed_counts:
+    code_i: 20
+    code_o: 20
+    code_f: 10
+  minimum_total: 50
+trace_schema:
+  version: 1
+  format: jsonl
+  one_record_per_global_step: true
+  difficulty_group_size: 8
+  difficulty_group_key: proposal_id
+  difficulty_responses_key: responses
+  trainable_trajectory_groups:
+  - proposal_responses
+  - formal_solve_responses
+  excluded_trajectory_group: difficulty_solve_responses
+short_baseline:
+  status: not_run
+  requested_step_range:
+    minimum: 20
+    maximum: 100
+  trace: *id001
+  trace_errors: []
+  executed_steps: null
+  required_per_step_fields:
+  - global_step
+  - proposal_responses
+  - difficulty_solve_responses
+  - formal_solve_responses
+  - proposal_rewards
+  - solve_rewards
+  - valid_programs
+  - program_pool_size
+  difficulty_group_size: 8
+environment:
+  python: 3.11.14 (main, Feb 12 2026, 00:42:50) [Clang 21.1.4 ]
+  platform: Linux-5.15.167.4-microsoft-standard-WSL2-x86_64-with-glibc2.39
+  machine: x86_64
+  packages:
+    datasets: 3.6.0
+    hydra_core: 1.4.0.dev1
+    numpy: 2.2.0
+    omegaconf: 2.4.0.dev11
+    pyyaml: 6.0.3
+    ray: 2.55.1
+    torch: 2.6.0
+    transformers: 5.9.0
+    vllm: null
+  relevant_env:
+    VLLM_ATTENTION_BACKEND: null
+    RAY_memory_monitor_refresh_ms: null
+    RAY_LOGGING_LEVEL: null
+    HYDRA_FULL_ERROR: null
+acceptance:
+  source_commits_frozen: false
+  expanded_configuration_frozen: true
+  fixed_examples_cover_all_tasks: true
+  required_artifact_hashes_recorded: false
+  short_run_20_to_100_steps_recorded: false
+  reproduction_contract_complete: false
+blocking_artifacts:
+- validation_dataset
+- model_checkpoint
+- short_run_trace
+blocking_repositories:
+- RLinf worktree is dirty
+blocking_items:
+- RLinf worktree is dirty
+- validation_dataset
+- model_checkpoint
+- short_run_trace

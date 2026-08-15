@@ -65,3 +65,4 @@ this section gives you the tools to plug directly into RLinf’s modular design.
    new_model_sft
    mbridge
    weight_syncer
+   azr_baseline
