@@ -22,7 +22,7 @@ import platform
 import subprocess
 import sys
 from collections.abc import Iterable, Mapping
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -545,7 +545,7 @@ def build_manifest(
     return {
         "schema_version": 1,
         "phase": 0,
-        "created_at_utc": datetime.now(UTC).isoformat(),
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "status": "baseline_pending" if blocking_items else "frozen",
         "contract": {
             "name": "azr-paper-reinforce-plus-plus",
